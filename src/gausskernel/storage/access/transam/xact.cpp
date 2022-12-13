@@ -37,6 +37,7 @@
 #include "access/csnlog.h"
 #include "access/cstore_am.h"
 #include "access/cstore_rewrite.h"
+#include "access/glt.h"
 #include "access/multixact.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -1621,7 +1622,11 @@ static TransactionId RecordTransactionCommit(void)
             /* set commit CSN and update global CSN in gtm free mode. */
             SetXact2CommitInProgress(xid, 0);
 #endif
-            setCommitCsn(getLocalNextCSN());
+            if (enable_glt) {
+                gltMethods->getCommitCSNInXact(xid);
+            } else {
+                setCommitCsn(getLocalNextCSN());
+            }
         } else {
             /* for dn auto commit condition, get a new next csn from gtm. */
             if (TransactionIdIsNormal(xid) &&
@@ -8090,8 +8095,13 @@ CommitSeqNo SetXact2CommitInProgress(TransactionId xid, CommitSeqNo csn)
 {
     int nchildren;
     TransactionId *children = NULL;
-    CommitSeqNo latestCSN = t_thrd.xact_cxt.ShmemVariableCache->nextCommitSeqNo;
-    latestCSN = latestCSN > csn ? latestCSN : csn;
+    CommitSeqNo latestCSN;
+    if (enable_glt) {
+        latestCSN = gltMethods->getCommitCSNBeforeCommitInProgress(csn, xid);
+    } else {
+        latestCSN = t_thrd.xact_cxt.ShmemVariableCache->nextCommitSeqNo;
+        latestCSN = latestCSN > csn ? latestCSN : csn;
+    }
     if (!TransactionIdIsValid(xid))
         xid = GetTopTransactionIdIfAny();
     /*

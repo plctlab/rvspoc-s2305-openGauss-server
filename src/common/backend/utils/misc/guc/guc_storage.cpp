@@ -647,7 +647,17 @@ static void InitStorageConfigureNamesBool()
             check_mix_replication_param,
             NULL,
             NULL},
-
+        {{"enable_glt",
+            PGC_POSTMASTER,
+            NODE_SINGLENODE,
+            UNGROUPED,
+            gettext_noop("Enable GLT in openGauss-shardingsphere distributed transaction."),
+            NULL},
+            &g_instance.attr.attr_storage.glt_attr.enable_glt,
+            false,
+            NULL,
+            NULL,
+            NULL},
 #ifndef ENABLE_MULTIPLE_NODES
         {{"enable_dcf",
             PGC_POSTMASTER,

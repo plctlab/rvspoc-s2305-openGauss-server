@@ -119,6 +119,11 @@ typedef struct knl_instance_attr_dms {
     int scrlock_worker_count;
 } knl_instance_attr_dms;
 
+typedef struct knl_instance_attr_glt {
+    /* GLT switch */
+    bool enable_glt;
+} knl_instance_attr_glt;
+
 typedef struct knl_instance_attr_storage {
     bool wal_log_hints;
     bool EnableHotStandby;
@@ -186,6 +191,7 @@ typedef struct knl_instance_attr_storage {
     knl_instance_attr_nvm nvm_attr;
     knl_instance_attr_dss dss_attr;
     knl_instance_attr_dms dms_attr;
+    knl_instance_attr_glt glt_attr;
     int num_internal_lock_partitions[LWLOCK_PART_KIND];
     char* num_internal_lock_partitions_str;
     int wal_insert_status_entries_power;

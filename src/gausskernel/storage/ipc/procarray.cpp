@@ -76,6 +76,7 @@
 
 #include "access/clog.h"
 #include "access/csnlog.h"
+#include "access/glt.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -1920,6 +1921,10 @@ RETRY:
             }
         }
 
+        if (enable_glt) {
+            snapshot->snapshotcsn = gltMethods->getSnapshotCSN();
+        }
+
         if (result) {
             if (GTM_LITE_MODE) {
                 /* gtm lite check csn, if not pass, try to get local snapshot form multiversion again */
@@ -2108,7 +2113,11 @@ RETRY_GET:
     }
 #endif
 
-    snapshot->snapshotcsn = pg_atomic_read_u64(&t_thrd.xact_cxt.ShmemVariableCache->nextCommitSeqNo);
+    if (enable_glt) {
+        snapshot->snapshotcsn = gltMethods->getSnapshotCSN();
+    } else {
+        snapshot->snapshotcsn = pg_atomic_read_u64(&t_thrd.xact_cxt.ShmemVariableCache->nextCommitSeqNo);
+    }
 
     if (GTM_LITE_MODE) {  /* gtm lite check csn, should always pass the check */
         (void)set_proc_csn_and_check("GetLocalSnapshotDataFromProc", snapshot->snapshotcsn,
@@ -2171,6 +2180,9 @@ GROUP_GET_SNAPSHOT:
 #endif
 
     snapshot->xmin = xmin;
+    if (enable_glt) {
+        snapshot->xmin = gltMethods->getSnapshotXmin(snapshot->snapshotcsn, snapshot->xmin);
+    }
     snapshot->xmax = xmax;
     snapshot->curcid = GetCurrentCommandId(false);
 
@@ -4598,7 +4610,12 @@ Snapshot GetLocalSnapshotData(Snapshot snapshot)
     u_sess->utils_cxt.RecentXmin = snapxid->xmin;
     snapshot->xmin = snapxid->xmin;
     snapshot->xmax = snapxid->xmax;
-    snapshot->snapshotcsn = snapxid->snapshotcsn;
+    if (enable_glt) {
+        snapshot->snapshotcsn = gltMethods->getSnapshotCSN();
+        snapshot->xmin = gltMethods->getSnapshotXmin(snapshot->snapshotcsn, snapshot->xmin);
+    } else {
+        snapshot->snapshotcsn = snapxid->snapshotcsn;
+    }
     snapshot->curcid = GetCurrentCommandId(false);
 
     snapshot->active_count = 0;

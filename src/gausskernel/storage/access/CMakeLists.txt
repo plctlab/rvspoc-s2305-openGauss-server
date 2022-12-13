@@ -9,6 +9,7 @@ set(CMAKE_MODULE_PATH
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/gin
     ${CMAKE_CURRENT_SOURCE_DIR}/gist
+    ${CMAKE_CURRENT_SOURCE_DIR}/glt
     ${CMAKE_CURRENT_SOURCE_DIR}/hash
     ${CMAKE_CURRENT_SOURCE_DIR}/hbstore
     ${CMAKE_CURRENT_SOURCE_DIR}/heap
@@ -36,6 +37,7 @@ add_subdirectory(cbtree)
 add_subdirectory(common)
 add_subdirectory(gin)
 add_subdirectory(gist)
+add_subdirectory(glt)
 add_subdirectory(hash)
 add_subdirectory(hbstore)
 add_subdirectory(heap)
