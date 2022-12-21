@@ -80,6 +80,7 @@
 #endif
 
 #include "access/cbmparsexlog.h"
+#include "access/glt.h"
 #include "access/obs/obs_am.h"
 #include "access/transam.h"
 #include "access/ustore/undo/knl_uundoapi.h"
@@ -1562,6 +1563,8 @@ int PostmasterMain(int argc, char* argv[])
      * so need this function to init postmaster level guc.
      */
     InitializePostmasterGUC();
+
+    gltInitMethod(g_instance.attr.attr_storage.glt_attr.enable_glt);
 
     t_thrd.myLogicTid = noProcLogicTid + POSTMASTER_LID;
     if (output_config_variable != NULL) {

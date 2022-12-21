@@ -256,6 +256,7 @@ select name,vartype,unit,min_val,max_val from pg_settings where name <> 'qunit_c
  enable_global_plancache                          | bool    |      |           | 
  enable_global_stats                              | bool    |      |           | 
  enable_global_syscache                           | bool    |      |           | 
+ enable_glt                                       | bool    |      |           | 
  enable_gtt_concurrent_truncate                   | bool    |      |           | 
  enable_hadoop_env                                | bool    |      |           | 
  enable_hashagg                                   | bool    |      |           | 

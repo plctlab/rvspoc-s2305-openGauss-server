@@ -226,7 +226,8 @@ struct PGPROC {
 
     /* commit sequence number send down */
     CommitSeqNo commitCSN;
-
+    CommitSeqNo gltSnapshotCSN;
+    CommitSeqNo gltCommitCSN;
     /* Support for group transaction status update. */
     bool clogGroupMember;                   /* true, if member of clog group */
     pg_atomic_uint32 clogGroupNext;         /* next clog group member */

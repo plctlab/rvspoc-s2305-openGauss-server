@@ -93,6 +93,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "access/cstore_am.h"
+#include "access/glt.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "commands/tablespace.h"
@@ -2497,7 +2498,11 @@ void FinishPreparedTransaction(const char *gid, bool isCommit)
          */
         if (useLocalXid || !IsPostmasterEnvironment || GTM_FREE_MODE) {
             SetXact2CommitInProgress(xid, 0);
-            setCommitCsn(getLocalNextCSN());
+            if (enable_glt) {
+                gltMethods->getCommitCSNInTwophase(xid);
+            } else {
+                setCommitCsn(getLocalNextCSN());
+            }
         }
 
 #ifdef ENABLE_MOT

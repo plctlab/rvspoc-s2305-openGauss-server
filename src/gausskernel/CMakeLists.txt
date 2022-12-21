@@ -163,6 +163,7 @@ endif()
 list(APPEND gaussdb_objects
     $<TARGET_OBJECTS:common_backend_pgxc_single_barrier>
     $<TARGET_OBJECTS:common_backend_pgxc_single_copy>
+    $<TARGET_OBJECTS:gausskernel_storage_access_glt>
     $<TARGET_OBJECTS:gausskernel_storage_access_heap>
     $<TARGET_OBJECTS:gausskernel_storage_access_index>
     $<TARGET_OBJECTS:gausskernel_storage_access_nbtree>

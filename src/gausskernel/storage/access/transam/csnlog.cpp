@@ -116,6 +116,10 @@ void CSNLogSetCommitSeqNo(TransactionId xid, int nsubxids, TransactionId *subxid
     int offset = 0;
     TransactionId topxid = xid;
 
+    ereport(DEBUG1,
+        (errmsg("CSNLogSetCommitSeqNo xid %ld csn %lu", 
+        xid, csn)));
+
     /* for standby node, don't set invalid or abort csn mark. */
     if ((t_thrd.xact_cxt.useLocalSnapshot ||
          g_instance.attr.attr_storage.IsRoachStandbyCluster) &&

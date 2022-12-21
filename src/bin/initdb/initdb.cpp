@@ -207,6 +207,7 @@ static char* snapshot_names[] = { "schema", "create", "prepare", "sample", "publ
 static char* snapshot_files[SNAPSHOT_LEN];
 static bool enableDCF = false;
 #endif
+static bool enableGLT = false;
 static bool made_new_pgdata = false;
 static bool found_existing_pgdata = false;
 static bool made_new_xlogdir = false;
@@ -1593,6 +1594,12 @@ static void setup_config(void)
         conflines = replace_token(conflines, "#ss_enable_dss = off", repltok);
 
         conflines = ss_addnodeparmater(conflines);
+    }
+    
+    if (enableGLT) {
+        nRet = strcpy_s(repltok, sizeof(repltok), "enable_glt = on");
+        securec_check_ss_c(nRet, "\0", "\0");
+        conflines = replace_token(conflines, "#enable_glt = off", repltok);
     }
 
     nRet = sprintf_s(path, sizeof(path), "%s/postgresql.conf", pg_data);
@@ -3969,6 +3976,7 @@ int main(int argc, char* argv[])
         {"socketpath", required_argument, NULL, 16},
         {"enable-dss", no_argument, NULL, 17},
         {"dms_url", required_argument, NULL, 18},
+        {"enable-glt", no_argument, NULL, 19},
         {NULL, 0, NULL, 0}};
 
     int c, i, ret;
@@ -4274,6 +4282,10 @@ int main(int argc, char* argv[])
                 check_input_spec_char(optarg);
                 ss_nodedatainfo = xstrdup(optarg);
                 break;
+            case 19:
+                enableGLT = true;
+                break;
+
             default:
                 /* getopt_long already emitted a complaint */
                 write_stderr(_("Try \"%s --help\" for more information.\n"), progname);

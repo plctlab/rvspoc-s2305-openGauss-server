@@ -42,6 +42,7 @@
 #include "access/xact.h"
 #include "access/ustore/undo/knl_uundoapi.h"
 #include "access/double_write.h"
+#include "access/glt.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
@@ -9171,6 +9172,10 @@ int PostgresMain(int argc, char* argv[], const char* dbname, const char* usernam
 
                 stmt_name = pq_getmsgstring(&input_message);
                 query_string = pq_getmsgstring(&input_message);
+
+                /* check sql if is a glt command */
+                gltMethods->checkIsGLTCommand(query_string);
+
                 if (strlen(query_string) > SECUREC_MEM_MAX_LEN) {
                     ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                                     errmsg("Too long query_string.")));
