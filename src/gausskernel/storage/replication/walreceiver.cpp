@@ -74,7 +74,9 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "gssignal/gs_signal.h"
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 
 #include "flock.h"
 #include "postmaster/postmaster.h"
@@ -277,18 +279,22 @@ static void walRcvCtlBlockInit()
     securec_check_c(rc, "\0", "\0");
 
     t_thrd.walreceiver_cxt.walRcvCtlBlock = (WalRcvCtlBlock *)buf;
+#ifdef ENABLE_BBOX
     if (BBOX_BLACKLIST_WALREC_CTL_BLOCK) {
         bbox_blacklist_add(WALRECIVER_CTL_BLOCK, t_thrd.walreceiver_cxt.walRcvCtlBlock, len);
     }
+#endif
 
     SpinLockInit(&t_thrd.walreceiver_cxt.walRcvCtlBlock->mutex);
 }
 
 static void walRcvCtlBlockFini()
 {
+#ifdef ENABLE_BBOX
     if (BBOX_BLACKLIST_WALREC_CTL_BLOCK) {
         bbox_blacklist_remove(WALRECIVER_CTL_BLOCK, t_thrd.walreceiver_cxt.walRcvCtlBlock);
     }
+#endif
 
     pfree(t_thrd.walreceiver_cxt.walRcvCtlBlock);
     t_thrd.walreceiver_cxt.walRcvCtlBlock = NULL;
