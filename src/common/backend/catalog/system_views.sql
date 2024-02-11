@@ -1386,7 +1386,22 @@ create table gs_wlm_session_query_info_all
     pl_compilation_time  bigint,
     net_send_time        bigint,
     data_io_time         bigint,
-    is_slow_query        bigint
+    is_slow_query        bigint,
+    srt1_q               bigint,
+    srt2_simple_query    bigint,
+    srt3_analyze_rewrite bigint,
+    srt4_plan_query      bigint,
+    srt5_light_query     bigint,
+    srt6_p               bigint,
+    srt7_b               bigint,
+    srt8_e               bigint,
+    srt9_d               bigint,
+    srt10_s              bigint,
+    srt11_c              bigint,
+    srt12_u              bigint,
+    srt13_before_query   bigint,
+    srt14_after_query    bigint,
+    rtt_unknown          bigint
 );
 
 CREATE VIEW gs_wlm_session_info_all AS
@@ -2199,18 +2214,18 @@ LANGUAGE SQL IMMUTABLE STRICT NOT FENCED;
 CREATE CAST (INTERVAL AS VARCHAR2) WITH FUNCTION pg_catalog.TO_VARCHAR2(INTERVAL) AS IMPLICIT;
 
 /* char,varchar2 to interval */
-CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(BPCHAR)
+CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(BPCHAR, int)
 RETURNS INTERVAL
-AS $$  select pg_catalog.interval_in(pg_catalog.bpcharout($1), 0::Oid, -1) $$
+AS $$  select pg_catalog.interval_in(pg_catalog.bpcharout($1), 0::Oid, $2) $$
 LANGUAGE SQL IMMUTABLE STRICT NOT FENCED;
 
-CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2)
+CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2, int)
 RETURNS INTERVAL
-AS $$  select pg_catalog.interval_in(pg_catalog.varcharout($1), 0::Oid, -1) $$
+AS $$  select pg_catalog.interval_in(pg_catalog.varcharout($1), 0::Oid, $2) $$
 LANGUAGE SQL IMMUTABLE STRICT NOT FENCED;
 
-CREATE CAST (BPCHAR AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(BPCHAR) AS IMPLICIT;
-CREATE CAST (VARCHAR2 AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2) AS IMPLICIT;
+CREATE CAST (BPCHAR AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(BPCHAR, int) AS IMPLICIT;
+CREATE CAST (VARCHAR2 AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2, int) AS IMPLICIT;
 
 /* raw to varchar2 */
 CREATE CAST (RAW AS VARCHAR2) WITH FUNCTION pg_catalog.rawtohex(RAW) AS IMPLICIT;
@@ -3487,7 +3502,24 @@ CREATE unlogged table statement_history(
     details bytea,
     is_slow_sql bool,
     trace_id text,
-    advise text
+    advise text,
+    net_send_time bigint,
+    srt1_q bigint,
+    srt2_simple_query bigint,
+    srt3_analyze_rewrite bigint,
+    srt4_plan_query bigint,
+    srt5_light_query bigint,
+    srt6_p bigint,
+    srt7_b bigint,
+    srt8_e bigint,
+    srt9_d bigint,
+    srt10_s bigint,
+    srt11_c bigint,
+    srt12_u bigint,
+    srt13_before_query bigint,
+    srt14_after_query bigint,
+    rtt_unknown bigint,
+    parent_query_id bigint
 );
 REVOKE ALL on table pg_catalog.statement_history FROM public;
 create index statement_history_time_idx on pg_catalog.statement_history USING btree (start_time, is_slow_sql);
@@ -3556,12 +3588,16 @@ SELECT * FROM pg_catalog.pv_thread_memory_detail() WHERE contextname LIKE '%Loca
 
 CREATE VIEW pg_publication_tables AS
     SELECT
-        P.pubname AS pubname,
+        gpt.pubname AS pubname,
         N.nspname AS schemaname,
         C.relname AS tablename
-    FROM pg_publication P, pg_class C
+    FROM (SELECT
+         P.pubname,
+         pg_catalog.pg_get_publication_tables(P.pubname) relid
+         FROM pg_publication P) gpt,
+         pg_class C
          JOIN pg_namespace N ON (N.oid = C.relnamespace)
-    WHERE C.oid IN (SELECT relid FROM pg_catalog.pg_get_publication_tables(P.pubname));
+    WHERE C.oid = gpt.relid;
 
 CREATE VIEW pg_stat_subscription AS
     SELECT
@@ -3577,6 +3613,92 @@ CREATE VIEW pg_stat_subscription AS
     FROM pg_subscription su
             LEFT JOIN pg_catalog.pg_stat_get_subscription(NULL) st
                       ON (st.subid = su.oid);
+
+CREATE SEQUENCE coverage.proc_coverage_coverage_id_seq START 1;
+CREATE unlogged table coverage.proc_coverage(
+	coverage_id bigint NOT NULL DEFAULT nextval('coverage.proc_coverage_coverage_id_seq'::regclass),
+	pro_oid oid NOT NULL,
+	pro_name text NOT NULL,
+	db_name text NOT NULL,
+	pro_querys text NOT NULL,
+	pro_canbreak bool[] NOT NULL,
+	coverage int[] NOT NULL
+);
+REVOKE ALL on table coverage.proc_coverage FROM public;
+
+CREATE OR REPLACE FUNCTION pg_catalog.array_integer_agg_add(int[], int[])
+RETURNS int[]
+AS $$
+DECLARE
+    result int[];
+    len int;
+    i int;
+    BEGIN
+        IF $1 IS NULL THEN
+            RETURN $2;
+        END IF;
+
+        IF $2 IS NULL THEN
+            RETURN $1;
+        END IF;
+
+        len := GREATEST(array_length($1, 1), array_length($2, 1));
+        result := $1;
+
+        FOR i IN 1..len LOOP
+            result[i] := COALESCE($1[i], 0) + COALESCE($2[i], 0);
+        END LOOP;
+
+        RETURN result;
+    END;$$
+LANGUAGE 'plpgsql' IMMUTABLE;
+
+CREATE AGGREGATE pg_catalog.array_integer_sum(int[]) (
+    SFUNC = array_integer_agg_add,
+    STYPE = int[]
+);
+
+CREATE OR REPLACE FUNCTION pg_catalog.coverage_arrays(booleans bool[], integers int[])
+RETURNS int[] AS $$
+DECLARE
+    result int[] := ARRAY[]::int[];
+    i int;
+BEGIN
+    FOR i IN 1..array_length(booleans, 1) LOOP
+        IF booleans[i] THEN
+            result := array_append(result, integers[i]);
+        ELSE
+            result := array_append(result, -1);
+        END IF;
+    END LOOP;
+
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION pg_catalog.calculate_coverage(numbers int[])
+RETURNS float8 AS $$
+DECLARE
+    count_ge_1 int := 0;
+    count_ge_0 int := 0;
+    ratio float8;
+BEGIN
+	FOR i IN 1..array_length(numbers, 1) LOOP
+		IF numbers[i] >= 1 THEN
+			count_ge_1 := count_ge_1 + 1;
+		END IF;
+		IF numbers[i] >= 0 THEN
+			count_ge_0 := count_ge_0 + 1;
+		END IF;
+	END LOOP;
+
+	IF count_ge_0 > 0 THEN
+		ratio := count_ge_1::float8 / count_ge_0::float8;
+	END IF;
+
+    RETURN ratio;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
 
 CREATE VIEW pg_replication_origin_status AS
     SELECT *

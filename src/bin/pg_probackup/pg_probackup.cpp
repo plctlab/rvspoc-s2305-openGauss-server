@@ -153,6 +153,7 @@ static void opt_show_format(ConfigOption *opt, const char *arg);
 
 static void compress_init(void);
 static void dss_init(void);
+static int ss_get_primary_id(void);
 
 /*
  * Short name should be non-printable ASCII character.
@@ -707,6 +708,17 @@ static void check_backid_option(char *command_name)
         dbuser = gs_pstrdup(instance_config.conn_opt.pguser);
 }
 
+static void check_dss_input()
+{
+    if (!instance_config.dss.enable_dss && instance_config.dss.vgname != NULL) {
+        instance_config.dss.enable_dss = true;
+    }
+
+    if (instance_config.dss.enable_dss && instance_config.dss.socketpath == NULL) {
+        instance_config.dss.socketpath = getSocketpathFromEnv();
+    }
+}
+
 int main(int argc, char *argv[])
 {
     char       *command = NULL,
@@ -761,7 +773,7 @@ int main(int argc, char *argv[])
     optind += 1;
     /* Parse command line only arguments */
     parse_cmdline_args(argc, argv, command_name);
-    
+
     /* Initialize logger */
     init_logger(backup_path, &instance_config.logger);
     
@@ -829,6 +841,8 @@ int main(int argc, char *argv[])
 
     /* compress_init */
     compress_init();
+
+    check_dss_input();
 
     dss_init();
 
@@ -927,6 +941,52 @@ compress_init(void)
     }
 }
 
+static int ss_get_primary_id(void)
+{
+    int fd = -1;
+    int len = 0;
+    int primary_id = -1;
+    errno_t rc = 0;
+    struct stat statbuf;
+    char control_file_path[MAXPGPATH];
+
+    rc = memset_s(control_file_path, MAXPGPATH, 0, MAXPGPATH);
+    securec_check_c(rc, "\0", "\0");
+    rc = snprintf_s(control_file_path, MAXPGPATH, MAXPGPATH - 1, "%s/pg_control", instance_config.dss.vgdata);
+    securec_check_ss_c(rc, "\0", "\0");
+
+    fd = open(control_file_path, O_RDONLY | PG_BINARY, 0);
+    if (fd < 0) {
+        pg_log(PG_WARNING, _("failed to open pg_contol\n"));
+        close(fd);
+        exit(1);
+    }
+
+    if (stat(control_file_path, &statbuf) < 0) {
+        pg_log(PG_WARNING, _("failed to stat pg_contol\n"));
+        close(fd);
+        exit(1);
+    }
+
+    len = statbuf.st_size;
+    char *tmpBuffer = (char*)malloc(len + 1);
+
+    if ((read(fd, tmpBuffer, len)) != len) {
+        close(fd);
+        free(tmpBuffer);
+        pg_log(PG_WARNING, _("failed to read pg_contol\n"));
+        exit(1);
+    }
+
+    ss_reformer_ctrl_t* reformerCtrl;
+
+    /* Calculate the offset to obtain the primary_id of the last page */
+    reformerCtrl = (ss_reformer_ctrl_t*)(tmpBuffer + REFORMER_CTL_INSTANCEID * PG_CONTROL_SIZE);
+    primary_id = reformerCtrl->primaryInstId;
+    free(tmpBuffer);
+    return primary_id;
+}
+
 static void dss_init(void)
 {
     if (IsDssMode()) {
@@ -953,12 +1013,13 @@ static void dss_init(void)
         parse_vgname_args(instance_config.dss.vgname);
 
         /* Check dss connect */
-        if (!dss_exist_dir(instance_config.dss.vgdata)) {
+        struct stat st;
+        if (stat(instance_config.dss.vgdata, &st) != 0 || !S_ISDIR(st.st_mode)) {
             elog(ERROR, "Could not connect dssserver, vgdata: \"%s\", socketpath: \"%s\", check and retry later.",
                  instance_config.dss.vgdata, instance_config.dss.socketpath);
         }
 
-        if (strlen(instance_config.dss.vglog) && !dss_exist_dir(instance_config.dss.vglog)) {
+        if (strlen(instance_config.dss.vglog) && (stat(instance_config.dss.vglog, &st) != 0 || !S_ISDIR(st.st_mode))) {
             elog(ERROR, "Could not connect dssserver, vglog: \"%s\", socketpath: \"%s\", check and retry later.",
                  instance_config.dss.vglog, instance_config.dss.socketpath);
         }
@@ -968,6 +1029,14 @@ static void dss_init(void)
         if (id < MIN_INSTANCEID || id > MAX_INSTANCEID) {
             elog(ERROR, "Instance id must be specified in dss mode, valid range is %d - %d.",
                 MIN_INSTANCEID, MAX_INSTANCEID);
+        }
+
+        if (backup_subcmd == BACKUP_CMD || backup_subcmd == ADD_INSTANCE_CMD) {
+            int primary_instance_id = ss_get_primary_id();
+            if (id != primary_instance_id) {
+                elog(ERROR, "backup only support on primary in dss mode, primary instance id: %d, backup instance id: %d",
+                    primary_instance_id, id);
+            }
         }
 
         if (backup_subcmd != RESTORE_CMD) {

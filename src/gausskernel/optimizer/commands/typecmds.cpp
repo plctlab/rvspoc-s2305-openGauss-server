@@ -83,6 +83,9 @@
 #include "utils/rel_gs.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+#include "utils/typcache.h"
+#include "catalog/gs_dependencies_fn.h"
+#include "catalog/pg_object.h"
 
 /* result structure for get_rels_with_domain() */
 typedef struct {
@@ -644,6 +647,20 @@ ObjectAddress DefineType(List* names, List* parameters)
  */
 void RemoveTypeById(Oid typeOid)
 {
+#ifndef ENABLE_MULTIPLE_NODES
+    GsDependObjDesc ref_obj;
+    if (t_thrd.proc->workingVersionNum >= SUPPORT_GS_DEPENDENCY_VERSION_NUM) {
+        gsplsql_init_gs_depend_obj_desc(&ref_obj);
+        char relkind = get_rel_relkind(typeOid);
+        if (relkind == RELKIND_COMPOSITE_TYPE || relkind == '\0') {
+            ref_obj.name = NULL;
+            Oid elem_oid = get_array_internal_depend_type_oid(typeOid);
+            if (!OidIsValid(elem_oid)) {
+                gsplsql_get_depend_obj_by_typ_id(&ref_obj, typeOid, InvalidOid, true);
+            }
+        }
+    }
+#endif
     Relation relation;
     HeapTuple tup;
 
@@ -682,6 +699,37 @@ void RemoveTypeById(Oid typeOid)
     ReleaseSysCache(tup);
 
     heap_close(relation, RowExclusiveLock);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= SUPPORT_GS_DEPENDENCY_VERSION_NUM && NULL != ref_obj.name) {
+        CommandCounterIncrement();
+        ref_obj.refPosType = GSDEPEND_REFOBJ_POS_IN_TYPE;
+        gsplsql_remove_type_gs_dependency(&ref_obj);
+        if (enable_plpgsql_gsdependency_guc()) {
+            ref_obj.type = GSDEPEND_OBJECT_TYPE_TYPE;
+            (void)gsplsql_remove_ref_dependency(&ref_obj);
+            Oid pkg_oid = GetTypePackageOid(typeOid);
+            if (OidIsValid(pkg_oid)) {
+                bool invalid_pkg = true;
+                if (NULL != u_sess->plsql_cxt.curr_compile_context &&
+                    NULL != u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package) {
+                    invalid_pkg = pkg_oid ==
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid;
+                }
+                if (invalid_pkg) {
+                    bool is_spec = ref_obj.name[0] != '$';
+                    SetPgObjectValid(pkg_oid, is_spec ? OBJECT_TYPE_PKGSPEC : OBJECT_TYPE_PKGBODY, false);
+                    if (is_spec) {
+                        SetPgObjectValid(pkg_oid, OBJECT_TYPE_PKGBODY, false);
+                    }
+                    gsplsql_set_pkg_func_status(GetPackageNamespace(pkg_oid), pkg_oid, false);
+                }
+            }
+        }
+        pfree_ext(ref_obj.schemaName);
+        pfree_ext(ref_obj.packageName);
+        pfree_ext(ref_obj.name);
+    }
+#endif
 }
 
 /*
@@ -2041,6 +2089,75 @@ Oid AssignTypeArrayOid(void)
     return type_array_oid;
 }
 
+static ObjectAddress ReplaceTableOfType(Oid oldTypeOid, Oid refTypeOid)
+{
+    Relation pg_type_desc = NULL;
+    HeapTuple typtuple = NULL;
+    Form_pg_type typform = NULL;
+    Oid old_elemtype = InvalidOid;
+    ObjectAddress address;
+
+    ObjectAddressSet(address, TypeRelationId, oldTypeOid);
+    /* if any table depend on this type, report ERROR */
+    ReplaceTypeCheckRef(&address);
+
+    /* change typelem in pg_type */
+    pg_type_desc = heap_open(TypeRelationId, RowExclusiveLock);
+    typtuple = SearchSysCacheCopy1(TYPEOID, ObjectIdGetDatum(oldTypeOid));
+    if (!HeapTupleIsValid(typtuple)) {
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), 
+            errmsg("cache lookup failed for type %u", oldTypeOid)));
+    }
+    typform = (Form_pg_type)GETSTRUCT(typtuple);
+    if (typform->typtype != TYPTYPE_TABLEOF) {
+        tableam_tops_free_tuple(typtuple);
+        ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), 
+            errmsg("type already exists but not a table of type")));
+    }
+    old_elemtype = typform->typelem;
+    typform->typelem = refTypeOid;
+    simple_heap_update(pg_type_desc, &typtuple->t_self, typtuple);
+    /* update the system catalog indexes */
+    CatalogUpdateIndexes(pg_type_desc, typtuple);
+
+    tableam_tops_free_tuple(typtuple);
+    heap_close(pg_type_desc, RowExclusiveLock);
+
+    /* find record between type and old_elemtype in pg_depend, and remove it */
+    Relation depRel = NULL;
+    ScanKeyData key[2];
+    int nkeys = 2;
+    SysScanDesc scan = NULL;
+    HeapTuple tup = NULL;
+    depRel = heap_open(DependRelationId, RowExclusiveLock);
+    ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(TypeRelationId));
+    ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(oldTypeOid));
+    scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, nkeys, key);
+
+    while (HeapTupleIsValid(tup = systable_getnext(scan))) {
+        Form_pg_depend foundDep = (Form_pg_depend)GETSTRUCT(tup);
+        if (foundDep->refobjid == old_elemtype) {
+            simple_heap_delete(depRel, &tup->t_self);
+        }
+    }
+    systable_endscan(scan);
+    heap_close(depRel, RowExclusiveLock);
+
+    /* record with new elemtype */
+    ObjectAddress myself, referenced;
+    myself.classId = TypeRelationId;
+    myself.objectId = oldTypeOid;
+    myself.objectSubId = 0;
+    referenced.classId = TypeRelationId;
+    referenced.objectId = refTypeOid;
+    referenced.objectSubId = 0;
+    recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+
+    CommandCounterIncrement();
+
+    return address;
+}
+
 /*
  * DefineRange
  *		Registers a new table of type.
@@ -2088,7 +2205,7 @@ ObjectAddress DefineTableOfType(const TableOfTypeStmt* stmt)
      */
     typoid = GetSysCacheOid2(TYPENAMENSP, CStringGetDatum(typname), ObjectIdGetDatum(typeNamespace));
     if (OidIsValid(typoid)) {
-        if (!moveArrayTypeName(typoid, typname, typeNamespace))
+        if (!moveArrayTypeName(typoid, typname, typeNamespace) && !stmt->replace)
             ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("type \"%s\" already exists", typname)));
     }
 
@@ -2133,38 +2250,43 @@ ObjectAddress DefineTableOfType(const TableOfTypeStmt* stmt)
     }
     ReleaseSysCache(type_tup);
 
-    /* Create the pg_type entry */
-    return TypeCreate(InvalidOid, /* no predetermined type OID */
-        typname,                    /* type name */
-        typeNamespace,              /* namespace */
-        InvalidOid,                 /* relation oid (n/a here) */
-        0,                          /* relation kind (ditto) */
-        typowner,                   /* owner's ID */
-        -1,                         /* internal size (always varlena) */
-        TYPTYPE_TABLEOF,            /* type-type (table of type) */
-        TYPCATEGORY_TABLEOF,        /* type-category (table of type) */
-        false,                      /* table of types are never preferred */
-        DEFAULT_TYPDELIM,           /* array element delimiter */
-        F_ARRAY_IN,                 /* array input proc */
-        F_ARRAY_OUT,                /* array output proc */
-        F_ARRAY_RECV,               /* array recv (bin) proc */
-        F_ARRAY_SEND,               /* array send (bin) proc */
-        InvalidOid,                 /* typmodin procedure - none */
-        InvalidOid,                 /* typmodout procedure - none */
-        F_ARRAY_TYPANALYZE,         /* array analyze procedure */
-        refTypeOid,                 /* element type ID - none */
-        false,                      /* this is not an array type */
-        InvalidOid,                 /* array type we are about to create */
-        InvalidOid,                 /* base type ID (only for domains) */
-        NULL,                       /* never a default type value */
-        NULL,                       /* no binary form available either */
-        false,                      /* never passed by value */
-        'd',                        /* alignment */
-        'x',                        /* TOAST strategy (always extended) */
-        -1,                         /* typMod (Domains only) */
-        0,                          /* Array dimensions of typbasetype */
-        false,                      /* Type NOT NULL */
-        InvalidOid);                /* type's collation (ranges never have one) */
+    if (OidIsValid(typoid) && get_typisdefined(typoid)) {
+        return ReplaceTableOfType(typoid, refTypeOid);
+    } else {
+        /* Create the pg_type entry */
+        return TypeCreate(InvalidOid, /* no predetermined type OID */
+            typname,                    /* type name */
+            typeNamespace,              /* namespace */
+            InvalidOid,                 /* relation oid (n/a here) */
+            0,                          /* relation kind (ditto) */
+            typowner,                   /* owner's ID */
+            -1,                         /* internal size (always varlena) */
+            TYPTYPE_TABLEOF,            /* type-type (table of type) */
+            TYPCATEGORY_TABLEOF,        /* type-category (table of type) */
+            false,                      /* table of types are never preferred */
+            DEFAULT_TYPDELIM,           /* array element delimiter */
+            F_ARRAY_IN,                 /* array input proc */
+            F_ARRAY_OUT,                /* array output proc */
+            F_ARRAY_RECV,               /* array recv (bin) proc */
+            F_ARRAY_SEND,               /* array send (bin) proc */
+            InvalidOid,                 /* typmodin procedure - none */
+            InvalidOid,                 /* typmodout procedure - none */
+            F_ARRAY_TYPANALYZE,         /* array analyze procedure */
+            refTypeOid,                 /* element type ID - none */
+            false,                      /* this is not an array type */
+            InvalidOid,                 /* array type we are about to create */
+            InvalidOid,                 /* base type ID (only for domains) */
+            NULL,                       /* never a default type value */
+            NULL,                       /* no binary form available either */
+            false,                      /* never passed by value */
+            'd',                        /* alignment */
+            'x',                        /* TOAST strategy (always extended) */
+            -1,                         /* typMod (Domains only) */
+            0,                          /* Array dimensions of typbasetype */
+            false,                      /* Type NOT NULL */
+            InvalidOid);                /* type's collation (ranges never have one) */
+    }
+    
 }
 
 /* -------------------------------------------------------------------
@@ -3283,6 +3405,14 @@ ObjectAddress RenameType(RenameStmt* stmt)
     }
 #endif
 
+    if (enable_plpgsql_gsdependency_guc() &&
+        gsplsql_is_object_depend(typeOid, GSDEPEND_OBJECT_TYPE_TYPE)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+                errmsg("The rename operator of %s is not allowed, because it is referenced by the other object.",
+                    TypeNameToString(typname))));
+    }
+
     /*
      * If type is composite we need to rename associated pg_class entry too.
      * RenameRelationInternal will call RenameTypeInternal automatically.
@@ -3633,6 +3763,13 @@ Oid AlterTypeNamespace_oid(Oid typeOid, Oid nspOid, ObjectAddresses* objsMoved)
                 errmsg("cannot alter array type %s", format_type_be(typeOid)),
                 errhint("You can alter type %s, which will alter the array type as well.", format_type_be(elemOid))));
 
+    if (enable_plpgsql_gsdependency_guc() &&
+        gsplsql_is_object_depend(typeOid, GSDEPEND_OBJECT_TYPE_TYPE)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+                errmsg("The set schema operator of %s is not allowed, because it is referenced by the other object.",
+                    get_typename(typeOid))));
+    }
     /* and do the work */
     return AlterTypeNamespaceInternal(typeOid, nspOid, false, true, objsMoved);
 }
@@ -3653,7 +3790,7 @@ Oid AlterTypeNamespace_oid(Oid typeOid, Oid nspOid, ObjectAddresses* objsMoved)
  * Returns the type's old namespace OID.
  */
 Oid AlterTypeNamespaceInternal(
-    Oid typeOid, Oid nspOid, bool isImplicitArray, bool errorOnTableType, ObjectAddresses* objsMoved)
+    Oid typeOid, Oid nspOid, bool isImplicitArray, bool errorOnTableType, ObjectAddresses* objsMoved, char* newTypeName)
 {
     Relation rel;
     HeapTuple tup;
@@ -3687,7 +3824,8 @@ Oid AlterTypeNamespaceInternal(
     CheckSetNamespace(oldNspOid, nspOid, TypeRelationId, typeOid);
 
     /* check for duplicate name (more friendly than unique-index failure) */
-    if (SearchSysCacheExists2(TYPENAMENSP, CStringGetDatum(NameStr(typform->typname)), ObjectIdGetDatum(nspOid)))
+    char* checkTypeName = (newTypeName == NULL) ? NameStr(typform->typname) : newTypeName;
+    if (SearchSysCacheExists2(TYPENAMENSP, CStringGetDatum(checkTypeName), ObjectIdGetDatum(nspOid)))
         ereport(ERROR,
             (errcode(ERRCODE_DUPLICATE_OBJECT),
                 errmsg("type \"%s\" already exists in schema \"%s\"",
@@ -3709,6 +3847,9 @@ Oid AlterTypeNamespaceInternal(
      * tup is a copy, so we can scribble directly on it
      */
     typform->typnamespace = nspOid;
+    if (newTypeName != NULL) {
+    	(void)namestrcpy(&(typform->typname), newTypeName);
+    }
 
     simple_heap_update(rel, &tup->t_self, tup);
     CatalogUpdateIndexes(rel, tup);
@@ -3756,8 +3897,10 @@ Oid AlterTypeNamespaceInternal(
     add_exact_object_address(&thisobj, objsMoved);
 
     /* Recursively alter the associated array type, if any */
-    if (OidIsValid(arrayOid))
-        AlterTypeNamespaceInternal(arrayOid, nspOid, true, true, objsMoved);
+    if (OidIsValid(arrayOid)) {
+        AlterTypeNamespaceInternal(arrayOid, nspOid, true, true, objsMoved,
+                                    (newTypeName == NULL) ? NULL : makeArrayTypeName(newTypeName, nspOid));
+    }
 
     return oldNspOid;
 }

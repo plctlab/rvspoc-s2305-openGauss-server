@@ -94,6 +94,9 @@
 
 /* Hook for plugins to get control in planner() */
 THR_LOCAL ndp_pushdown_hook_type ndp_pushdown_hook = NULL;
+#ifdef USE_SPQ
+THR_LOCAL spq_planner_hook_type spq_planner_hook = NULL;
+#endif
 
 #ifndef MIN
 #define MIN(A, B) ((B) < (A) ? (B) : (A))
@@ -142,7 +145,10 @@ static Plan* inheritance_planner(PlannerInfo* root);
 static Plan* grouping_planner(PlannerInfo* root, double tuple_fraction);
 static void preprocess_rowmarks(PlannerInfo* root);
 static double preprocess_limit(PlannerInfo* root, double tuple_fraction, int64* offset_est, int64* count_est);
-
+static void process_sort(Query* parse, PlannerInfo* root, PlannerTargets* plannerTargets, Plan** resultPlan, 
+    List* tlist, List* collectiveGroupExpr, List** currentPathKeys, double limitTuples, FDWUpperRelCxt* ufdwCxt);
+static void process_rowMarks(Query* parse, Plan** resultPlan, PlannerInfo* root, List** currentPathKeys, 
+    FDWUpperRelCxt* ufdwCxt);
 static bool grouping_is_can_hash(Query* parse, AggClauseCosts* agg_costs);
 static Size compute_hash_entry_size(bool vectorized, Path* cheapest_path, int path_width, AggClauseCosts* agg_costs);
 static bool choose_hashed_grouping(PlannerInfo* root, double tuple_fraction, double limit_tuples, int path_width,
@@ -377,6 +383,12 @@ PlannedStmt* planner(Query* parse, int cursorOptions, ParamListInfo boundParams)
     instr_time starttime;
     double totaltime = 0;
 
+#ifdef USE_SPQ
+    if (spq_planner_hook) {
+        return (*spq_planner_hook) (parse, cursorOptions, boundParams);
+    }
+#endif
+
     INSTR_TIME_SET_CURRENT(starttime);
 
 #ifdef PGXC
@@ -390,9 +402,12 @@ PlannedStmt* planner(Query* parse, int cursorOptions, ParamListInfo boundParams)
      * A Coordinator receiving a query from another Coordinator
      * is not allowed to go into PGXC planner.
      */
-    if ((IS_PGXC_COORDINATOR || IS_SINGLE_NODE) && !IsConnFromCoord())
+    if (u_sess->hook_cxt.pluginPlannerHook){
+        result = (*(planner_hook_type) u_sess->hook_cxt.pluginPlannerHook)\
+                 (parse, cursorOptions, boundParams);
+    } else if ((IS_PGXC_COORDINATOR || IS_SINGLE_NODE) && !IsConnFromCoord()){
         result = pgxc_planner(parse, cursorOptions, boundParams);
-    else
+    } else
 #endif
         result = standard_planner(parse, cursorOptions, boundParams);
 
@@ -522,6 +537,8 @@ PlannedStmt* standard_planner(Query* parse, int cursorOptions, ParamListInfo bou
     bool use_tenant = false;
     List* parse_hint_warning = NIL;
 
+    if (cursorOptions & CURSOR_OPT_SPQ_OK)
+        cursorOptions &= ~CURSOR_OPT_SPQ_OK;
     //if it is pgxc plan for tsstore delete sql.errport
     if((!u_sess->attr.attr_sql.enable_stream_operator || !u_sess->opt_cxt.is_stream) && IS_PGXC_COORDINATOR) {
         checkTsstoreQuery(parse);
@@ -1260,6 +1277,24 @@ static inline bool contain_system_column(Node *var_list)
     return result;
 }
 
+static inline bool contain_placeholdervar(Node *var_list)
+{
+    List* vars = pull_var_clause(var_list, PVC_RECURSE_AGGREGATES, PVC_INCLUDE_PLACEHOLDERS);
+    ListCell* lc = NULL;
+    bool result = false;
+
+    foreach (lc, vars) {
+        Node* var = (Node*)lfirst(lc);
+        if (IsA(var, PlaceHolderVar)) {
+            result = true;
+            break;
+        }
+    }
+
+    list_free_ext(vars);
+    return result;
+}
+
 /* --------------------
  * subquery_planner
  *	  Invokes the planner on a subquery.  We recurse to here for each
@@ -1822,6 +1857,10 @@ Plan* subquery_planner(PlannerGlobal* glob, Query* parse, PlannerInfo* parent_ro
                     support_rewrite = false;
                     break;
                 }
+                if (root->parse->jointree != NULL && contain_placeholdervar(root->parse->jointree->quals)) {
+                    support_rewrite = false;
+                    break;
+                }
                 if (!fulljoin_2_left_union_right_anti_support(root->parse)) {
                     support_rewrite = false;
                     break;
@@ -1882,8 +1921,10 @@ Plan* subquery_planner(PlannerGlobal* glob, Query* parse, PlannerInfo* parent_ro
      */
     if (parse->resultRelations && parse->commandType != CMD_INSERT &&
         rt_fetch(linitial_int(parse->resultRelations), parse->rtable)->inh)
+    {
         plan = inheritance_planner(root);
-    else {
+        plan->isinherit = true;
+    } else {
         plan = grouping_planner(root, tuple_fraction);
         /*
         * Make sure the topmost plan node's targetlist exposes the original
@@ -1893,6 +1934,20 @@ Plan* subquery_planner(PlannerGlobal* glob, Query* parse, PlannerInfo* parent_ro
         */
         if (parse->is_flt_frame && parse->hasTargetSRFs && !IsA(plan, ModifyTable)) {
             apply_tlist_labeling(plan->targetlist, root->processed_tlist);
+        }
+
+        /* Change the targetlist chain */
+        ExtensiblePlan* tsdbExtensiblePlan;
+        bool planForInsertTsdb = u_sess->hook_cxt.forTsdbHook && parse->commandType == CMD_INSERT && IsA(plan, ExtensiblePlan);
+
+        if(planForInsertTsdb) {
+            tsdbExtensiblePlan = (ExtensiblePlan*)plan;
+
+            ListCell* lc;
+            foreach(lc,tsdbExtensiblePlan->extensible_plans) {
+                plan = (Plan*)lfirst(lc);
+                break;
+            }
         }
 
         /* If it's not SELECT, we need a ModifyTable node */
@@ -1962,6 +2017,10 @@ Plan* subquery_planner(PlannerGlobal* glob, Query* parse, PlannerInfo* parent_ro
 #ifdef PGXC
             plan = pgxc_make_modifytable(root, plan);
 #endif
+            if(planForInsertTsdb) {
+                tsdbExtensiblePlan->extensible_plans = list_make1(plan);
+                plan = (Plan*)tsdbExtensiblePlan;
+            }
             ((ModifyTable*)plan)->isReplace = parse->isReplace;
         }
     }
@@ -2693,6 +2752,83 @@ static bool has_ts_func(List* tlist)
 }
 #endif
 
+static void process_sort(Query* parse, PlannerInfo* root, PlannerTargets* plannerTargets, Plan** resultPlan, 
+    List* tlist, List* collectiveGroupExpr, List** currentPathKeys, double limitTuples, FDWUpperRelCxt* ufdwCxt) 
+{
+    /*
+     * If ORDER BY was given and we were not able to make the plan come out in
+     * the right order, add an explicit sort step.
+     */
+    if (parse->sortClause) {
+        if (parse->is_flt_frame && parse->hasTargetSRFs) {
+            List* sortInputTarget = build_plan_tlist(root, plannerTargets->final_target);
+            (*resultPlan)->targetlist = sortInputTarget;
+        }
+
+        /*
+         * Set group_set and again build pathkeys, data's value can be altered groupingSet after,
+         * so equal expr can not be deleted from pathkeys. Rebuild pathkey EquivalenceClass's ec_group_set
+         * is true.
+         */
+        rebuild_pathkey_for_groupingSet<sort_pathkey>(root, tlist, NULL, collectiveGroupExpr);
+
+        /* we also need to add sort if the sub node is parallized. */
+        if (!pathkeys_contained_in(root->sort_pathkeys, *currentPathKeys) ||
+            ((*resultPlan)->dop > 1 && root->sort_pathkeys)) {
+            *resultPlan = (Plan*)make_sort_from_pathkeys(root, *resultPlan, root->sort_pathkeys, limitTuples);
+#ifdef STREAMPLAN
+            if (IS_STREAM_PLAN && check_sort_for_upsert(root))
+                *resultPlan = make_stream_sort(root, *resultPlan);
+#endif /* STREAMPLAN */
+            if (IS_PGXC_COORDINATOR && !IS_STREAM && !IsConnFromCoord())
+                *resultPlan = (Plan*)create_remotesort_plan(root, *resultPlan);
+            *currentPathKeys = root->sort_pathkeys;
+        }
+
+        if (parse->is_flt_frame && parse->hasTargetSRFs) {
+            *resultPlan = adjust_plan_for_srfs(root, *resultPlan, 
+                                            plannerTargets->final_targets, 
+                                            plannerTargets->final_targets_contain_srfs);
+        }
+
+        if (ufdwCxt != NULL && ufdwCxt->state != FDW_UPPER_REL_END) {
+            ufdwCxt->orderExtra = (OrderPathExtraData*)palloc(sizeof(OrderPathExtraData));
+            ufdwCxt->orderExtra->targetList = (*resultPlan)->targetlist;
+            AdvanceFDWUpperPlan(ufdwCxt, UPPERREL_ORDERED, *resultPlan);
+        }
+    }
+}
+
+static void process_rowMarks(Query* parse, Plan** resultPlan, PlannerInfo* root, List** currentPathKeys,
+    FDWUpperRelCxt* ufdwCxt) 
+{
+    /*
+    * If there is a FOR [KEY] UPDATE/SHARE clause, add the LockRows node. (Note: we
+    * intentionally test parse->rowMarks not root->rowMarks here. If there
+    * are only non-locking rowmarks, they should be handled by the
+    * ModifyTable node instead.)
+    */
+    if (parse->rowMarks) {
+#ifdef ENABLE_MOT
+        if (!IsMOTEngineUsed()) {
+#endif
+            *resultPlan = (Plan*)make_lockrows(root, *resultPlan);
+#ifdef ENABLE_MOT
+        }
+#endif
+
+        /*
+         * The result can no longer be assumed sorted, since redistribute add
+         * for lockrows may cause the data unsorted.
+         */
+        *currentPathKeys = NIL;
+
+        if (ufdwCxt != NULL && ufdwCxt->state != FDW_UPPER_REL_END) {
+            AdvanceFDWUpperPlan(ufdwCxt, UPPERREL_ROWMARKS, *resultPlan);
+        }
+    }
+}
+
 /* --------------------
  * grouping_planner
  *	  Perform planning steps related to grouping, aggregation, etc.
@@ -2734,7 +2870,7 @@ static Plan* grouping_planner(PlannerInfo* root, double tuple_fraction)
     FDWUpperRelCxt* ufdwCxt = NULL;
     errno_t rc = EOK;
     PlannerTargets* planner_targets = NULL;
-
+    RelOptInfo* for_plugin_rel = NULL;
     if (parse->is_flt_frame) {
         planner_targets = (PlannerTargets*)palloc0(sizeof(PlannerTargets));
         Assert(!root->planner_targets);
@@ -3163,7 +3299,7 @@ static Plan* grouping_planner(PlannerInfo* root, double tuple_fraction)
                                           &sorted_path, 
                                           dNumGroups, 
                                           has_groupby);
-
+        for_plugin_rel = final_rel;
         /* restore superset keys */
         root->dis_keys.superset_keys = superset_key;
 
@@ -4578,78 +4714,14 @@ static Plan* grouping_planner(PlannerInfo* root, double tuple_fraction)
             AdvanceFDWUpperPlan(ufdwCxt, UPPERREL_WINDOW, result_plan);
         }
     }
-
-    /*
-     * If there is a FOR [KEY] UPDATE/SHARE clause, add the LockRows node. (Note: we
-     * intentionally test parse->rowMarks not root->rowMarks here. If there
-     * are only non-locking rowmarks, they should be handled by the
-     * ModifyTable node instead.)
-     */
-    if (parse->rowMarks) {
-#ifdef ENABLE_MOT
-        if (!IsMOTEngineUsed()) {
-#endif
-            result_plan = (Plan*)make_lockrows(root, result_plan);
-#ifdef ENABLE_MOT
-        }
-#endif
-
-        /*
-         * The result can no longer be assumed sorted, since redistribute add
-         * for lockrows may cause the data unsorted.
-         */
-#ifndef PGXC
-        current_pathkeys = NIL;
-#endif
-
-        if (ufdwCxt != NULL && ufdwCxt->state != FDW_UPPER_REL_END) {
-            AdvanceFDWUpperPlan(ufdwCxt, UPPERREL_ROWMARKS, result_plan);
-        }
-    }
-
-    /*
-     * If ORDER BY was given and we were not able to make the plan come out in
-     * the right order, add an explicit sort step.
-     */
-    if (parse->sortClause) {
-        if (parse->is_flt_frame && parse->hasTargetSRFs) {
-            List* sort_input_target = build_plan_tlist(root, planner_targets->final_target);
-            result_plan->targetlist = sort_input_target;
-        }
-
-        /*
-         * Set group_set and again build pathkeys, data's value can be altered groupingSet after,
-         * so equal expr can not be deleted from pathkeys. Rebuild pathkey EquivalenceClass's ec_group_set
-         * is true.
-         */
-        rebuild_pathkey_for_groupingSet<sort_pathkey>(root, tlist, NULL, collectiveGroupExpr);
-
-        /* we also need to add sort if the sub node is parallized. */
-        if (!pathkeys_contained_in(root->sort_pathkeys, current_pathkeys) ||
-            (result_plan->dop > 1 && root->sort_pathkeys)) {
-            result_plan = (Plan*)make_sort_from_pathkeys(root, result_plan, root->sort_pathkeys, limit_tuples);
-#ifdef PGXC
-#ifdef STREAMPLAN
-            if (IS_STREAM_PLAN && check_sort_for_upsert(root))
-                result_plan = make_stream_sort(root, result_plan);
-#endif /* STREAMPLAN */
-            if (IS_PGXC_COORDINATOR && !IS_STREAM && !IsConnFromCoord())
-                result_plan = (Plan*)create_remotesort_plan(root, result_plan);
-#endif /* PGXC */
-            current_pathkeys = root->sort_pathkeys;
-        }
-
-        if (parse->is_flt_frame && parse->hasTargetSRFs) {
-            result_plan = adjust_plan_for_srfs(root, result_plan, 
-                                            planner_targets->final_targets, 
-                                            planner_targets->final_targets_contain_srfs);
-        }
-
-        if (ufdwCxt != NULL && ufdwCxt->state != FDW_UPPER_REL_END) {
-            ufdwCxt->orderExtra = (OrderPathExtraData*)palloc(sizeof(OrderPathExtraData));
-            ufdwCxt->orderExtra->targetList = result_plan->targetlist;
-            AdvanceFDWUpperPlan(ufdwCxt, UPPERREL_ORDERED, result_plan);
-        }
+    if (IS_STREAM_PLAN) {
+        process_rowMarks(parse, &result_plan, root, &current_pathkeys, ufdwCxt);
+        process_sort(parse, root, planner_targets, &result_plan, tlist, collectiveGroupExpr, 
+            &current_pathkeys, limit_tuples, ufdwCxt);
+    } else {
+        process_sort(parse, root, planner_targets, &result_plan, tlist, collectiveGroupExpr, 
+            &current_pathkeys, limit_tuples, ufdwCxt);
+        process_rowMarks(parse, &result_plan, root, &current_pathkeys, ufdwCxt);
     }
 
     /*
@@ -4760,6 +4832,64 @@ static Plan* grouping_planner(PlannerInfo* root, double tuple_fraction)
     }
 #endif
     (void)MemoryContextSwitchTo(oldcontext);
+    if(u_sess->hook_cxt.forTsdbHook && parse->commandType == CMD_INSERT) {
+        
+        for_plugin_rel->reltarget->exprs = tlist;
+        List* newList = NIL;
+        
+        List* returningLists = NIL;
+        List* rowMarks = NIL;
+        
+
+        if (parse->rowMarks)
+            rowMarks = NIL;
+        else
+            rowMarks = root->rowMarks;
+
+        if (parse->returningList)
+            returningLists = list_make1(parse->returningList);
+        else
+            returningLists = NIL;
+
+        newList = (*(for_tsdb_hook_type)u_sess->hook_cxt.forTsdbHook)(root,
+               for_plugin_rel,
+               parse->commandType,
+               parse->canSetTag,
+               parse->resultRelation,
+               list_make1_int(parse->resultRelation),
+               for_plugin_rel->pathlist,
+               list_make1(root),
+               returningLists,
+               rowMarks,
+               SS_assign_special_param(root),
+               tlist);
+
+        /* If not a hypertable*/
+        if (newList == NIL)
+        return result_plan;
+
+        Path* bestPath;
+        bestPath = (Path*) linitial(newList);
+        
+        Plan* tsdbPlan = create_plan(root, bestPath);
+        /* Change targetlist of the last plan */
+        ExtensiblePlan* expPlan1 =(ExtensiblePlan*)tsdbPlan;
+        ExtensiblePlan* expPlan2;
+        ListCell* expL;
+        foreach(expL,expPlan1->extensible_plans) {
+            Plan* planTemp = (Plan*) lfirst(expL);
+
+            if (IsA(planTemp, ExtensiblePlan)) {
+                expPlan2 = (ExtensiblePlan*)planTemp;
+
+                expPlan2->extensible_plans = NIL;
+                result_plan->targetlist = tlist;
+                expPlan2->extensible_plans = lappend(expPlan2->extensible_plans, result_plan);
+            }
+            
+        }
+        return tsdbPlan;
+    }
     return result_plan;
 }
 
@@ -12119,6 +12249,9 @@ bool findConstraintByVar(Var* var, Oid relid, constraintType conType)
         ArrayType* arr = NULL;
 
         adatum = SysCacheGetAttr(CONSTROID, htup, Anum_pg_constraint_conkey, &isNull);
+        if (adatum == 0) {
+            continue;
+        }
 
         arr = DatumGetArrayTypeP(adatum);
         attnums = (int16*)ARR_DATA_PTR(arr);
@@ -15931,3 +16064,88 @@ adjust_plan_for_srfs(PlannerInfo *root, Plan *plan, List *targets, List *targets
     }
     return newplan;
 }
+
+#ifdef USE_SPQ
+static Node* get_spq_multiple_from_expr(
+    PlannerInfo* root, Node* expr, double rows, double* skew_multiple, double* bias_multiple)
+{
+    List* groupExprs = NIL;
+    Oid datatype = exprType((Node*)(expr));
+    bool use_skew_multiple = true;
+
+    if (!OidIsValid(datatype) || !IsSpqTypeDistributable(datatype))
+        return NULL;
+
+    groupExprs = list_make1(expr);
+    get_multiple_from_exprlist(root, groupExprs, rows, &use_skew_multiple, true, skew_multiple, bias_multiple);
+    list_free_ext(groupExprs);
+
+    return expr;
+}
+
+
+List* spq_get_distributekey_from_tlist(
+    PlannerInfo* root, List* tlist, List* groupcls, double rows, double* result_multiple, void* skew_info)
+{
+    ListCell* lcell = NULL;
+    List* distkey = NIL;
+    double multiple = 0.0;
+    double bias_multiple = 0.0;
+    double skew_multiple = 0.0;
+    List* exprMultipleList = NIL;
+
+    foreach (lcell, groupcls) {
+        Node* expr = (Node*)lfirst(lcell);
+
+        if (IsA(expr, SortGroupClause))
+            expr = get_sortgroupclause_expr((SortGroupClause*)expr, tlist);
+
+        expr = get_spq_multiple_from_expr(root, expr, rows, &skew_multiple, &bias_multiple);
+        if (expr != NULL) {
+            /*
+             * we can't estimate skew of grouping sets because there's
+             * null added, so just add all columns and set mutiple to 1
+             */
+            if (root->parse->groupingSets) {
+                distkey = lappend(distkey, expr);
+                *result_multiple = 1;
+                continue;
+            }
+            if ((skew_multiple == 1.0) && (bias_multiple <= 1.0)) {
+                *result_multiple = 1;
+                list_free_ext(exprMultipleList);
+                return list_make1(expr);
+            } else if ((u_sess->pgxc_cxt.NumDataNodes == skew_multiple) &&
+                       (u_sess->pgxc_cxt.NumDataNodes ==
+                           bias_multiple)) { /* All the expr are const, return the first expr.  */
+                if (distkey == NULL)
+                    distkey = lappend(distkey, expr);
+                *result_multiple = u_sess->pgxc_cxt.NumDataNodes;
+
+                continue;
+            } else {
+                if (skew_multiple == 1.0) {
+                    /*
+                     * If distinct num of multiple has no skew, we should use bias multiple to
+                     * compute mix multiple.
+                     */
+                    multiple = bias_multiple;
+                }
+                else if (bias_multiple <= 1.0) /* mcf has no skew, handle skew_multiple */
+                    multiple = skew_multiple;
+                else
+                    multiple = Max(bias_multiple, skew_multiple);
+
+                exprMultipleList = add_multiple_to_list(expr, multiple, exprMultipleList);
+            }
+        }
+    }
+
+    if (exprMultipleList != NULL) {
+        distkey = get_mix_diskey_by_exprlist(root, exprMultipleList, rows, result_multiple, (AggSkewInfo*)skew_info);
+        list_free_ext(exprMultipleList);
+    }
+
+    return distkey;
+}
+#endif

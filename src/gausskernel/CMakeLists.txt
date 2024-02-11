@@ -52,6 +52,7 @@ set(gaussdb_objects
     $<TARGET_OBJECTS:common_backend_utils_cache>
     $<TARGET_OBJECTS:common_backend_utils_error>
     $<TARGET_OBJECTS:common_backend_utils_fmgr>
+    $<TARGET_OBJECTS:common_backend_utils_gsplsql>
     $<TARGET_OBJECTS:common_backend_utils_hash>
     $<TARGET_OBJECTS:common_backend_utils_init>
     $<TARGET_OBJECTS:common_backend_utils_mb>
@@ -138,6 +139,12 @@ set(gaussdb_objects
     $<TARGET_OBJECTS:gausskernel_ddes_dms_adapter>
 )
 
+if("${ENABLE_BBOX}" STREQUAL "OFF")
+list(REMOVE_ITEM gaussdb_objects 
+    $<TARGET_OBJECTS:gausskernel_cbb_bbox>
+)
+endif()
+
 if("${ENABLE_MULTIPLE_NODES}" STREQUAL "OFF")
 list(APPEND gaussdb_objects
     $<TARGET_OBJECTS:gausskernel_storage_replication_dcf>
@@ -179,6 +186,7 @@ list(APPEND gaussdb_objects
     $<TARGET_OBJECTS:gausskernel_storage_access_gin>
     $<TARGET_OBJECTS:gausskernel_storage_access_hbstore>
     $<TARGET_OBJECTS:gausskernel_storage_access_redo>
+    $<TARGET_OBJECTS:gausskernel_storage_access_redo_standby_read>
     $<TARGET_OBJECTS:gausskernel_storage_access_table>
     $<TARGET_OBJECTS:gausskernel_storage_bulkload>
     $<TARGET_OBJECTS:gausskernel_storage_replication_logical>
@@ -187,6 +195,7 @@ list(APPEND gaussdb_objects
     $<TARGET_OBJECTS:gausskernel_storage_replication>
     $<TARGET_OBJECTS:gausskernel_storage_buffer>
     $<TARGET_OBJECTS:gausskernel_storage_nvm>
+    $<TARGET_OBJECTS:gausskernel_storage_gs_uwal>
     $<TARGET_OBJECTS:gausskernel_storage_cmgr>
     $<TARGET_OBJECTS:gausskernel_storage_cstore_compression>
     $<TARGET_OBJECTS:gausskernel_storage_cstore>
@@ -291,9 +300,13 @@ if(${USE_LIBXML})
 endif()
 
 if(NOT "${ENABLE_LITE_MODE}" STREQUAL "ON")
-    list(APPEND gaussdb_LINK_LIBS -lz -lminiunz -leSDKOBS -leSDKLogAPI -lpcre -liconv -lnghttp2 -llog4cpp -lcurl -llz4 -lcjson -l${JEMALLOC_LIB_NAME} -lcgroup -lzstd -lcom_err_gauss -lgssapi_krb5_gauss -lkrb5_gauss -lgssrpc_gauss -lk5crypto_gauss -lkadm5clnt_mit -lkadm5srv_mit -lkdb5 -lkrb5support_gauss -lstdc++ -lboost_thread -lboost_chrono -lboost_system -lboost_atomic -lxml2 -laio -lncurses -ltinfo)
+    list(APPEND gaussdb_LINK_LIBS -lz -lminiunz -leSDKOBS -leSDKLogAPI -lpcre -liconv -lnghttp2 -llog4cpp -lcurl -llz4 -lcjson -l${JEMALLOC_LIB_NAME} -lcgroup -lzstd -lcom_err_gauss -lgssapi_krb5_gauss -lkrb5_gauss -lgssrpc_gauss -lk5crypto_gauss -lkadm5clnt_mit -lkadm5srv_mit -lkdb5 -lkrb5support_gauss -lstdc++ -lboost_thread -lboost_chrono -lboost_system -lboost_atomic -lxml2 -laio -lncurses -ltinfo -latomic)
 else()
     list(APPEND gaussdb_LINK_LIBS -lz -lminiunz -lcurl -llz4 -lcjson -l${JEMALLOC_LIB_NAME} -lcgroup -lzstd -lncurses -ltinfo -lboost_thread -lboost_chrono -lboost_system -lboost_atomic)
+endif()
+
+if(NOT "${ENABLE_JEMALLOC}" STREQUAL "ON")
+    list(REMOVE_ITEM gaussdb_LINK_LIBS -l${JEMALLOC_LIB_NAME})
 endif()
 
 include_directories(
@@ -378,6 +391,9 @@ if("${SUPPORT_HOTPATCH}" STREQUAL "yes")
     list(APPEND gaussdb_LINK_DIRS ${LIBHOTPATCH_LIB_PATH})
 endif()
 if(NOT "${ENABLE_UT}" STREQUAL "ON")
+    list(APPEND gaussdb_LINK_DIRS ${LIBUWAL_LINK_DIRS})
+    list(APPEND gaussdb_LINK_OPTIONS ${LIBUWAL_LINK_OPTIONS})
+
     add_executable(gaussdb ${gaussdb_objects})
     target_link_options(gaussdb PRIVATE ${gaussdb_LINK_OPTIONS})
     target_link_directories(gaussdb PRIVATE ${gaussdb_LINK_DIRS})

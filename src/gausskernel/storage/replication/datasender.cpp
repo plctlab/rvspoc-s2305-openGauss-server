@@ -71,7 +71,9 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "gssignal/gs_signal.h"
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 
 /* Flag indicates dummy are searching bcm files now */
 static bool dummySearching;
@@ -711,11 +713,13 @@ static int DataSndLoop(void)
     t_thrd.datasender_cxt.output_message =
         (char *)palloc(1 + sizeof(DataPageMessageHeader) + g_instance.attr.attr_storage.MaxSendSize * 1024);
 
+#ifdef ENABLE_BBOX
     if (BBOX_BLACKLIST_DATA_MESSAGE_SEND) {
         bbox_blacklist_add(DATA_MESSAGE_SEND, t_thrd.datasender_cxt.output_message,
                            (uint64)(1 + sizeof(DataPageMessageHeader) +
                                     g_instance.attr.attr_storage.MaxSendSize * 1024));
     }
+#endif
 
     /*
      * Allocate buffer that will be used for processing reply messages.  As
@@ -1128,10 +1132,11 @@ static void DataSndKill(int code, Datum arg)
     SpinLockRelease(&datasnd->mutex);
     dummySearching = false;
 
+#ifdef ENABLE_BBOX
     if (BBOX_BLACKLIST_DATA_MESSAGE_SEND) {
         bbox_blacklist_remove(DATA_MESSAGE_SEND, t_thrd.datasender_cxt.output_message);
     }
-
+#endif
     ereport(LOG, (errmsg("datasender thread shut down")));
 }
 
@@ -1584,7 +1589,7 @@ retry:
         if (bytesread != sizeof(nbytes)) {
             if (ferror(t_thrd.datasender_cxt.dummy_data_read_file_fd)) {
                 ereport(PANIC, (errcode_for_file_access(),
-                                errmsg("could not read to data file %s length %u: %m", path, nbytes)));
+                                errmsg("could not read to data file %s length %u: %s", path, nbytes, TRANSLATE_ERRNO)));
             }
             if (feof(t_thrd.datasender_cxt.dummy_data_read_file_fd)) {
                 ereport(LOG, (errmsg("step1: data file num %u, read file fd %d",
@@ -1617,7 +1622,7 @@ retry:
         if (bytesread != nbytes) {
             if (ferror(t_thrd.datasender_cxt.dummy_data_read_file_fd)) {
                 ereport(PANIC, (errcode_for_file_access(),
-                                errmsg("could not read to data file %s length %u: %m", path, nbytes)));
+                                errmsg("could not read to data file %s length %u: %s", path, nbytes, TRANSLATE_ERRNO)));
             }
             if (feof(t_thrd.datasender_cxt.dummy_data_read_file_fd)) {
                 ereport(LOG, (errmsg("step2: data file num %u, read file fd %d",

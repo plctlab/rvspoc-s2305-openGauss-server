@@ -1166,7 +1166,17 @@ static IndexBulkDeleteResult** lazy_scan_heap(
          */
         visibilitymap_pin(onerel, blkno, &vmbuffer);
 
-        buf = ReadBufferExtended(onerel, MAIN_FORKNUM, blkno, RBM_NORMAL, vac_strategy);
+        /*
+         * We do pre-read for lazy-vacuum when we cant skip the visible blocks.
+         * If we do it directly, we will read many blocks what we dont neet to
+         * check, it is useless and meaningless.
+         */
+        if (u_sess->attr.attr_storage.vacuum_bulk_read_size > 0 && !skipping_all_visible_blocks) {
+            int maxBLockCount = nblocks - blkno;
+            buf = MultiReadBufferExtend(onerel, MAIN_FORKNUM, blkno, RBM_NORMAL, vac_strategy, maxBLockCount, true);
+        } else {
+            buf = ReadBufferExtended(onerel, MAIN_FORKNUM, blkno, RBM_NORMAL, vac_strategy);
+        }
         /* We need buffer cleanup lock so that we can prune HOT chains. */
         if (!ConditionalLockBufferForCleanup(buf)) {
             /*
@@ -2057,9 +2067,9 @@ lazy_truncate_heap(Relation onerel, VacuumStmt *vacstmt, LVRelStats *vacrelstats
          */
         if (RelationIsPartition(onerel)) {
             Assert(vacstmt->onepart && vacstmt->onepartrel);
-            PartitionTruncate(vacstmt->onepartrel, vacstmt->onepart, new_rel_pages);
+            PartitionTruncate(vacstmt->onepartrel, vacstmt->onepart, new_rel_pages, vacrelstats->latestRemovedXid);
         } else {
-            RelationTruncate(onerel, new_rel_pages);
+            RelationTruncate(onerel, new_rel_pages, vacrelstats->latestRemovedXid);
         }
 
         /*
@@ -2115,7 +2125,7 @@ count_nondeletable_pages(Relation onerel, LVRelStats *vacrelstats)
     while (blkno > vacrelstats->nonempty_pages) {
         Buffer          buf;
         Page            page;
-        bool            hastup = NULL;
+        bool            hastup = false;
 
         /*
          * Check if another process requests a lock on our relation. We are

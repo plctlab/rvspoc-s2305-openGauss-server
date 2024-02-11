@@ -38,7 +38,9 @@
 #include "access/xlog.h"
 #include "access/ustore/knl_whitebox_test.h"
 #include "access/ubtree.h"
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 #include "catalog/namespace.h"
 #include "catalog/pgxc_group.h"
 #include "catalog/storage_gtt.h"
@@ -182,6 +184,7 @@ static void assign_plsql_compile_behavior_compat_options(const char* newval, voi
 static void assign_connection_info(const char* newval, void* extra);
 static bool check_application_type(int* newval, void** extra, GucSource source);
 static void assign_convert_string_to_digit(bool newval, void* extra);
+static bool check_enable_ignore_case_in_dquotes(bool* newval, void** extra, GucSource source);
 static bool CheckUStoreAttr(char** newval, void** extra, GucSource source);
 static void AssignUStoreAttr(const char* newval, void* extra);
 static bool check_snapshot_delimiter(char** newval, void** extra, GucSource source);
@@ -366,7 +369,7 @@ static const struct behavior_compat_entry behavior_compat_options[OPT_MAX] = {
     {"unbind_divide_bound", OPT_UNBIND_DIVIDE_BOUND},
     {"correct_to_number", OPT_CORRECT_TO_NUMBER},
     {"compat_concat_variadic", OPT_CONCAT_VARIADIC},
-    {"merge_update_multi", OPT_MEGRE_UPDATE_MULTI},
+    {"merge_update_multi", OPT_MERGE_UPDATE_MULTI},
     {"convert_string_digit_to_numeric", OPT_CONVERT_TO_NUMERIC},
     {"plstmt_implicit_savepoint", OPT_PLSTMT_IMPLICIT_SAVEPOINT},
     {"hide_tailing_zero", OPT_HIDE_TAILING_ZERO},
@@ -383,7 +386,10 @@ static const struct behavior_compat_entry behavior_compat_options[OPT_MAX] = {
     {"pgformat_substr", OPT_PGFORMAT_SUBSTR},
     {"truncate_numeric_tail_zero", OPT_TRUNC_NUMERIC_TAIL_ZERO},
     {"allow_orderby_undistinct_column", OPT_ALLOW_ORDERBY_UNDISTINCT_COLUMN},
-    {"select_into_return_null", OPT_SELECT_INTO_RETURN_NULL}
+    {"select_into_return_null", OPT_SELECT_INTO_RETURN_NULL},
+    {"accept_empty_str", OPT_ACCEPT_EMPTY_STR},
+    {"plpgsql_dependency", OPT_PLPGSQL_DEPENDENCY},
+    {"proc_uncheck_default_param", OPT_PROC_UNCHECK_DEFAULT_PARAM}
 };
 
 // increase SQL_IGNORE_STRATEGY_NUM if we need more strategy
@@ -473,6 +479,17 @@ static void InitSqlConfigureNamesBool()
             NULL,
             NULL,
             NULL},
+        {{"enable_union_all_subquery_orderby",
+          PGC_USERSET,
+          NODE_SINGLENODE,
+          QUERY_TUNING_METHOD,
+          gettext_noop("Enable union all to order subquery."),
+          NULL},
+         &u_sess->attr.attr_sql.enable_union_all_subquery_orderby,
+         false,
+         NULL,
+         NULL,
+         NULL},
         {{"enable_global_stats",
             PGC_SUSET,
             NODE_ALL,
@@ -569,7 +586,7 @@ static void InitSqlConfigureNamesBool()
             gettext_noop("Enable llvm for executor."),
             NULL},
             &u_sess->attr.attr_sql.enable_codegen,
-            true,
+            false,
             NULL,
             NULL,
             NULL},
@@ -1077,6 +1094,17 @@ static void InitSqlConfigureNamesBool()
             NULL,
             NULL,
             NULL},
+            {{"transform_to_numeric_operators",
+              PGC_USERSET,
+              NODE_SINGLENODE,
+              QUERY_TUNING_METHOD,
+              gettext_noop("When turn on, choose numeric (op) numeric for varchar (op) int."),
+              NULL},
+             &u_sess->attr.attr_sql.transform_to_numeric_operators,
+             false,
+             NULL,
+             NULL,
+             NULL},
         {{"check_function_bodies",
             PGC_USERSET,
             NODE_ALL,
@@ -1702,6 +1730,17 @@ static void InitSqlConfigureNamesBool()
             NULL,
             NULL,
             NULL},
+        {{"enable_ignore_case_in_dquotes",
+            PGC_USERSET,
+            NODE_ALL,
+            QUERY_TUNING_METHOD,
+            gettext_noop("Enable ignore case in double quotes for some driver."),
+            NULL},
+            &u_sess->attr.attr_sql.enable_ignore_case_in_dquotes,
+            false,
+            check_enable_ignore_case_in_dquotes,
+            NULL,
+            NULL},
         {{"enable_streaming",
             PGC_POSTMASTER,
             NODE_DISTRIBUTE,
@@ -2196,6 +2235,10 @@ static void InitSqlConfigureNamesInt()
             1,
             MIN_QUERY_DOP,
             INT_MAX,
+#elif defined(ENABLE_FINANCE_MODE)
+            1,
+            1,
+            1,
 #else
             1,
 #ifdef ENABLE_MULTIPLE_NODES
@@ -3091,6 +3134,7 @@ static void InitSqlConfigureNamesEnum()
             NULL,
             NULL,
             NULL},
+#ifndef ENABLE_FINANCE_MODE
         {{"try_vector_engine_strategy",
             PGC_USERSET,
             NODE_ALL,
@@ -3103,6 +3147,20 @@ static void InitSqlConfigureNamesEnum()
             NULL,
             strategy_assign_vector_targetlist,
             NULL},
+#else
+        {{"try_vector_engine_strategy",
+            PGC_INTERNAL,
+            NODE_ALL,
+            QUERY_TUNING,
+            gettext_noop("Sets the strategy of using vector engine for row table."),
+            NULL},
+            &u_sess->attr.attr_sql.vectorEngineStrategy,
+            OFF_VECTOR_ENGINE,
+            vector_engine_strategy,
+            NULL,
+            strategy_assign_vector_targetlist,
+            NULL},
+#endif
         {{"multi_stats_type",
             PGC_USERSET,
             NODE_ALL,
@@ -3717,6 +3775,16 @@ static void assign_convert_string_to_digit(bool newval, void* extra)
         InvalidateOprCacheCallBack(0, 0, 0);
     }
     return;
+}
+
+static bool check_enable_ignore_case_in_dquotes(bool* newval, void** extra, GucSource source)
+{
+    if (*newval && (currentGucContext == PGC_SUSET || currentGucContext == PGC_USERSET)) {
+        ereport(WARNING, (errmsg("if tables with the same name but different case already\n"
+        "exists in the database, this will result in only being able to\n"
+        "manipulate tables with table names that are entirely lowercase.")));
+    }
+    return true;
 }
 
 #define IS_NULL_STR(str) ((str) == NULL || (str)[0] == '\0')

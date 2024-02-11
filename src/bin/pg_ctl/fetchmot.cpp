@@ -41,6 +41,7 @@
     } while (0)
 
 static uint64 totaldone = 0;
+static bool g_isReceiveDone = false;
 
 static void CheckConnResult(PGconn* conn, const char* progname)
 {
@@ -50,6 +51,15 @@ static void CheckConnResult(PGconn* conn, const char* progname)
         disconnect_and_exit(1);
     }
     PQclear(res);
+}
+
+static void* ProgressReportMot(void* arg)
+{
+    do {
+        fprintf(stderr, "MOT Process: %dKB files have been received\n", totaldone);
+        sleep(1);
+    } while (!g_isReceiveDone);
+    return nullptr;
 }
 
 static char* GenerateChpktHeader(const char* chkptName) 
@@ -107,8 +117,6 @@ static void MotReceiveAndAppendTarFile(const char* basedir, const char* chkptNam
                 duplicatedfd = -1;
                 disconnect_and_exit(1);
             }
-            close(duplicatedfd);
-            duplicatedfd = -1;
         } else
 #endif
         tarfile = stdout;
@@ -158,6 +166,10 @@ static void MotReceiveAndAppendTarFile(const char* basedir, const char* chkptNam
                 if (gzclose(ztarfile) != 0) {
                     fprintf(stderr, _("%s: could not close compressed file \"%s\": %s\n"), progname, filename,
                         get_gz_error(ztarfile));
+                    if (duplicatedfd != -1) {
+                        close(duplicatedfd);
+                        duplicatedfd = -1;
+                    }
                     disconnect_and_exit(1);
                 }
             } else
@@ -229,6 +241,10 @@ static void MotReceiveAndAppendTarFile(const char* basedir, const char* chkptNam
             if (ztarfile != NULL) {
                 if (!writeGzFile(ztarfile, copybuf, r)) {
                     fprintf(stderr, _("%s: could not write to file \"%s\": %s\n"), progname, filename, strerror(errno));
+                    if (duplicatedfd != -1) {
+                        close(duplicatedfd);
+                        duplicatedfd = -1;
+                    }
                     disconnect_and_exit(1);
                 }
             } else
@@ -271,6 +287,10 @@ static void MotReceiveAndAppendTarFile(const char* basedir, const char* chkptNam
             if (ztarfile != NULL) {
                 if (!writeGzFile(ztarfile, copybuf, r)) {
                     fprintf(stderr, _("%s: could not write to file \"%s\": %s\n"), progname, filename, strerror(errno));
+                    if (duplicatedfd != -1) {
+                        close(duplicatedfd);
+                        duplicatedfd = -1;
+                    }
                     disconnect_and_exit(1);
                 }
             } else
@@ -290,6 +310,12 @@ static void MotReceiveAndAppendTarFile(const char* basedir, const char* chkptNam
             }
         } /* continuing data in existing file */
     }     /* loop over all data blocks */
+#ifdef HAVE_LIBZ
+    if (duplicatedfd != -1) {
+        close(duplicatedfd);
+        duplicatedfd = -1;
+    }
+#endif
     if (tarfile != NULL) {
         fclose(tarfile);
         tarfile = NULL;
@@ -600,6 +626,9 @@ void FetchMotCheckpoint(const char* basedir, PGconn* conn, const char* progname,
         }
 
         if (format == 'p') {
+            fprintf(stderr, "MOT: Start receiving files\n");
+            pthread_t progressThread;
+            pthread_create(&progressThread, NULL, ProgressReportMot, NULL);
             if (stat(dirName, &fileStat) < 0) {
                 if (pg_mkdir_p(dirName, S_IRWXU) == -1) {
                     fprintf(stderr, "%s: could not create directory \"%s\": %s\n", progname, dirName, strerror(errno));
@@ -613,8 +642,15 @@ void FetchMotCheckpoint(const char* basedir, PGconn* conn, const char* progname,
                 disconnect_and_exit(1);
             }
             MotReceiveAndUnpackTarFile(basedir, chkptName, conn, progname);
+            g_isReceiveDone = true;
+            fprintf(stderr, "MOT: Finish receiving files\n");
         } else if (format == 't') {
+            fprintf(stderr, "MOT: Start receiving files\n");
+            pthread_t progressThread;
+            pthread_create(&progressThread, NULL, ProgressReportMot, NULL);
             MotReceiveAndAppendTarFile(basedir, chkptName, conn, progname, compresslevel);
+            g_isReceiveDone = true;
+            fprintf(stderr, "MOT: Finish receiving files\n");
         } else {
             fprintf(stderr, "%s: unsupport format type: \"%c\".\n", progname, format);
             PQclear(res);

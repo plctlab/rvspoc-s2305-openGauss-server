@@ -691,6 +691,9 @@ void ReplicationSlotRelease(void)
     LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
     t_thrd.pgxact->xmin = InvalidTransactionId;
     t_thrd.pgxact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
+    t_thrd.proc->exrto_read_lsn = 0;
+    t_thrd.proc->exrto_min = 0;
+    t_thrd.proc->exrto_gen_snap_time = 0;
     LWLockRelease(ProcArrayLock);
 }
 
@@ -1103,8 +1106,10 @@ void ReplicationSlotsComputeRequiredLSN(ReplicationSlotState *repl_slt_state)
     }
     LWLockRelease(ReplicationSlotControlLock);
 
-    XLogSetReplicationSlotMinimumLSN(min_required);
-    XLogSetReplicationSlotMaximumLSN(max_required);
+    if(InvalidXLogRecPtr != min_required)
+        XLogSetReplicationSlotMinimumLSN(min_required);
+    if(InvalidXLogRecPtr != max_required)
+        XLogSetReplicationSlotMaximumLSN(max_required);
     qsort(standby_slots_list, g_instance.attr.attr_storage.max_replication_slots, sizeof(XLogRecPtr), cmp_slot_lsn);
     if (repl_slt_state != NULL) {
         repl_slt_state->min_required = min_required;
@@ -2635,7 +2640,8 @@ static bool CheckExistReplslotPath(char *path)
         errno_t rc = strcat_s(path_for_check, MAXPGPATH, suffix);
         securec_check_ss(rc, "\0", "\0");
     }
-    if (dss_exist_dir(path_for_check)) {
+    struct stat st;
+    if (stat(path_for_check, &st) == 0 && S_ISDIR(st.st_mode)) {
         return true;
     }
 

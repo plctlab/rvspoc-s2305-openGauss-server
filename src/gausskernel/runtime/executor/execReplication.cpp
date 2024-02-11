@@ -53,7 +53,8 @@ static bool RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode, Tuple
  * This is not generic routine, it expects the idxrel to be replication
  * identity of a rel and meet all limitations associated with that.
  */
-static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel, TupleTableSlot *searchslot)
+static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel, TupleTableSlot *searchslot,
+    EState *estate)
 {
     int attoff;
     bool isnull;
@@ -65,6 +66,16 @@ static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel
     indclassDatum = SysCacheGetAttr(INDEXRELID, idxrel->rd_indextuple, Anum_pg_index_indclass, &isnull);
     Assert(!isnull);
     opclass = (oidvector *)DatumGetPointer(indclassDatum);
+
+    List* expressionsState = NIL;
+    ExprContext* econtext = GetPerTupleExprContext(estate);
+    econtext->ecxt_scantuple = searchslot;
+    ListCell* indexpr_item = NULL;
+
+    if (idxrel->rd_indexprs != NIL) {
+        expressionsState = ExecPrepareExprList(idxrel->rd_indexprs, estate);
+        indexpr_item = list_head(expressionsState);
+    }
 
     /* Build scankey for every attribute in the index. */
     for (attoff = 0; attoff < IndexRelationGetNumberOfKeyAttributes(idxrel); attoff++) {
@@ -92,14 +103,34 @@ static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel
 
         regop = get_opcode(op);
 
-        /* Initialize the scankey. */
-        ScanKeyInit(&skey[attoff], pkattno, BTEqualStrategyNumber, regop, searchslot->tts_values[mainattno - 1]);
-        skey[attoff].sk_collation = idxrel->rd_indcollation[attoff];
+        if (mainattno != 0) {
+            /* Initialize the scankey. */
+            ScanKeyInit(&skey[attoff], pkattno, BTEqualStrategyNumber, regop, searchslot->tts_values[mainattno - 1]);
+            skey[attoff].sk_collation = idxrel->rd_indcollation[attoff];
 
-        /* Check for null value. */
-        if (searchslot->tts_isnull[mainattno - 1]) {
-            hasnulls = true;
-            skey[attoff].sk_flags |= SK_ISNULL;
+            /* Check for null value. */
+            if (searchslot->tts_isnull[mainattno - 1]) {
+                hasnulls = true;
+                skey[attoff].sk_flags |= SK_ISNULL;
+            }
+        } else {
+            if (idxrel->rd_indexprs == NIL) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("wrong number of index expressions")));
+            } else {
+                bool isNull = false;
+                Datum datum = ExecEvalExprSwitchContext((ExprState*)lfirst(indexpr_item), econtext, &isNull, NULL);
+                indexpr_item = lnext(indexpr_item);
+
+                ScanKeyInit(&skey[attoff], pkattno, BTEqualStrategyNumber, regop, datum);
+                skey[attoff].sk_collation = idxrel->rd_indcollation[attoff];
+
+                /* Check for null value. */
+                if (isNull) {
+                    hasnulls = true;
+                    skey[attoff].sk_flags |= SK_ISNULL;
+                }
+            }
         }
     }
 
@@ -307,7 +338,7 @@ static bool RelationFindReplTupleByIndex(EState *estate, Relation rel, Relation 
     scan->isUpsert = true;
 
     /* Build scan key. */
-    build_replindex_scan_key(skey, targetRel, idxrel, searchslot);
+    build_replindex_scan_key(skey, targetRel, idxrel, searchslot, estate);
 
     while (true) {
         found = false;
@@ -849,7 +880,7 @@ void GetFakeRelAndPart(EState *estate, Relation rel, TupleTableSlot *slot, FakeR
         case PARTTYPE_VALUE_PARTITIONED_RELATION:
             break;
         case PARTTYPE_PARTITIONED_RELATION:
-            partitionOid = heapTupleGetPartitionId(rel, tuple, &partitionno);
+            partitionOid = heapTupleGetPartitionOid(rel, tuple, &partitionno);
             searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, rel, partitionOid, partitionno,
                 partRelation, partition, RowExclusiveLock);
             relAndPart->partRel = partRelation;
@@ -861,10 +892,10 @@ void GetFakeRelAndPart(EState *estate, Relation rel, TupleTableSlot *slot, FakeR
             Partition subPart = NULL;
             Oid subPartOid;
             int subpartitionno = INVALID_PARTITION_NO;
-            partitionOid = heapTupleGetPartitionId(rel, tuple, &partitionno);
+            partitionOid = heapTupleGetPartitionOid(rel, tuple, &partitionno);
             searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, rel, partitionOid, partitionno,
                 partRelation, partition, RowExclusiveLock);
-            subPartOid = heapTupleGetPartitionId(partRelation, tuple, &subpartitionno);
+            subPartOid = heapTupleGetPartitionOid(partRelation, tuple, &subpartitionno);
             searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, partRelation, subPartOid,
                 subpartitionno, subPartRel, subPart, RowExclusiveLock);
 

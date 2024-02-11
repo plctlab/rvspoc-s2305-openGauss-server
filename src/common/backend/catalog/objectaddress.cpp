@@ -89,6 +89,7 @@
 #include "utils/syscache.h"
 #include "access/heapam.h"
 #include "datasource/datasource.h"
+#include "catalog/pg_depend.h"
 
 /*
  * ObjectProperty
@@ -96,24 +97,6 @@
  * This array provides a common part of system object structure; to help
  * consolidate routines to handle various kind of object classes.
  */
-typedef struct {
-    Oid class_oid;               /* oid of catalog */
-    Oid oid_index_oid;           /* oid of index on system oid column */
-    int oid_catcache_id;         /* id of catcache on system oid column	*/
-    int         name_catcache_id;   /* id of catcache on (name,namespace), or
-                                     * (name) if the object does not live in a
-                                     * namespace */
-    AttrNumber  attnum_name;    /* attnum of name field */
-    AttrNumber  attnum_namespace;   /* attnum of namespace field */
-    AttrNumber  attnum_owner;   /* attnum of owner field */
-    AttrNumber  attnum_acl;     /* attnum of acl field */
-    ObjectType  objtype;        /* OBJECT_* of this object type */
-    bool        is_nsp_name_unique; /* can the nsp/name combination (or name
-                                     * alone, if there's no namespace) be
-                                     * considered a unique identifier for an
-                                     * object of this class? */
-    
-} ObjectPropertyType;
 
 static THR_LOCAL const ObjectPropertyType ObjectProperty[] = {
     {
@@ -2228,6 +2211,9 @@ static void getRelationTypeDescription(StringInfo buffer, Oid relid, int32 objec
                case RELKIND_FOREIGN_TABLE:
                        appendStringInfoString(buffer, "foreign table");
                        break;
+               case RELKIND_GLOBAL_INDEX:
+                       appendStringInfoString(buffer, "index");
+                       break;
                default:
                        /* should not here */
                        appendStringInfoString(buffer, "relation");
@@ -3742,4 +3728,51 @@ get_object_address_usermapping(List *objname, List *objargs, bool missing_ok)
     return address;
 }
  
-
+Oid get_object_package(const ObjectAddress* address)
+{
+    const ObjectPropertyType* property = NULL;
+    property = get_object_property_data(address->classId);
+    if (property->attnum_namespace == InvalidAttrNumber) {
+        return InvalidOid;
+    }
+    Relation dependRel;
+    const int nKeys = 3;
+    ScanKeyData key[nKeys];
+    SysScanDesc scan = NULL;
+    HeapTuple tuple = NULL;
+    bool isNull = true;
+    Oid pkgOid = InvalidOid;
+    int keyNum = 0;
+    dependRel = heap_open(DependRelationId, AccessShareLock);
+    ScanKeyInit(&key[keyNum++], Anum_pg_depend_classid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(address->classId));
+    ScanKeyInit(&key[keyNum++], Anum_pg_depend_objid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(address->objectId));
+    ScanKeyInit(&key[keyNum++], Anum_pg_depend_objsubid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(address->objectSubId));
+    scan = systable_beginscan(dependRel, DependDependerIndexId, true, NULL, nKeys, key);
+    ObjectAddress procObjAddr;
+    procObjAddr.classId = InvalidOid;
+    while (HeapTupleIsValid(tuple = systable_getnext(scan))) {
+        Datum objOidDatum = heap_getattr(tuple, Anum_pg_depend_refobjid,
+                                   RelationGetDescr(dependRel), &isNull);
+        Assert(!isNull);
+        Datum classOidDatum = heap_getattr(tuple, Anum_pg_depend_refclassid,
+                                         RelationGetDescr(dependRel), &isNull);
+        Assert(!isNull);
+        if (classOidDatum == ProcedureRelationId) {
+            procObjAddr.classId = ProcedureRelationId;
+            procObjAddr.objectId = DatumGetObjectId(objOidDatum);
+            procObjAddr.objectSubId = 0;
+            break;
+        }
+        if (classOidDatum != PackageRelationId) {
+            continue;
+        }
+        pkgOid = DatumGetObjectId(objOidDatum);
+        break;
+    }
+    systable_endscan(scan);
+    heap_close(dependRel, AccessShareLock);
+    if (OidIsValid(procObjAddr.classId)) {
+        pkgOid = get_object_package(&procObjAddr);
+    }
+    return pkgOid;
+}

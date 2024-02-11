@@ -470,6 +470,7 @@ static void check_xact_readonly(Node* parse_tree)
         case T_AlterDatabaseSetStmt:
         case T_AlterDomainStmt:
         case T_AlterFunctionStmt:
+        case T_CompileStmt:
         case T_AlterRoleSetStmt:
         case T_AlterObjectSchemaStmt:
         case T_AlterOwnerStmt:
@@ -643,7 +644,7 @@ void PreventCommandDuringRecovery(const char* cmd_name)
                 errmsg("cannot execute %s during recovery", cmd_name)));
 }
 
-void PreventCommandDuringSSOndemandRecovery(Node* parseTree)
+void PreventCommandDuringSSOndemandRedo(Node* parseTree)
 {
     switch(nodeTag(parseTree)) {
         case T_InsertStmt:
@@ -2325,7 +2326,8 @@ void CreateCommand(CreateStmt *parse_tree, const char *query_string, ParamListIn
                 true,
 #endif /* PGXC */
                 NULL,
-                is_top_level ? PROCESS_UTILITY_TOPLEVEL : PROCESS_UTILITY_QUERY,
+                //is_top_level ? PROCESS_UTILITY_TOPLEVEL : PROCESS_UTILITY_QUERY,
+                PROCESS_UTILITY_SUBCOMMAND,
                 isCTAS);
         }
 
@@ -3388,13 +3390,21 @@ void standard_ProcessUtility(processutility_context* processutility_cxt,
 #endif
             PG_TRY();
             {
+                set_create_plsql_type_start();
+                u_sess->plsql_cxt.isCreatePkg = true;
                 CreatePackageCommand((CreatePackageStmt*)parse_tree, query_string);
+                set_create_plsql_type_end();
+                set_function_style_none();
+                u_sess->plsql_cxt.isCreatePkg = false;
             }
             PG_CATCH();
             {
                 if (u_sess->plsql_cxt.debug_query_string) {
                     pfree_ext(u_sess->plsql_cxt.debug_query_string);
                 }
+                set_create_plsql_type_end();
+                set_function_style_none();
+                u_sess->plsql_cxt.isCreatePkg = false;
                 PG_RE_THROW();
             }
             PG_END_TRY();
@@ -3408,13 +3418,21 @@ void standard_ProcessUtility(processutility_context* processutility_cxt,
 #endif
             PG_TRY();
             {
+                set_create_plsql_type_start();
+                u_sess->plsql_cxt.isCreatePkg = true;
                 CreatePackageBodyCommand((CreatePackageBodyStmt*)parse_tree, query_string);
+                set_create_plsql_type_end();
+                set_function_style_none();
+                u_sess->plsql_cxt.isCreatePkg = false;
             }
             PG_CATCH();
             {
                 if (u_sess->plsql_cxt.debug_query_string) {
                     pfree_ext(u_sess->plsql_cxt.debug_query_string);
                 }
+                set_create_plsql_type_end();
+                set_function_style_none();
+                u_sess->plsql_cxt.isCreatePkg = false;
                 PG_RE_THROW();
             }
             PG_END_TRY();
@@ -3592,7 +3610,7 @@ void standard_ProcessUtility(processutility_context* processutility_cxt,
                 }
                 TransformLoadDataToCopy(stmt);
                 break;
-            }        
+            } 
 #ifdef PGXC
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("LOAD statement is not yet supported.")));
 #endif /* PGXC */
@@ -5124,9 +5142,15 @@ ProcessUtilitySlow(Node *parse_tree,
     ObjectAddress address;
     ObjectAddress secondaryObject = InvalidObjectAddress;
 
+    if (T_CreateStmt == nodeTag(parse_tree) && isCTAS) {
+        isCompleteQuery = true;
+    } else if (T_AlterTableStmt == nodeTag(parse_tree) && ((AlterTableStmt*)parse_tree)->fromCreate) {
+        isCompleteQuery = false;
+    }
+
     /* All event trigger calls are done only when isCompleteQuery is true */
     needCleanup = isCompleteQuery && EventTriggerBeginCompleteQuery();
- 
+
     /* PG_TRY block is to ensure we call EventTriggerEndCompleteQuery */
     PG_TRY();
     {
@@ -5725,10 +5749,15 @@ ProcessUtilitySlow(Node *parse_tree,
             {
                 PG_TRY();
                 {
+                    set_create_plsql_type_start();
                     address = CreateFunction((CreateFunctionStmt*)parse_tree, query_string, InvalidOid);
+                    set_create_plsql_type_end();
+                    set_function_style_none();
                 }
                 PG_CATCH();
                 {
+                    set_create_plsql_type_end();
+                    set_function_style_none();
     #ifndef ENABLE_MULTIPLE_NODES
                     CreateFunctionStmt* stmt = (CreateFunctionStmt*)parse_tree;
                     char* schemaname = NULL;
@@ -5831,6 +5860,29 @@ ProcessUtilitySlow(Node *parse_tree,
 #else
                 address = AlterFunction((AlterFunctionStmt*)parse_tree);
 #endif
+            }    break;
+
+            case T_CompileStmt:
+            {
+                if (u_sess->SPI_cxt._connected == -1) {
+                    plpgsql_hashtable_clear_invalid_obj(true);
+                }
+                u_sess->plsql_cxt.during_compile = true;
+                u_sess->plsql_cxt.isCreateFunction = true;
+                if (!enable_plpgsql_gsdependency_guc()) {
+                    u_sess->plsql_cxt.during_compile = false;
+                    ereport(ERROR, (errmsg("This operation is not supported.")));
+                    break;
+                }
+                u_sess->plsql_cxt.is_alter_compile_stmt = true;
+                CompileStmt* tmpStmt = (CompileStmt*)parse_tree;
+                if (tmpStmt->compileItem == COMPILE_FUNCTION || tmpStmt->compileItem == COMPILE_PROCEDURE) {
+                    RecompileFunction(tmpStmt);
+                } else {
+                    RecompilePackage(tmpStmt);
+                }
+                u_sess->plsql_cxt.during_compile = false;
+                u_sess->plsql_cxt.is_alter_compile_stmt = false;
             }    break;
 
             case T_IndexStmt: /* CREATE INDEX */
@@ -6090,9 +6142,6 @@ ProcessUtilitySlow(Node *parse_tree,
 
             case T_AlterSeqStmt:
 #ifdef PGXC
-                if (IS_MAIN_COORDINATOR || IS_SINGLE_NODE) {
-                    PreventAlterSeqInTransaction(is_top_level, (AlterSeqStmt*)parse_tree);
-                }
                 if (IS_PGXC_COORDINATOR) {
                     AlterSeqStmt* stmt = (AlterSeqStmt*)parse_tree;
 
@@ -6172,7 +6221,6 @@ ProcessUtilitySlow(Node *parse_tree,
                     address = AlterSequenceWrapper((AlterSeqStmt*)parse_tree);
                 }
 #else
-                PreventAlterSeqInTransaction(is_top_level, (AlterSeqStmt*)parse_tree);
                 address = AlterSequenceWrapper((AlterSeqStmt*)parse_tree);
 #endif
                 break;
@@ -8458,6 +8506,29 @@ static const char* AlterObjectTypeCommandTag(ObjectType obj_type)
     return tag;
 }
 
+static const char* CompileTag(CompileEntry compileItem)
+{
+    const char* tag = NULL;
+    switch (compileItem) {
+        case COMPILE_PROCEDURE:
+            tag = "ALTER PROCEDURE";
+            break;
+        case COMPILE_FUNCTION:
+            tag = "ALTER FUNCTION";
+            break;
+        case COMPILE_PACKAGE:
+            tag = "ALTER PACKAGE";
+            break;
+        case COMPILE_PKG_SPECIFICATION:
+            tag = "ALTER PACKAGE SPECIFICATION";
+            break;
+        case COMPILE_PKG_BODY:
+            tag = "ALTER PACKAGE BODY";
+            break;
+    }
+    return tag;
+}
+
 /*
  * CreateCommandTag
  *		utility to get a string representation of the command operation,
@@ -8876,9 +8947,11 @@ const char* CreateCommandTag(Node* parse_tree)
             tag = "COPY";
             break;
 
-        case T_RenameStmt:
-            tag = AlterObjectTypeCommandTag(((RenameStmt*)parse_tree)->renameType);
+        case T_RenameStmt: {
+            ObjectType RenameType = ((RenameStmt*)parse_tree)->renameType == OBJECT_COLUMN ? ((RenameStmt*)parse_tree)->relationType:((RenameStmt*)parse_tree)->renameType;
+            tag = AlterObjectTypeCommandTag(RenameType);
             break;
+        }
 
         case T_AlterObjectSchemaStmt:
             tag = AlterObjectTypeCommandTag(((AlterObjectSchemaStmt*)parse_tree)->objectType);
@@ -8900,6 +8973,17 @@ const char* CreateCommandTag(Node* parse_tree)
             tag = "ALTER FUNCTION";
             break;
 
+        case T_CompileStmt: {
+            u_sess->plsql_cxt.during_compile = true;
+            if (!enable_plpgsql_gsdependency_guc()) {
+                u_sess->plsql_cxt.during_compile = false;
+                ereport(ERROR, (errmsg("This operation is not supported.")));
+                break;
+            }
+            CompileStmt* stmt = (CompileStmt*)parse_tree;
+            tag = CompileTag(stmt->compileItem);
+        } break;
+        
         case T_GrantStmt: {
             GrantStmt* stmt = (GrantStmt*)parse_tree;
 
@@ -10057,6 +10141,7 @@ LogStmtLevel GetCommandLogLevel(Node* parse_tree)
             break;
 
         case T_AlterFunctionStmt:
+        case T_CompileStmt:
         case T_CreateEventStmt:
         case T_AlterEventStmt:
         case T_DropEventStmt:

@@ -511,6 +511,7 @@ typedef struct _PublicationInfo {
     bool pubinsert;
     bool pubupdate;
     bool pubdelete;
+    int64 pubddl;
 } PublicationInfo;
 
 /*
@@ -534,12 +535,13 @@ typedef struct _SubscriptionInfo {
     char *subsynccommit;
     char *subpublications;
     char *subbinary;
+    char *submatchddlowner;
 } SubscriptionInfo;
 
 /* global decls */
 extern bool force_quotes; /* double-quotes for identifiers flag */
 extern bool g_verbose;    /* verbose flag */
-
+extern int g_curStep;       /* used for progress */
 /* placeholders for comment starting and ending delimiters */
 extern char g_comment_start[10];
 extern char g_comment_end[10];
@@ -617,11 +619,14 @@ extern DefaultACLInfo* getDefaultACLs(Archive* fout, int* numDefaultACLs);
 extern void getExtensionMembership(Archive* fout, ExtensionInfo extinfo[], int numExtensions);
 extern void help(const char* progname);
 extern bool IsRbObject(Archive* fout, Oid classid, Oid objid, const char* objname);
+extern uint32 GetVersionNumFromServer(Archive* fout);
 extern uint32 GetVersionNum(Archive* fout);
 extern void getPublications(Archive *fout);
 extern void getPublicationTables(Archive *fout, TableInfo tblinfo[], int numTables);
 extern void getSubscriptions(Archive *fout);
 extern EventTriggerInfo *getEventTriggers(Archive *fout, int *numEventTriggers);
+bool FuncExists(Archive* fout, const char* funcNamespace, const char* funcName);
+bool TabExists(Archive* fout, const char* schemaName, const char* tabName);
 
 #ifdef GSDUMP_LLT
 void stopLLT();

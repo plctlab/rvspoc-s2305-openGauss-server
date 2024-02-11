@@ -36,7 +36,9 @@
 #include "utils/palloc.h"
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/access_gstrace.h"
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 #include "postmaster/bgwriter.h"
 #include "knl/knl_thread.h"
 #include "tde_key_management/tde_key_storage.h"
@@ -354,7 +356,7 @@ int64 dw_seek_file(int fd, int64 offset, int32 origin)
     int64 seek_offset = lseek64(fd, (off64_t)offset, origin);
     if (seek_offset == -1) {
         ereport(PANIC, (errcode_for_file_access(), errmodule(MOD_DW),
-            errmsg("Seek dw file error, seek offset is %ld, origin is %d, error: %m", offset, origin)));
+            errmsg("Seek dw file error, seek offset is %ld, origin is %d, error: %s", offset, origin, TRANSLATE_ERRNO)));
     }
     return seek_offset;
 }
@@ -1539,9 +1541,12 @@ static void dw_file_cxt_init_batch(int id, dw_batch_file_context *batch_file_cxt
     (void)dw_recover_batch_file_head(batch_file_cxt);
 
     batch_file_cxt->buf = buf;
+    
+#ifdef ENABLE_BBOX
     if (BBOX_BLACKLIST_DW_BUFFER) {
         bbox_blacklist_add(DW_BUFFER, buf, buf_size - BLCKSZ - BLCKSZ);
     }
+#endif
 
     batch_file_cxt->write_pos = 0;
     batch_file_cxt->flush_page = 0;
@@ -2102,7 +2107,7 @@ static XLogRecPtr dw_copy_page(ThrdDwCxt* thrd_dw_cxt, int buf_desc_id, bool* is
     XLogRecPtr page_lsn = InvalidXLogRecPtr;
     Block block;
     uint16 page_num;
-    uint32 buf_state;
+    uint64 buf_state;
     errno_t rc;
     *is_skipped = true;
 

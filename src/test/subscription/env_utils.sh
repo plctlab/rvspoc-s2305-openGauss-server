@@ -35,6 +35,35 @@ function exec_sql(){
 	fi
 }
 
+function exec_sql_with_user() {
+	local sql_user=$username
+	if [ -n "$test_username" ]; then
+		sql_user=$test_username
+	fi
+	result=$(gsql -U $sql_user -W $passwd -d $1 -p $2 -Atq -c "$3")
+	if [ "$result" != "" ]; then
+		echo "$result"
+	fi
+}
+
+function exec_sql_file() {
+	local sql_user=$username
+	if [ -n "$test_username" ]; then
+		sql_user=$test_username
+	fi
+
+	gsql -U $sql_user -W $passwd -d $1 -p $2 -Atq -f "$3"
+}
+
+function exec_dump_db() {
+	echo "dump $1 to $3.."
+	if [ $# -eq 4 ]; then
+		gs_dump $1 -f $3 -p $2
+	else 
+		gs_dump $1 -f $3 -p $2 --no-publications --no-subscriptions
+	fi
+}
+
 function wait_for_subscription_sync(){
 	max_attempts=20
 	attempt=0
@@ -56,6 +85,7 @@ function wait_for_subscription_sync(){
 }
 
 function wait_for_catchup(){
+	$(exec_sql $1 $2 "checkpoint")
 	target_lsn=$(exec_sql $1 $2 "SELECT pg_current_xlog_location()")
 	max_attempts=20
 	attempt=0

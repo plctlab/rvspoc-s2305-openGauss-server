@@ -621,6 +621,9 @@ static Datum ExecEvalScalarVar(ExprState* exprstate, ExprContext* econtext, bool
            /* INDEX_VAR is handled by default case */
        default: /* get the tuple from the relation being scanned */
            slot = econtext->ecxt_scantuple;
+           if (u_sess->parser_cxt.in_userset) {
+               u_sess->parser_cxt.has_set_uservar = true;
+           }
            break;
    }
 
@@ -632,7 +635,7 @@ static Datum ExecEvalScalarVar(ExprState* exprstate, ExprContext* econtext, bool
     RightRefState* refState = econtext->rightRefState;
     int index = attnum - 1;
     if (refState && refState->values &&
-        (IS_ENABLE_INSERT_RIGHT_REF(refState) ||
+        ((slot == nullptr && IS_ENABLE_INSERT_RIGHT_REF(refState)) ||
          (IS_ENABLE_UPSERT_RIGHT_REF(refState) && refState->hasExecs[index] && index < refState->colCnt))) {
         *isNull = refState->isNulls[index];
         return refState->values[index];
@@ -720,6 +723,9 @@ static Datum ExecEvalScalarVarFast(ExprState* exprstate, ExprContext* econtext, 
            /* INDEX_VAR is handled by default case */
        default: /* get the tuple from the relation being scanned */
            slot = econtext->ecxt_scantuple;
+           if (u_sess->parser_cxt.in_userset) {
+               u_sess->parser_cxt.has_set_uservar = true;
+           }
            break;
    }
 
@@ -1091,6 +1097,7 @@ static Datum ExecEvalConst(ExprState* exprstate, ExprContext* econtext, bool* is
         if (found) {
             if (entry->isParse) {
                 con = (Const *)uservar->value;
+                entry->isParse = false;
             } else {
                 Node *node = coerce_type(NULL, (Node *)entry->value, entry->value->consttype, ((Const *)uservar->value)->consttype,
                     -1, COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
@@ -1103,6 +1110,9 @@ static Datum ExecEvalConst(ExprState* exprstate, ExprContext* econtext, bool* is
             }
         } else {
             con = makeConst(UNKNOWNOID, -1, InvalidOid, -2, (Datum)0, true, false);
+        }
+        if (u_sess->parser_cxt.in_userset) {
+            u_sess->parser_cxt.has_set_uservar = true;
         }
     } else if (IsA(exprstate->expr, SetVariableExpr)) {
         SetVariableExpr* setvar = (SetVariableExpr*)transformSetVariableExpr((SetVariableExpr*)exprstate->expr);
@@ -1290,6 +1300,9 @@ static Datum ExecEvalUserSetElm(ExprState* exprstate, ExprContext* econtext, boo
     Node* res = NULL;
     char* value  =  NULL;
 
+    if (nodeTag(usestate->instate) != T_CaseExprState && DB_IS_CMPT(B_FORMAT))
+        u_sess->parser_cxt.in_userset = true;
+
     Datum result = ExecEvalExpr(usestate->instate, econtext, isNull, isDone);
 
     if (*isNull) {
@@ -1329,6 +1342,7 @@ static Datum ExecEvalUserSetElm(ExprState* exprstate, ExprContext* econtext, boo
     }
 
     check_set_user_message(&elemcopy);
+    u_sess->parser_cxt.in_userset = false;
 
     return result;
 }
@@ -1346,6 +1360,10 @@ static Datum ExecEvalParamExec(ExprState* exprstate, ExprContext* econtext, bool
 
    if (isDone != NULL)
        *isDone = ExprSingleResult;
+    
+    if (u_sess->parser_cxt.in_userset) {
+        u_sess->parser_cxt.has_set_uservar = true;
+    }
 
    /*
     * PARAM_EXEC params (internal executor parameters) are stored in the
@@ -1356,7 +1374,9 @@ static Datum ExecEvalParamExec(ExprState* exprstate, ExprContext* econtext, bool
        /* Parameter not evaluated yet, so go do it */
        ExecSetParamPlan((SubPlanState*)prm->execPlan, econtext);
        /* ExecSetParamPlan should have processed this param... */
-       Assert(prm->execPlan == NULL);
+       if (!u_sess->parser_cxt.has_set_uservar || !DB_IS_CMPT(B_FORMAT)) {
+            Assert(prm->execPlan == NULL);
+       }
        prm->isConst = true;
        prm->valueType = expression->paramtype;
    }
@@ -1905,6 +1925,7 @@ static void init_fcache(
    fcache->funcResultSlot = NULL;
    fcache->setArgsValid = false;
    fcache->shutdown_reg = false;
+   fcache->setArgByVal = false;
    if(fcache->xprstate.is_flt_frame){
         fcache->is_plpgsql_func_with_outparam = is_function_with_plpgsql_language_and_outparam(fcache->func.fn_oid);
         fcache->has_refcursor = func_has_refcursor_args(fcache->func.fn_oid, &fcache->fcinfo_data);
@@ -1936,6 +1957,7 @@ extern void ShutdownFuncExpr(Datum arg)
 
    /* Clear any active set-argument state */
    fcache->setArgsValid = false;
+   fcache->setArgByVal = false;
 
    /* execUtils will deregister the callback... */
    fcache->shutdown_reg = false;
@@ -1976,7 +1998,7 @@ static TupleDesc get_cached_rowtype(Oid type_id, int32 typmod, TupleDesc* cache_
 /*
 * Callback function to release a tupdesc refcount at expression tree shutdown
 */
-static void ShutdownTupleDescRef(Datum arg)
+void ShutdownTupleDescRef(Datum arg)
 {
    TupleDesc* cache_field = (TupleDesc*)DatumGetPointer(arg);
 
@@ -2167,25 +2189,51 @@ static void tupledesc_match(TupleDesc dst_tupdesc, TupleDesc src_tupdesc)
 
 void set_result_for_plpgsql_language_function_with_outparam(FuncExprState *fcache, Datum *result, bool *isNull)
 {
-   if (!IsA(fcache->xprstate.expr, FuncExpr)) {
-       return;
-   }
-   FuncExpr *func = (FuncExpr *)fcache->xprstate.expr;
-   if (!is_function_with_plpgsql_language_and_outparam(func->funcid)) {
-       return;
-   }
-   HeapTupleHeader td = DatumGetHeapTupleHeader(*result);
-   TupleDesc tupdesc = lookup_rowtype_tupdesc_copy(HeapTupleHeaderGetTypeId(td), HeapTupleHeaderGetTypMod(td));
-   HeapTupleData tup;
-   tup.t_len = HeapTupleHeaderGetDatumLength(td);
-   tup.t_data = td;
-   Datum *values = (Datum *)palloc(sizeof(Datum) * tupdesc->natts);
-   bool *nulls = (bool *)palloc(sizeof(bool) * tupdesc->natts);
-   heap_deform_tuple(&tup, tupdesc, values, nulls);
-   *result = values[0];
-   *isNull = nulls[0];
-   pfree(values);
-   pfree(nulls);
+    if (!IsA(fcache->xprstate.expr, FuncExpr)) {
+        return;
+    }
+    FuncExpr *func = (FuncExpr *)fcache->xprstate.expr;
+    if (!is_function_with_plpgsql_language_and_outparam(func->funcid)) {
+        return;
+    }
+    HeapTupleHeader td = DatumGetHeapTupleHeader(*result);
+    TupleDesc tupdesc;
+    PG_TRY();
+    {
+        tupdesc = lookup_rowtype_tupdesc_copy(HeapTupleHeaderGetTypeId(td), HeapTupleHeaderGetTypMod(td));
+    }
+    PG_CATCH();
+    {
+        int ecode = geterrcode();
+        if (ecode == ERRCODE_CACHE_LOOKUP_FAILED) {
+            ereport(ERROR, (errcode(ERRCODE_PLPGSQL_ERROR), errmodule(MOD_PLSQL),
+                           errmsg("tuple is null"),
+                           errdetail("it may be because change guc behavior_compat_options in one session")));
+        } else {
+            PG_RE_THROW();
+        }
+    }
+    PG_END_TRY();
+    HeapTupleData tup;
+    tup.t_len = HeapTupleHeaderGetDatumLength(td);
+    tup.t_data = td;
+    Datum *values = (Datum *)palloc(sizeof(Datum) * tupdesc->natts);
+    bool *nulls = (bool *)palloc(sizeof(bool) * tupdesc->natts);
+    heap_deform_tuple(&tup, tupdesc, values, nulls);
+    *result = values[0];
+    *isNull = nulls[0];
+    pfree(values);
+    pfree(nulls);
+}
+
+bool ExecSetArgIsByValue(FunctionCallInfo fcinfo)
+{
+    for (int i = 0; i < fcinfo->nargs; i++) {
+        if (!fcinfo->argnull[i] && !get_typbyval(fcinfo->argTypes[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /*
@@ -2338,6 +2386,7 @@ restart:
         } else {
             hasSetArg = (argDone != ExprSingleResult);
         }
+        fcache->setArgByVal = ExecSetArgIsByValue(fcinfo);
    } else {
        /* Re-use callinfo from previous evaluation */
        hasSetArg = fcache->setHasSetArg;
@@ -2497,6 +2546,10 @@ restart:
                    if (fcache->func.fn_retset && *isDone == ExprMultipleResult) {
                        fcache->setHasSetArg = hasSetArg;
                        fcache->setArgsValid = true;
+                        /* arg not by value, memory can not be reset */
+                        if (!fcache->setArgByVal) {
+                            econtext->hasSetResultStore = true;
+                        }
                        /* Register cleanup callback if we didn't already */
                        if (!fcache->shutdown_reg) {
                            RegisterExprContextCallback(econtext, ShutdownFuncExpr, PointerGetDatum(fcache));
@@ -2732,7 +2785,8 @@ static Datum ExecMakeFunctionResultNoSets(
    }
 
    if (econtext) {
-        fcinfo->can_ignore = econtext->can_ignore;
+        fcinfo->can_ignore = econtext->can_ignore || (econtext->ecxt_estate && econtext->ecxt_estate->es_plannedstmt &&
+                 econtext->ecxt_estate->es_plannedstmt->hasIgnore);
     }
 
     /*
@@ -3522,32 +3576,25 @@ static Datum ExecEvalFunc(FuncExprState *fcache, ExprContext *econtext, bool *is
     cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
 
     if (func->funcformat == COERCE_EXPLICIT_CAST || func->funcformat == COERCE_IMPLICIT_CAST) {
-        target_type = func->funcresulttype;
-        source_type = fcache->fcinfo_data.argTypes[0];
 
         HeapTuple proc_tuple = SearchSysCache(PROCOID, ObjectIdGetDatum(func->funcid), 0, 0, 0);
         if (HeapTupleIsValid(proc_tuple)) {
             Form_pg_proc proc_struct = (Form_pg_proc)GETSTRUCT(proc_tuple);
             source_type = proc_struct->proargtypes.values[0];
             ReleaseSysCache(proc_tuple);
-        }
-        HeapTuple cast_tuple = SearchSysCache2(CASTSOURCETARGET, ObjectIdGetDatum(source_type),
-                                                ObjectIdGetDatum(target_type));
-
-        if (HeapTupleIsValid(cast_tuple)) {
-            Relation cast_rel = heap_open(CastRelationId, AccessShareLock);
-            int castowner_Anum = Anum_pg_cast_castowner;
-            if (castowner_Anum <= (int)HeapTupleHeaderGetNatts(cast_tuple->t_data, cast_rel->rd_att)) {
-                bool isnull = true;
-                Datum datum = fastgetattr(cast_tuple, Anum_pg_cast_castowner, cast_rel->rd_att, &isnull);
-                if (!isnull) {
-                    u_sess->exec_cxt.cast_owner = DatumGetObjectId(datum);
-                } else {
-                    u_sess->exec_cxt.cast_owner = InvalidCastOwnerId;
-                }
+            target_type = func->funcresulttype;
+            HeapTuple cast_tuple = SearchSysCache2(CASTSOURCETARGET, ObjectIdGetDatum(source_type),
+                                                   ObjectIdGetDatum(target_type));
+            if (HeapTupleIsValid(cast_tuple)) {
+               bool isnull = false;
+               Datum datum = SysCacheGetAttr(CASTSOURCETARGET, cast_tuple, Anum_pg_cast_castowner, &isnull);
+               if (!isnull) {
+                   u_sess->exec_cxt.cast_owner = DatumGetObjectId(datum);
+               } else {
+                   u_sess->exec_cxt.cast_owner = InvalidCastOwnerId;
+               }
+               ReleaseSysCache(cast_tuple);
             }
-            heap_close(cast_rel, AccessShareLock);
-            ReleaseSysCache(cast_tuple);
         }
     }
 
@@ -6854,7 +6901,7 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
 
     SortTargetListAsArray(refState, targetlist, targetArr);
 
-    InitOutputValues(refState, targetArr, values, isnull, targetCount, hasExecs);
+    InitOutputValues(refState, values, isnull, hasExecs);
 
     /*
      * evaluate all the expressions in the target list
@@ -7214,3 +7261,31 @@ void ExecCopyDataToDatum(PLpgSQL_datum** datums, int dno, Cursor_Data* source_cu
    cursor_var->value = Int32GetDatum(source_cursor->row_count);
    cursor_var->isnull = source_cursor->null_open;
 }
+
+#ifdef USE_SPQ
+bool IsJoinExprNull(List *joinExpr, ExprContext *econtext)
+{
+    ListCell *lc;
+    bool joinkeys_null = true;
+ 
+    Assert(joinExpr != nullptr);
+ 
+    foreach(lc, joinExpr) {
+        ExprState *keyexpr = (ExprState *) lfirst(lc);
+        bool isNull = false;
+ 
+        /*
+         * Evaluate the current join attribute value of the tuple
+         */
+        ExecEvalExpr(keyexpr, econtext, &isNull, NULL);
+ 
+        if (!isNull) {
+            /* Found at least one non-null join expression, we're done */
+            joinkeys_null = false;
+            break;
+        }
+    }
+ 
+    return joinkeys_null;
+}
+#endif

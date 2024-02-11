@@ -28,30 +28,42 @@
 #include "storage/buf/bufmgr.h"
 #include "storage/smgr/segment_internal.h"
 #include "ddes/dms/ss_transaction.h"
+#include "ddes/dms/ss_reform_common.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 #include "storage/sinvaladt.h"
 #include "replication/libpqsw.h"
+#include "replication/walsender.h"
+
+static inline void txnstatusNetworkStats(uint64 timeDiff);
+static inline void txnstatusHashStats(uint64 timeDiff);
+
+#define TxnStatusCalcStats(startTime, endTime, timeDiff, isHash) \
+ do {                                                            \
+    (void)INSTR_TIME_SET_CURRENT(endTime);                       \
+    INSTR_TIME_SUBTRACT(endTime, startTime);                     \
+    timeDiff = INSTR_TIME_GET_MICROSEC(endTime);                 \
+    if (isHash) {                                                \
+        txnstatusHashStats((uint64)timeDiff);                    \
+    } else {                                                     \
+        txnstatusNetworkStats((uint64)timeDiff);                 \
+    }                                                            \
+ } while (0)
 
 void SSStandbyGlobalInvalidSharedInvalidMessages(const SharedInvalidationMessage* msg, Oid tsid);
 
-Snapshot SSGetSnapshotData(Snapshot snapshot)
+static Snapshot SSGetSnapshotDataFromMaster(Snapshot snapshot)
 {
     dms_opengauss_txn_snapshot_t dms_snapshot;
     dms_context_t dms_ctx;
     InitDmsContext(&dms_ctx);
-    if (SS_IN_REFORM) {
-        ereport(DEBUG1, (errmsg("[SS reform] SSGetSnapshotData returns NULL in reform.")));
-        return NULL;
-    }
 
     do {
         dms_ctx.xmap_ctx.dest_id = (unsigned int)SS_PRIMARY_ID;
         if (dms_request_opengauss_txn_snapshot(&dms_ctx, &dms_snapshot) == DMS_SUCCESS) {
             break;
-        }
+        } 
 
-        if (SS_IN_REFORM) {
-            ereport(DEBUG1, (errmsg("[SS reform] SSGetSnapshotData returns NULL in reform.")));
+        if (AM_WAL_SENDER && SS_IN_REFORM) {
             return NULL;
         }
         pg_usleep(USECS_PER_SEC);
@@ -61,6 +73,14 @@ Snapshot SSGetSnapshotData(Snapshot snapshot)
     snapshot->xmin = dms_snapshot.xmin;
     snapshot->xmax = dms_snapshot.xmax;
     snapshot->snapshotcsn = dms_snapshot.snapshotcsn;
+    if (ENABLE_SS_BCAST_SNAPSHOT) {
+        t_thrd.dms_cxt.latest_snapshot_xmin = dms_snapshot.xmin;
+        t_thrd.dms_cxt.latest_snapshot_csn = dms_snapshot.snapshotcsn;
+        t_thrd.dms_cxt.latest_snapshot_xmax = dms_snapshot.xmax;
+        ereport(DEBUG1,
+            (errmsg("Get Local snapshot from master, xmin/xmax/csn:%lu/%lu/%lu", t_thrd.dms_cxt.latest_snapshot_xmin,
+            t_thrd.dms_cxt.latest_snapshot_xmax, t_thrd.dms_cxt.latest_snapshot_csn)));
+    }
     if (!TransactionIdIsValid(t_thrd.pgxact->xmin)) {
         t_thrd.pgxact->xmin = u_sess->utils_cxt.TransactionXmin = snapshot->xmin;
     }
@@ -73,6 +93,81 @@ Snapshot SSGetSnapshotData(Snapshot snapshot)
     return snapshot;
 }
 
+Snapshot SSGetSnapshotData(Snapshot snapshot)
+{
+    /* For cm agent, it only query the system status using the parameter in memory. So don't need MVCC */
+    if (u_sess->libpq_cxt.IsConnFromCmAgent) {
+        if (SS_IN_REFORM && !SSPerformingStandbyScenario()) {
+            ereport(ERROR, (errmsg("failed to request snapshot as current node is in reform.")));
+        }
+
+        snapshot = SnapshotNow;
+        if (!TransactionIdIsNormal(u_sess->utils_cxt.RecentGlobalXmin)) {
+            u_sess->utils_cxt.RecentGlobalXmin = FirstNormalTransactionId;
+        }
+        u_sess->utils_cxt.RecentGlobalDataXmin = u_sess->utils_cxt.RecentGlobalXmin;
+        return snapshot;
+    }
+
+    if (!ENABLE_SS_BCAST_SNAPSHOT ||
+        (g_instance.dms_cxt.latest_snapshot_xmax == InvalidTransactionId &&
+        t_thrd.dms_cxt.latest_snapshot_xmax == InvalidTransactionId)) {
+        return SSGetSnapshotDataFromMaster(snapshot);
+    } else if (TransactionIdPrecedes(t_thrd.dms_cxt.latest_snapshot_xmax, g_instance.dms_cxt.latest_snapshot_xmax)) {
+        SpinLockAcquire(&g_instance.dms_cxt.set_snapshot_mutex);
+        t_thrd.dms_cxt.latest_snapshot_xmin = g_instance.dms_cxt.latest_snapshot_xmin;
+        t_thrd.dms_cxt.latest_snapshot_csn = g_instance.dms_cxt.latest_snapshot_csn;
+        t_thrd.dms_cxt.latest_snapshot_xmax = g_instance.dms_cxt.latest_snapshot_xmax;
+        SpinLockRelease(&g_instance.dms_cxt.set_snapshot_mutex);
+        ereport(DEBUG1,
+            (errmsg("Update Local snapshot from global, xmin/xmax/csn:%lu/%lu/%lu", t_thrd.dms_cxt.latest_snapshot_xmin,
+            t_thrd.dms_cxt.latest_snapshot_xmax, t_thrd.dms_cxt.latest_snapshot_csn)));
+    }
+
+    Assert(t_thrd.dms_cxt.latest_snapshot_xmax != InvalidTransactionId);
+    if (g_instance.dms_cxt.latest_snapshot_xmax == InvalidTransactionId) {
+        return SSGetSnapshotDataFromMaster(snapshot);
+    }
+    snapshot->xmin = t_thrd.dms_cxt.latest_snapshot_xmin;
+    snapshot->xmax = t_thrd.dms_cxt.latest_snapshot_xmax;
+    snapshot->snapshotcsn = t_thrd.dms_cxt.latest_snapshot_csn;
+    ereport(DEBUG1, (errmsg("Current Use snapshot, xmin/xmax/csn:%lu/%lu/%lu", snapshot->xmin,
+        snapshot->xmax, snapshot->snapshotcsn)));
+    if (!TransactionIdIsValid(t_thrd.pgxact->xmin)) {
+        t_thrd.pgxact->xmin = u_sess->utils_cxt.TransactionXmin = snapshot->xmin;
+    }
+
+    if (!TransactionIdIsNormal(u_sess->utils_cxt.RecentGlobalXmin)) {
+        u_sess->utils_cxt.RecentGlobalXmin = FirstNormalTransactionId;
+    }
+    u_sess->utils_cxt.RecentGlobalDataXmin = u_sess->utils_cxt.RecentGlobalXmin;
+    u_sess->utils_cxt.RecentXmin = snapshot->xmin;
+    return snapshot;
+}
+
+int SSUpdateLatestSnapshotOfStandby(char *data, uint32 len)
+{
+    if (unlikely(len != sizeof(SSBroadcastSnapshot))) {
+        ereport(DEBUG1, (errmsg("invalid broadcast set snapshot message")));
+        return DMS_ERROR;
+    }
+
+    SSBroadcastSnapshot *received_data = (SSBroadcastSnapshot *)data;
+    if (TransactionIdPrecedes(received_data->xmax, g_instance.dms_cxt.latest_snapshot_xmax)) {
+        ereport(WARNING, (errmsg("Receive oldest one, can't update:%lu/%lu", received_data->xmin,
+            g_instance.dms_cxt.latest_snapshot_xmax)));
+        return DMS_SUCCESS;
+    }
+    SpinLockAcquire(&g_instance.dms_cxt.set_snapshot_mutex);
+    g_instance.dms_cxt.latest_snapshot_xmin = received_data->xmin;
+    g_instance.dms_cxt.latest_snapshot_csn = received_data->csn;
+    g_instance.dms_cxt.latest_snapshot_xmax = received_data->xmax;
+    SpinLockRelease(&g_instance.dms_cxt.set_snapshot_mutex);
+    ereport(DEBUG1, (errmsg("Receive and set global snapshot xmin/xmax/csn:%lu/%lu/%lu", received_data->xmin,
+        received_data->xmax, received_data->csn)));
+    return DMS_SUCCESS;
+}
+
 static int SSTransactionIdGetCSN(dms_opengauss_xid_csn_t *dms_txn_info, dms_opengauss_csn_result_t *xid_csn_result)
 {
     dms_context_t dms_ctx;
@@ -82,6 +177,53 @@ static int SSTransactionIdGetCSN(dms_opengauss_xid_csn_t *dms_txn_info, dms_open
     return dms_request_opengauss_xid_csn(&dms_ctx, dms_txn_info, xid_csn_result);
 }
 
+static inline void txnstatusNetworkStats(uint64 timeDiff)
+{
+    ereport(DEBUG1, (errmodule(MOD_SS_TXNSTATUS),
+            errmsg("SSTxnStatusCache niotimediff=%luus", timeDiff)));
+    g_instance.dms_cxt.SSDFxStats.txnstatus_network_io_gets++;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_total_niogets_time += timeDiff;
+}
+
+static inline void txnstatusHashStats(uint64 timeDiff)
+{
+    ereport(DEBUG1, (errmodule(MOD_SS_TXNSTATUS),
+            errmsg("SSTxnStatusCache hashtimediff=%luus", timeDiff)));
+    g_instance.dms_cxt.SSDFxStats.txnstatus_hashcache_gets++;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_total_hcgets_time += timeDiff;
+}
+
+/*
+ * Use TxnStatusCache regardless of the snapshot might result in erroneous visibility check.
+ * trustFrozen: whether frozen CSN can be used to determine visibility. if xid > snapshotxid,
+ * then still fetch from remote clogstatus cache. is clogstatus the most accurate?
+ */
+static inline bool SnapshotSatisfiesTSC(TransactionId transactionId, Snapshot snapshot,
+    bool isMvcc, bool *trustFrozen)
+{
+    if (snapshot == NULL || !isMvcc) {
+        return true;
+    } else {
+        if (IsVersionMVCCSnapshot(snapshot) || (snapshot->satisfies == SNAPSHOT_DECODE_MVCC)) {
+            return false;
+        }
+        if (IsMVCCSnapshot(snapshot) && !TransactionIdPrecedes(transactionId, snapshot->xmin)) {
+            *trustFrozen = false;
+        }
+    }
+    return true;
+}
+
+static inline bool IsCommitSeqNoDefinitive(CommitSeqNo csn)
+{
+    return (COMMITSEQNO_IS_ABORTED(csn) || COMMITSEQNO_IS_COMMITTED(csn));
+}
+
+static inline bool IsClogStatusDefinitive(CLogXidStatus status)
+{
+    return (status != CLOG_XID_STATUS_IN_PROGRESS && status != CLOG_XID_STATUS_SUB_COMMITTED);
+}
+
 /*
  * xid -> csnlog status
  * is_committed: if true, then no need to fetch xid status from clog
@@ -89,19 +231,43 @@ static int SSTransactionIdGetCSN(dms_opengauss_xid_csn_t *dms_txn_info, dms_open
 CommitSeqNo SSTransactionIdGetCommitSeqNo(TransactionId transactionId, bool isCommit, bool isMvcc, bool isNest,
     Snapshot snapshot, bool* sync)
 {
+    instr_time startTime;
+    instr_time endTime;
+    PgStat_Counter timeDiff = 0;
+    (void)INSTR_TIME_SET_CURRENT(startTime);
+
     if ((snapshot == NULL || !IsVersionMVCCSnapshot(snapshot)) &&
         TransactionIdEquals(transactionId, t_thrd.xact_cxt.cachedFetchCSNXid)) {
+        g_instance.dms_cxt.SSDFxStats.txnstatus_varcache_gets++;
         t_thrd.xact_cxt.latestFetchCSNXid = t_thrd.xact_cxt.cachedFetchCSNXid;
         t_thrd.xact_cxt.latestFetchCSN = t_thrd.xact_cxt.cachedFetchCSN;
         return t_thrd.xact_cxt.cachedFetchCSN;
     }
     if (!TransactionIdIsNormal(transactionId)) {
+        g_instance.dms_cxt.SSDFxStats.txnstatus_varcache_gets++;
         t_thrd.xact_cxt.latestFetchCSNXid = InvalidTransactionId;
         if (TransactionIdEquals(transactionId, BootstrapTransactionId) ||
             TransactionIdEquals(transactionId, FrozenTransactionId)) {
             return COMMITSEQNO_FROZEN;
         }
         return COMMITSEQNO_ABORTED;
+    }
+
+    CommitSeqNo cachedCSN = InvalidCommitSeqNo;
+    bool trustFrozen = false;
+    if (ENABLE_SS_TXNSTATUS_CACHE && SnapshotSatisfiesTSC(transactionId, snapshot, isMvcc, &trustFrozen)) {
+        bool cached = false;
+        uint32 hashcode = XidHashCode(&transactionId);
+        cached = TxnStatusCacheLookup(&transactionId, hashcode, &cachedCSN);
+        if (cached) {
+            Assert(IsCommitSeqNoDefinitive(cachedCSN));
+            if (!COMMITSEQNO_IS_FROZEN(cachedCSN) || trustFrozen) {
+                TxnStatusCalcStats(startTime, endTime, timeDiff, true);
+#ifndef USE_ASSERT_CHECKING
+                return cachedCSN;
+#endif
+            }
+        }
     }
 
     CommitSeqNo csn = 0; // COMMITSEQNO_INPROGRESS by default
@@ -121,8 +287,9 @@ CommitSeqNo SSTransactionIdGetCommitSeqNo(TransactionId transactionId, bool isCo
         dms_txn_info.snapshotxmin = InvalidTransactionId;
     }
 
-    if (SS_IN_REFORM && (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER || t_thrd.role == STREAM_WORKER)) {
-        ereport(FATAL, (errmsg("SSTransactionIdGetCommitSeqNo failed during reform, xid=%lu.", transactionId)));
+    if (SS_IN_REFORM && SSBackendNeedExitScenario() &&
+        (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER || t_thrd.role == STREAM_WORKER)) {
+        ereport(ERROR, (errmsg("SSTransactionIdGetCommitSeqNo failed during reform, xid=%lu.", transactionId)));
     }
 
     do {
@@ -142,7 +309,7 @@ CommitSeqNo SSTransactionIdGetCommitSeqNo(TransactionId transactionId, bool isCo
             }
             break;
         } else {
-            if (SS_IN_REFORM &&
+            if (SS_IN_REFORM && SSBackendNeedExitScenario() &&
                 (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER || t_thrd.role == STREAM_WORKER)) {
                 ereport(FATAL, (errmsg("SSTransactionIdGetCommitSeqNo failed during reform, xid=%lu.", transactionId)));
             }
@@ -151,17 +318,39 @@ CommitSeqNo SSTransactionIdGetCommitSeqNo(TransactionId transactionId, bool isCo
         }
     } while (true);
 
-    if (COMMITSEQNO_IS_COMMITTED(csn) || COMMITSEQNO_IS_ABORTED(csn)) {
+#ifdef USE_ASSERT_CHECKING
+    /* DEBUG mode validates cache-networkIO consistency before returning cache */
+    if (cachedCSN != InvalidCommitSeqNo && (!COMMITSEQNO_IS_FROZEN(cachedCSN) || trustFrozen)) {
+        Assert(((COMMITSEQNO_IS_COMMITTED(csn) && COMMITSEQNO_IS_COMMITTED(cachedCSN))) ||
+            (COMMITSEQNO_IS_ABORTED(csn) && COMMITSEQNO_IS_ABORTED(cachedCSN)));
+        return cachedCSN;
+    }
+#endif
+
+    if (IsCommitSeqNoDefinitive(csn)) {
         t_thrd.xact_cxt.cachedFetchCSNXid = transactionId;
         t_thrd.xact_cxt.cachedFetchCSN = csn;
+
+        if (ENABLE_SS_TXNSTATUS_CACHE && IsClogStatusDefinitive(clogstatus)) {
+            /* clogstat might be in-progress, therefore we want to be discreet */
+            uint32 hashcode = XidHashCode(&transactionId);
+            LWLock *partitionLock = TxnStatusCachePartitionLock(hashcode);
+            LWLockAcquire(partitionLock, LW_EXCLUSIVE);
+            int ret = TxnStatusCacheInsert(&transactionId, hashcode, csn, clogstatus);
+            if (ret != GS_SUCCESS) {
+                ereport(PANIC, (errmsg("SSTxnStatusCache insert failed, xid=%lu.", transactionId)));
+            }
+            LWLockRelease(partitionLock);
+        }
     }
 
-    if (clogstatus != CLOG_XID_STATUS_IN_PROGRESS && clogstatus != CLOG_XID_STATUS_SUB_COMMITTED) {
+    if (IsClogStatusDefinitive(clogstatus)) {
         t_thrd.xact_cxt.cachedFetchXid = transactionId;
         t_thrd.xact_cxt.cachedFetchXidStatus = clogstatus;
         t_thrd.xact_cxt.cachedCommitLSN = lsn;
     }
 
+    TxnStatusCalcStats(startTime, endTime, timeDiff, false);
     return csn;
 }
 
@@ -205,7 +394,7 @@ void SSTransactionIdDidCommit(TransactionId transactionId, bool* ret_did_commit)
                         transactionId, did_commit)));
                 break;
             } else {
-                if (SS_IN_REFORM &&
+                if (SS_IN_REFORM && SSBackendNeedExitScenario() &&
                     (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER || t_thrd.role == STREAM_WORKER)) {
                     ereport(FATAL, (errmsg("SSTransactionIdDidCommit failed during reform, xid=%lu.", transactionId)));
                 }
@@ -239,7 +428,7 @@ void SSTransactionIdIsInProgress(TransactionId transactionId, bool *in_progress)
                 transactionId, *in_progress)));
             break;
         } else {
-            if (SS_IN_REFORM &&
+            if (SS_IN_REFORM && SSBackendNeedExitScenario() &&
                 (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER || t_thrd.role == STREAM_WORKER)) {
                 ereport(FATAL, (errmsg("SSTransactionIdIsInProgress failed during reform, xid=%lu.", transactionId)));
             }
@@ -264,7 +453,7 @@ TransactionId SSMultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask, u
             ereport(DEBUG1, (errmsg("SS get update xid success, multixact xid=%lu, uxid=%lu.", xmax, update_xid)));
             break;
         } else {
-            if (SS_IN_REFORM &&
+            if (SS_IN_REFORM && SSBackendNeedExitScenario() &&
                 (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER || t_thrd.role == STREAM_WORKER)) {
                 ereport(FATAL, (errmsg("SSMultiXactIdGetUpdateXid failed during reform, xid=%lu.", xmax)));
             }
@@ -276,45 +465,26 @@ TransactionId SSMultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask, u
     return update_xid;
 }
 
-int SSGetOldestXmin(char *data, uint32 len, char *output_msg, uint32 *output_msg_len)
-{
-    if (unlikely(len != sizeof(SSBroadcastXmin))) {
-        ereport(DEBUG1, (errmsg("invalid broadcast xmin message")));
-        return DMS_ERROR;
-    }
-
-    SSBroadcastXminAck* getXminReq = (SSBroadcastXminAck *)output_msg;
-    getXminReq->type = BCAST_GET_XMIN_ACK;
-    GetOldestGlobalProcXmin(&(getXminReq->xmin));
-    *output_msg_len = sizeof(SSBroadcastXminAck);
-    return DMS_SUCCESS;
-}
-
-/* Calbulate the oldest xmin during broadcast xmin ack */
-int SSGetOldestXminAck(SSBroadcastXminAck *ack_data)
-{
-    TransactionId xmin_ack = pg_atomic_read_u64(&g_instance.dms_cxt.xminAck);
-    if (TransactionIdIsValid(ack_data->xmin) && TransactionIdIsNormal(ack_data->xmin) &&
-        TransactionIdPrecedes(ack_data->xmin, xmin_ack)) {
-        pg_atomic_write_u64(&g_instance.dms_cxt.xminAck, ack_data->xmin);
-    }
-    return DMS_SUCCESS;
-}
-
-bool SSGetOldestXminFromAllStandby()
+void SSSendLatestSnapshotToStandby(TransactionId xmin, TransactionId xmax, CommitSeqNo csn)
 {
     dms_context_t dms_ctx;
     InitDmsContext(&dms_ctx);
-    SSBroadcastXmin xmin_data;
-    xmin_data.type = BCAST_GET_XMIN;
-    xmin_data.xmin = InvalidTransactionId;
-    pg_atomic_write_u64(&g_instance.dms_cxt.xminAck, MaxTransactionId);
-    int ret = dms_broadcast_msg(&dms_ctx, (char *)&xmin_data, sizeof(SSBroadcastXmin),
-        (unsigned char)true, SS_BROADCAST_WAIT_FIVE_SECONDS);
-    if (ret != DMS_SUCCESS) {
-        return false;
-    }
-    return true;
+    int ret;
+    SSBroadcastSnapshot latest_snapshot;
+    latest_snapshot.xmin = xmin;
+    latest_snapshot.xmax = xmax;
+    latest_snapshot.csn = csn;
+    latest_snapshot.type = BCAST_SEND_SNAPSHOT;
+    do {
+        ret = dms_broadcast_msg(&dms_ctx, (char *)&latest_snapshot, sizeof(SSBroadcastSnapshot),
+            (unsigned char)false, SS_BROADCAST_WAIT_ONE_SECOND);
+
+        if (ret == DMS_SUCCESS) {
+            return;
+        }
+
+        pg_usleep(5000L);
+    } while (ret != DMS_SUCCESS);
 }
 
 void SSIsPageHitDms(RelFileNode& node, BlockNumber page, int pagesNum, uint64 *pageMap, int *bitCount)
@@ -331,6 +501,16 @@ void SSIsPageHitDms(RelFileNode& node, BlockNumber page, int pagesNum, uint64 *p
         return;
     }
     ereport(DEBUG1, (errmsg("SS get page map success, buffer_id = %u.", page)));
+}
+
+int SSReloadReformCtrlPage(uint32 len)
+{
+    if (unlikely(len != sizeof(SSBroadcastCmdOnly))) {
+        return DMS_ERROR;
+    }
+
+    SSReadControlFile(REFORM_CTRL_PAGE);
+    return DMS_SUCCESS;
 }
 
 int SSCheckDbBackends(char *data, uint32 len, char *output_msg, uint32 *output_msg_len)
@@ -382,6 +562,24 @@ bool SSCheckDbBackendsFromAllStandby(Oid dbid)
         return true;
     }
     return false;
+}
+
+void SSRequestAllStandbyReloadReformCtrlPage()
+{
+    dms_context_t dms_ctx;
+    InitDmsContext(&dms_ctx);
+    int ret;
+    SSBroadcastCmdOnly ssmsg;
+    ssmsg.type = BCAST_RELOAD_REFORM_CTRL_PAGE;
+    do {
+        ret = dms_broadcast_msg(&dms_ctx, (char *)&ssmsg, sizeof(SSBroadcastCmdOnly),
+            (unsigned char)false, SS_BROADCAST_WAIT_ONE_SECOND);
+
+        if (ret == DMS_SUCCESS) {
+            return;
+        }
+        pg_usleep(5000L);
+    } while (ret != DMS_SUCCESS);
 }
 
 void SSSendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
@@ -766,4 +964,25 @@ void SSStandbyUpdateRedirectInfo()
 
     redirect_manager->ss_standby_sxid = dms_sw_info.sxid;
     redirect_manager->ss_standby_scid = dms_sw_info.scid;
+}
+
+bool SSCanFetchLocalSnapshotTxnRelatedInfo()
+{
+    if (SS_NORMAL_PRIMARY) {
+        return true;
+    } else if (SS_PERFORMING_SWITCHOVER) {
+        if (SS_REFORM_REFORMER && g_instance.dms_cxt.SSClusterState < NODESTATE_PROMOTE_APPROVE) {
+            return true;
+        }
+    } else if (SS_REFORM_REFORMER && SSPerformingStandbyScenario()) {
+        return true;
+    } else if (SS_REFORM_REFORMER && SS_ONDEMAND_BUILD_DONE) {
+        ss_xmin_info_t *xmin_info = &g_instance.dms_cxt.SSXminInfo;
+        SpinLockAcquire(&xmin_info->snapshot_available_lock);
+        bool snap_available = xmin_info->snapshot_available;
+        SpinLockRelease(&xmin_info->snapshot_available_lock);
+        return snap_available;
+    }
+    
+    return false;
 }

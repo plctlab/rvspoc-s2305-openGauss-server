@@ -306,7 +306,7 @@ typedef struct DecodeOptionsDefault {
 
 extern LogicalDispatcher g_Logicaldispatcher[];
 extern bool firstCreateDispatcher;
-
+extern bool QuoteCheckOut(char* newval);
 extern void CheckLogicalDecodingRequirements(Oid databaseId);
 extern void ParallelReorderBufferQueueChange(ParallelReorderBuffer *rb, logicalLog *change, int slotId);
 extern void ParallelReorderBufferForget(ParallelReorderBuffer *rb, int slotId, ParallelReorderBufferTXN *txn);
@@ -342,7 +342,6 @@ extern void ParallelDecodeWorkerMain(void* point);
 extern void LogicalReadWorkerMain(void* point);
 extern void ParseProcessRecord(ParallelLogicalDecodingContext *ctx, XLogReaderState *record, ParallelDecodeReaderWorker
     *worker);
-extern void XLogSendParallelLogical();
 extern void StartLogicalLogWorkers(char* dbUser, char* dbName, char* slotname, List *options, int parallelDecodeNum);
 extern void CheckBooleanOption(DefElem *elem, bool *booleanOption, bool defaultValue);
 extern void CheckIntOption(DefElem *elem, int *intOption, int defaultValue, int minVal, int maxVal);
@@ -358,5 +357,7 @@ extern void FreeLogicalLog(ParallelReorderBuffer *rb, logicalLog *logChange, int
 extern bool LogicalDecodeParseOptionsDefault(const char* defaultStr, void **options);
 extern DecodeOptionsDefault* LogicalDecodeGetOptionsDefault();
 template <typename T> void LogicalDecodeReportLostChanges(const T *iterstate);
+extern void tuple_to_stringinfo(Relation relation, StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool isOld,
+    bool printOid = false);
 
 #endif

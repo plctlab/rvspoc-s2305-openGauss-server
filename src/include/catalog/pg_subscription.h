@@ -52,13 +52,17 @@ CATALOG(pg_subscription,6126) BKI_SHARED_RELATION BKI_ROWTYPE_OID(6128) BKI_SCHE
     text subpublications[1]; /* List of publications subscribed to */
     bool subbinary;          /* True if the subscription wants the
                               * publisher to send data in binary */
+    text subskiplsn;         /* All changes finished at this LSN are
+                              * skipped */
+    bool submatchddlowner;   /* True if replicated objects by DDL replication
+                              * should match the original owner on the publisher */
 #endif
 }
 FormData_pg_subscription;
 
 typedef FormData_pg_subscription *Form_pg_subscription;
 
-#define Natts_pg_subscription 9
+#define Natts_pg_subscription 11
 #define Anum_pg_subscription_subdbid 1
 #define Anum_pg_subscription_subname 2
 #define Anum_pg_subscription_subowner 3
@@ -68,7 +72,8 @@ typedef FormData_pg_subscription *Form_pg_subscription;
 #define Anum_pg_subscription_subsynccommit 7
 #define Anum_pg_subscription_subpublications 8
 #define Anum_pg_subscription_subbinary 9
-
+#define Anum_pg_subscription_subskiplsn 10
+#define Anum_pg_subscription_submatchddlowner 11
 
 typedef struct Subscription {
     Oid oid;            /* Oid of the subscription */
@@ -81,6 +86,10 @@ typedef struct Subscription {
     char *synccommit;   /* Synchronous commit setting for worker */
     List *publications; /* List of publication names to subscribe to */
     bool binary;        /* Indicates if the subscription wants data in binary format */
+    XLogRecPtr skiplsn; /* All changes finished at this LSN are
+                         * skipped */
+    bool matchddlowner; /* Indicated if replicated objects by DDL repllication
+                         * shold match the original owner on th publisher */
 } Subscription;
 
 
@@ -91,6 +100,8 @@ extern char *get_subscription_name(Oid subid, bool missing_ok);
 
 extern int CountDBSubscriptions(Oid dbid);
 extern void ClearListContent(List *list);
+extern Datum LsnGetTextDatum(XLogRecPtr lsn);
+extern XLogRecPtr TextDatumGetLsn(Datum datum);
 
 
 #endif /* PG_SUBSCRIPTION_H */

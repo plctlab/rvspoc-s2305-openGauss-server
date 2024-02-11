@@ -42,6 +42,7 @@
 #include "access/multixact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_matview.h"
 #include "catalog/gs_obsscaninfo.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -115,6 +116,8 @@
 #include "foreign/fdwapi.h"
 #include "instruments/generate_report.h"
 #include "catalog/gs_encrypted_columns.h"
+#include "catalog/gs_dependencies_fn.h"
+#include "utils/plpgsql.h"
 
 #ifdef PGXC
 #include "catalog/pgxc_class.h"
@@ -408,7 +411,28 @@ static FormData_pg_attribute a10 = {0,
     true,
     0};
 
+#ifdef USE_SPQ
+static FormData_pg_attribute a11 = {0,
+    {"_root_ctid"},
+    TIDOID,
+    0,
+    sizeof(ItemPointerData),
+    RootSelfItemPointerAttributeNumber,
+    0,
+    -1,
+    -1,
+    false,
+    'p',
+    's',
+    true,
+    false,
+    false,
+    true,
+    0};
+static const Form_pg_attribute SysAtt[] = {&a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10, &a11};
+#else
 static const Form_pg_attribute SysAtt[] = {&a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8, &a9, &a10};
+#endif
 #else
 static const Form_pg_attribute SysAtt[] = {&a1, &a2, &a3, &a4, &a5, &a6, &a7};
 #endif
@@ -983,6 +1007,7 @@ void InsertPgAttributeTuple(Relation pg_attribute_rel, Form_pg_attribute new_att
 
     /* at default, new fileld attinitdefval of pg_attribute is null. */
     nulls[Anum_pg_attribute_attinitdefval - 1] = true;
+    nulls[Anum_pg_attribute_attdroppedname - 1] = true;
 
     tup = heap_form_tuple(RelationGetDescr(pg_attribute_rel), values, nulls);
 
@@ -997,6 +1022,34 @@ void InsertPgAttributeTuple(Relation pg_attribute_rel, Form_pg_attribute new_att
     heap_freetuple(tup);
 }
 
+static bool make_gs_depend_param_body(GsDependParamBody* gs_depend_param_body, const char* typ_name,
+    const char relkind, const Oid namespace_oid)
+{
+    bool need_build_depend = false;
+    int cw = CompileWhich();
+    need_build_depend = (relkind == RELKIND_RELATION || relkind == RELKIND_COMPOSITE_TYPE) &&
+        (cw == PLPGSQL_COMPILE_PACKAGE_PROC || cw == PLPGSQL_COMPILE_PACKAGE || cw == PLPGSQL_COMPILE_PROC);
+    if (!need_build_depend) {
+        return false;
+    }
+    gs_depend_param_body->dependNamespaceOid = namespace_oid;
+    if (NULL != u_sess->plsql_cxt.curr_compile_context &&
+        NULL != u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package) {
+        PLpgSQL_package* pkg = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package;
+        gs_depend_param_body->dependPkgOid = pkg->pkg_oid;
+        gs_depend_param_body->dependPkgName = pkg->pkg_signature;
+    }
+    char* real_typ_name = ParseTypeName((char*)typ_name, gs_depend_param_body->dependPkgOid);
+    if (real_typ_name == NULL) {
+        gs_depend_param_body->dependName = pstrdup(typ_name);
+    } else {
+        gs_depend_param_body->dependName = real_typ_name;
+    }
+    gs_depend_param_body->refPosType = GSDEPEND_REFOBJ_POS_IN_TYPE;
+    gs_depend_param_body->type = GSDEPEND_OBJECT_TYPE_TYPE;
+    return true;
+}
+
 /* --------------------------------
  *		AddNewAttributeTuples
  *
@@ -1004,7 +1057,8 @@ void InsertPgAttributeTuple(Relation pg_attribute_rel, Form_pg_attribute new_att
  *		tuples to pg_attribute.
  * --------------------------------
  */
-static void AddNewAttributeTuples(Oid new_rel_oid, TupleDesc tupdesc, char relkind, bool oidislocal, int oidinhcount, bool hasbucket, bool hasuids)
+static void AddNewAttributeTuples(Oid new_rel_oid, TupleDesc tupdesc, char relkind,
+    bool oidislocal, int oidinhcount, bool hasbucket, bool hasuids, List* depend_extend, const char* typ_name, Oid namespace_oid)
 {
     Form_pg_attribute attr;
     int i;
@@ -1019,7 +1073,13 @@ static void AddNewAttributeTuples(Oid new_rel_oid, TupleDesc tupdesc, char relki
     rel = heap_open(AttributeRelationId, RowExclusiveLock);
 
     indstate = CatalogOpenIndexes(rel);
-
+    GsDependParamBody gs_depend_param_body;
+    gsplsql_init_gs_depend_param_body(&gs_depend_param_body);
+    bool need_build_depend = false;
+    if (enable_plpgsql_gsdependency()) {
+        need_build_depend = make_gs_depend_param_body(&gs_depend_param_body, typ_name, relkind, namespace_oid);
+    }
+    ListCell* depend_extend_cell = list_head(depend_extend);
     /*
      * First we add the user attributes.  This is also a convenient place to
      * add dependencies on their datatypes and collations.
@@ -1047,7 +1107,17 @@ static void AddNewAttributeTuples(Oid new_rel_oid, TupleDesc tupdesc, char relki
             referenced.classId = TypeRelationId;
             referenced.objectId = attr->atttypid;
             referenced.objectSubId = 0;
-            recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+            
+            if (need_build_depend) {
+                if (NULL != depend_extend_cell) {
+                    gs_depend_param_body.dependExtend = (TypeDependExtend*)lfirst(depend_extend_cell);
+                } else {
+                    gs_depend_param_body.dependExtend = NULL;
+                }
+                recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL, &gs_depend_param_body);
+            } else {
+                recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+            }
 
             /* The default collation is pinned, so don't bother recording it */
             if (OidIsValid(attr->attcollation) && attr->attcollation != DEFAULT_COLLATION_OID) {
@@ -1057,6 +1127,12 @@ static void AddNewAttributeTuples(Oid new_rel_oid, TupleDesc tupdesc, char relki
                 recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
             }
         }
+        if (need_build_depend && NULL != depend_extend_cell) {
+            depend_extend_cell = lnext(depend_extend_cell);
+        }
+    }
+    if (need_build_depend) {
+        pfree_ext(gs_depend_param_body.dependName);
     }
 
     /*
@@ -1071,6 +1147,10 @@ static void AddNewAttributeTuples(Oid new_rel_oid, TupleDesc tupdesc, char relki
             /* skip OID where appropriate */
             if (!tupdesc->tdhasoid && SysAtt[i]->attnum == ObjectIdAttributeNumber)
                 continue;
+#ifdef USE_SPQ
+            if (SysAtt[i]->attnum == RootSelfItemPointerAttributeNumber)
+                continue;
+#endif
             if (!hasbucket && SysAtt[i]->attnum == BucketIdAttributeNumber)
                 continue;
             if (!hasuids && SysAtt[i]->attnum == UidAttributeNumber)
@@ -2599,7 +2679,7 @@ Oid heap_create_with_catalog(const char *relname, Oid relnamespace, Oid reltable
                              int oidinhcount, OnCommitAction oncommit, Datum reloptions, bool use_user_acl,
                              bool allow_system_table_mods, PartitionState *partTableState, int8 row_compress,
                              HashBucketInfo *bucketinfo, bool record_dependce, List *ceLst, StorageType storage_type,
-                             LOCKMODE partLockMode, ObjectAddress *typaddress)
+                             LOCKMODE partLockMode, ObjectAddress *typaddress, List* depend_extend)
 {
     Relation pg_class_desc;
     Relation new_rel_desc;
@@ -2627,7 +2707,7 @@ Oid heap_create_with_catalog(const char *relname, Oid relnamespace, Oid reltable
         /* store tables in segment storage as all possible while initdb */
         if (relpersistence == RELPERSISTENCE_PERMANENT &&
             (relkind != RELKIND_SEQUENCE && relkind != RELKIND_LARGE_SEQUENCE &&
-            (!ENABLE_DMS || relkind != RELKIND_TOASTVALUE))) {
+             relkind != RELKIND_TOASTVALUE)) {
             storage_type = SEGMENT_PAGE;
             reloptions = AddSegmentOption(reloptions);
         }
@@ -3001,7 +3081,7 @@ Oid heap_create_with_catalog(const char *relname, Oid relnamespace, Oid reltable
      * now add tuples to pg_attribute for the attributes in our new relation.
      */
     AddNewAttributeTuples(
-        relid, new_rel_desc->rd_att, relkind, oidislocal, oidinhcount, relhasbucket, relhasuids);
+        relid, new_rel_desc->rd_att, relkind, oidislocal, oidinhcount, relhasbucket, relhasuids, depend_extend, relname, relnamespace);
     if (ceLst != NULL) {
         AddNewGsSecEncryptedColumnsTuples(relid, ceLst);
     }
@@ -3302,6 +3382,13 @@ void RemoveAttributeById(Oid relid, AttrNumber attnum)
     Form_pg_attribute attStruct;
     char newattname[NAMEDATALEN];
     bool isRedisDropColumn = false;
+    Datum values[Natts_pg_attribute] = { 0 };
+    bool nulls[Natts_pg_attribute] = { 0 };
+    bool replaces[Natts_pg_attribute] = { 0 };
+    const int keyNum = 2;
+    ScanKeyData key[keyNum];
+    SysScanDesc scan;
+    HeapTuple newatttuple;
 
     /*
      * Grab an exclusive lock on the target table, which we will NOT release
@@ -3314,7 +3401,10 @@ void RemoveAttributeById(Oid relid, AttrNumber attnum)
 
     attr_rel = heap_open(AttributeRelationId, RowExclusiveLock);
 
-    atttuple = SearchSysCacheCopy2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(attnum));
+    ScanKeyInit(&key[0], Anum_pg_attribute_attrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relid));
+    ScanKeyInit(&key[1], Anum_pg_attribute_attnum, BTEqualStrategyNumber, F_INT2EQ, Int16GetDatum(attnum));
+    scan = systable_beginscan(attr_rel, AttributeRelidNumIndexId, true, SnapshotSelf, keyNum, key);
+    atttuple = systable_getnext(scan);
     if (!HeapTupleIsValid(atttuple)) /* shouldn't happen */
     {
         Assert(0);
@@ -3322,7 +3412,6 @@ void RemoveAttributeById(Oid relid, AttrNumber attnum)
             (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
                 errmsg("cache lookup failed for attribute %d of relation %u", attnum, relid)));
     }
-    attStruct = (Form_pg_attribute)GETSTRUCT(atttuple);
 
     if (RelationIsRedistributeDest(rel) && (attnum > 0 && attnum == rel->rd_att->natts))
         isRedisDropColumn = true;
@@ -3334,9 +3423,10 @@ void RemoveAttributeById(Oid relid, AttrNumber attnum)
     } else {
         errno_t rc;
         /* Dropping user attributes is lots harder */
+        attStruct = (Form_pg_attribute)GETSTRUCT(atttuple);
 
         /* Mark the attribute as dropped */
-        attStruct->attisdropped = true;
+        values[Anum_pg_attribute_attisdropped - 1] = BoolGetDatum(true);
 
         /*
          * Set the type OID to invalid.  A dropped attribute's type link
@@ -3347,27 +3437,39 @@ void RemoveAttributeById(Oid relid, AttrNumber attnum)
          * atttypid to zero here as a means of catching code that incorrectly
          * expects it to be valid.
          */
-        attStruct->atttypid = InvalidOid;
+        values[Anum_pg_attribute_atttypid - 1] = ObjectIdGetDatum(InvalidOid);
 
         /* Remove any NOT NULL constraint the column may have */
-        attStruct->attnotnull = false;
+        values[Anum_pg_attribute_attnotnull - 1] = BoolGetDatum(false);
 
         /* We don't want to keep stats for it anymore */
-        attStruct->attstattarget = 0;
+        values[Anum_pg_attribute_attstattarget - 1] = Int32GetDatum(0);
+        
+        values[Anum_pg_attribute_attdroppedname - 1] = NameGetDatum(&(attStruct->attname));
 
         /*
          * Change the column name to something that isn't likely to conflict
          */
+
         rc =
             snprintf_s(newattname, sizeof(newattname), sizeof(newattname) - 1, "........pg.dropped.%d........", attnum);
         securec_check_ss(rc, "\0", "\0");
-        (void)namestrcpy(&(attStruct->attname), newattname);
+        values[Anum_pg_attribute_attname - 1] = NameGetDatum(newattname);
+        replaces[Anum_pg_attribute_attisdropped - 1] = true;
+        replaces[Anum_pg_attribute_atttypid - 1] = true;
+        replaces[Anum_pg_attribute_attnotnull - 1] = true;
+        replaces[Anum_pg_attribute_attstattarget - 1] = true;
+        replaces[Anum_pg_attribute_attdroppedname - 1] = true;
+        replaces[Anum_pg_attribute_attname - 1] = true;
 
-        simple_heap_update(attr_rel, &atttuple->t_self, atttuple);
+        newatttuple = heap_modify_tuple(atttuple, RelationGetDescr(attr_rel), values, nulls, replaces);
+        simple_heap_update(attr_rel, &newatttuple->t_self, newatttuple);
 
         /* keep the system catalog indexes current */
-        CatalogUpdateIndexes(attr_rel, atttuple);
+        CatalogUpdateIndexes(attr_rel, newatttuple);
+        heap_freetuple_ext(newatttuple);
     }
+    systable_endscan(scan);
 
     /*
      * Because updating the pg_attribute row will trigger a relcache flush for
@@ -3695,8 +3797,7 @@ void heap_drop_with_catalog(Oid relid)
      * something with the doomed relation.
      */
     if (ISMLOG(RelationGetForm(rel)->relname.data)) {
-        char *base_relid_str = RelationGetForm(rel)->relname.data + MLOGLEN;
-        Oid base_relid = atoi(base_relid_str);
+        Oid base_relid = get_matview_mlog_baserelid(relid);
         if (OidIsValid(base_relid)) {
             CacheInvalidateRelcacheByRelid(base_relid);
         }
@@ -6118,10 +6219,10 @@ Oid heapAddRangePartition(Relation pgPartRel, Oid partTableOid, Oid partTablespa
     if (!PointerIsValid(newPartDef->boundary)) {
         ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("boundary not defined for new partition")));
     }
-    if (newPartDef->boundary->length > PARTITION_PARTKEYMAXNUM) {
+    if (newPartDef->boundary->length > MAX_PARTKEY_NUMS) {
         ereport(ERROR,
             (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-                errmsg("too many partition keys, allowed is %d", PARTITION_PARTKEYMAXNUM)));
+                errmsg("too many partition keys, allowed is %d", MAX_PARTKEY_NUMS)));
     }
 
     /*new partition name check*/
@@ -6575,7 +6676,7 @@ Datum Timestamp2Boundarys(Relation rel, Timestamp ts)
     } else {
         columnRaw = TimestampGetDatum(ts);
     }
-    int2vector* partKeyColumn = partMap->partitionKey;
+    int2vector* partKeyColumn = partMap->base.partitionKey;
     Assert(partKeyColumn->dim1 == 1);
 
     (void)transformDatum2Const(rel->rd_att, partKeyColumn->values[0], columnRaw, false, &consts);
@@ -6588,9 +6689,9 @@ Datum Timestamp2Boundarys(Relation rel, Timestamp ts)
 Datum GetPartBoundaryByTuple(Relation rel, HeapTuple tuple)
 {
     RangePartitionMap* partMap = (RangePartitionMap*)rel->partMap;
-    int2vector* partKeyColumn = partMap->partitionKey;
+    int2vector* partKeyColumn = partMap->base.partitionKey;
     Assert(partKeyColumn->dim1 == 1);
-    Assert(partMap->type.type == PART_TYPE_INTERVAL);
+    Assert(partMap->base.type == PART_TYPE_INTERVAL);
     Assert(partMap->rangeElementsNum >= 1);
 
     Const* lastPartBoundary = partMap->rangeElements[partMap->rangeElementsNum - 1].boundary[0];
@@ -6957,10 +7058,10 @@ static void addNewPartitionTupleForTable(Relation pg_partition_rel, const char* 
         RangePartitionDefState* lastPartition = NULL;
         lastPartition = (RangePartitionDefState*)lfirst(partTableState->partitionList->tail);
 
-        if (lastPartition->boundary->length > PARTITION_PARTKEYMAXNUM) {
+        if (lastPartition->boundary->length > MAX_PARTKEY_NUMS) {
             ereport(ERROR,
                 (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-                    errmsg("number of partition key columns MUST less or equal than %d", PARTITION_PARTKEYMAXNUM)));
+                    errmsg("number of partition key columns MUST less or equal than %d", MAX_PARTKEY_NUMS)));
         }
     }
 
@@ -7501,99 +7602,15 @@ Oid getPartitionIdFromTuple(Relation rel, void *tuple, EState* estate, TupleTabl
 {
     char* partExprKeyStr = NULL;
     Oid targetOid = InvalidOid;
-    bool partExprKeyIsNull = PartExprKeyIsNull(rel, NULL, &partExprKeyStr);
+    bool partExprKeyIsNull = PartExprKeyIsNull(rel, &partExprKeyStr);
     if (partExprKeyIsNull) {
-        targetOid = heapTupleGetPartitionId(rel, tuple, partitionno, isDDL, canIgnore);
+        targetOid = heapTupleGetPartitionOid(rel, tuple, partitionno, isDDL, canIgnore);
     } else {
         Datum newval = ComputePartKeyExprTuple(rel, estate, slot, NULL, partExprKeyStr);
-        targetOid = heapTupleGetPartitionId(rel, (void*)newval, partitionno, isDDL, canIgnore, false);
+        targetOid = heapTupleGetPartitionOid(rel, (void*)newval, partitionno, isDDL, canIgnore, false);
     }
     pfree_ext(partExprKeyStr);
     return targetOid;
-}
-
-/*
- * @@GaussDB@@
- * Target		: data partition
- * Brief		: get special table partition for a tuple
- *			: create a partition if necessary
- * Description	:
- * Notes		:
- */
-Oid heapTupleGetPartitionId(Relation rel, void *tuple, int *partitionno, bool isDDL, bool canIgnore, bool partExprKeyIsNull)
-{
-    Oid partitionid = InvalidOid;
-
-    /* get routing result */
-    partitionRoutingForTuple(rel, tuple, u_sess->catalog_cxt.route, canIgnore, partExprKeyIsNull);
-
-    /* if the partition exists, return partition's oid */
-    if (u_sess->catalog_cxt.route->fileExist) {
-        Assert(OidIsValid(u_sess->catalog_cxt.route->partitionId));
-        partitionid = u_sess->catalog_cxt.route->partitionId;
-        if (PointerIsValid(partitionno)) {
-            *partitionno = GetPartitionnoFromSequence(rel->partMap, u_sess->catalog_cxt.route->partSeq);
-        }
-        return partitionid;
-    }
-
-    /*
-     * feedback for non-existing table partition.
-     *   If the routing result indicates a range partition, give error report
-     */
-    int level = canIgnore ? WARNING : ERROR;
-    switch (u_sess->catalog_cxt.route->partArea) {
-        /*
-         * If it is a range partition, give error report
-         */
-        case PART_AREA_RANGE: {
-            ereport(
-                level,
-                (errcode(ERRCODE_NO_DATA_FOUND), errmsg("inserted partition key does not map to any table partition")));
-        } break;
-        case PART_AREA_INTERVAL: {
-            return AddNewIntervalPartition(rel, tuple, partitionno, isDDL);
-        } break;
-        case PART_AREA_LIST: {
-            ereport(
-                level,
-                (errcode(ERRCODE_NO_DATA_FOUND), errmsg("inserted partition key does not map to any table partition")));
-        } break;
-        case PART_AREA_HASH: {
-            ereport(
-                level,
-                (errcode(ERRCODE_NO_DATA_FOUND), errmsg("inserted partition key does not map to any table partition")));
-        } break;
-        /* never happen; just to be self-contained */
-        default: {
-            ereport(
-                level,
-                (errcode(ERRCODE_NO_DATA_FOUND), errmsg("Inserted partition key does not map to any table partition"),
-                 errdetail("Unrecognized PartitionArea %d", u_sess->catalog_cxt.route->partArea)));
-        } break;
-    }
-
-    return partitionid;
-}
-
-Oid heapTupleGetSubPartitionId(Relation rel, void *tuple)
-{
-    Oid partitionId = InvalidOid;
-    Oid subPartitionId = InvalidOid;
-    int partitionno = INVALID_PARTITION_NO;
-    Partition part = NULL;
-    Relation partRel = NULL;
-    /* get partititon oid for the record */
-    partitionId = heapTupleGetPartitionId(rel, tuple, &partitionno);
-    part = PartitionOpenWithPartitionno(rel, partitionId, partitionno, RowExclusiveLock);
-    partRel = partitionGetRelation(rel, part);
-    /* get subpartititon oid for the record */
-    subPartitionId = heapTupleGetPartitionId(partRel, tuple, NULL);
-
-    releaseDummyRelation(&partRel);
-    partitionClose(rel, part, RowExclusiveLock);
-
-    return subPartitionId;
 }
 
 static bool binary_upgrade_is_next_part_pg_partition_oid_valid()
@@ -7999,7 +8016,7 @@ bool* CheckPartkeyHasTimestampwithzone(Relation partTableRel, bool isForSubParti
     n_key_column = ARR_DIMS(partkey_columns)[0];
 
     /*CHECK: the ArrayType of partition key is valid*/
-    if (ARR_NDIM(partkey_columns) != 1 || n_key_column < 0 || n_key_column > RANGE_PARTKEYMAXNUM ||
+    if (ARR_NDIM(partkey_columns) != 1 || n_key_column < 0 || n_key_column > MAX_RANGE_PARTKEY_NUMS ||
         ARR_HASNULL(partkey_columns) || ARR_ELEMTYPE(partkey_columns) != INT2OID) {
         relation_close(pgPartRel, AccessShareLock);
         ereport(ERROR,
@@ -8008,7 +8025,7 @@ bool* CheckPartkeyHasTimestampwithzone(Relation partTableRel, bool isForSubParti
                        "type.",
                     RelationGetRelationName(partTableRel))));
     }
-    Assert(n_key_column <= RANGE_PARTKEYMAXNUM);
+    Assert(n_key_column <= MAX_RANGE_PARTKEY_NUMS);
     /* Get int2 array of partition key column numbers*/
     attnums = (int16*)ARR_DATA_PTR(partkey_columns);
 
@@ -8208,3 +8225,105 @@ void AddOrDropUidsAttr(Oid relOid, bool oldRelHasUids, bool newRelHasUids)
     }
 }
 
+static void heap_serialize_rel_attribute(Relation att_rel, Oid rel_oid,
+    int att_idx, StringInfoData* concat_name, bool* depend_undefined)
+{
+    ScanKeyData skey[2];
+    SysScanDesc scan;
+    HeapTuple tuple;
+    bool is_null = false;
+    int key_num = 0;
+    ScanKeyInit(&skey[key_num++], Anum_pg_attribute_attrelid, BTEqualStrategyNumber,
+        F_OIDEQ, ObjectIdGetDatum(rel_oid));
+    ScanKeyInit(&skey[key_num++], Anum_pg_attribute_attnum, BTEqualStrategyNumber,
+        F_INT4EQ, Int32GetDatum(att_idx));
+    scan = systable_beginscan(att_rel, AttributeRelidNumIndexId, true, SnapshotSelf, key_num, skey);
+    tuple = systable_getnext(scan);
+    if (!HeapTupleIsValid(tuple)) {
+        systable_endscan(scan);
+        return;
+    }
+    Datum id_dropped_datum = heap_getattr(tuple, Anum_pg_attribute_attisdropped,
+        RelationGetDescr(att_rel), &is_null);
+    if (is_null || DatumGetBool(id_dropped_datum)) {
+        systable_endscan(scan);
+        return;
+    }
+    Datum att_name_datum = heap_getattr(tuple, Anum_pg_attribute_attname,
+        RelationGetDescr(att_rel), &is_null);
+    if (!is_null) {
+        appendStringInfoString(concat_name, DatumGetName(att_name_datum)->data);
+    }
+    Datum typ_oid_datum = heap_getattr(tuple, Anum_pg_attribute_atttypid,
+        RelationGetDescr(att_rel), &is_null);
+    appendStringInfoString(concat_name, ":");
+    Oid typ_oid = DatumGetObjectId(typ_oid_datum);
+    if (!is_null && OidIsValid(typ_oid) && typ_oid != UNDEFINEDOID) {
+        (void)MakeTypeNamesStrForTypeOid(DatumGetObjectId(typ_oid_datum), depend_undefined, concat_name);
+    } else if (NULL != depend_undefined) {
+        *depend_undefined = true;
+    }
+    appendStringInfoString(concat_name, ",");
+    systable_endscan(scan);
+}
+
+char* heap_serialize_row_attr(Oid rel_oid, bool* depend_undefined)
+{
+    Relation rel;
+    StringInfoData concat_name;
+    char rel_kind = get_rel_relkind(rel_oid);
+    if (rel_kind != RELKIND_COMPOSITE_TYPE && rel_kind != RELKIND_RELATION) {
+        return NULL;
+    }
+    int att_num = get_relnatts(rel_oid);
+    rel = heap_open(AttributeRelationId, AccessShareLock);
+    initStringInfo(&concat_name);
+    for (int i = 1; i <= att_num; i++) {
+       heap_serialize_rel_attribute(rel, rel_oid, i, &concat_name, depend_undefined);
+    }
+    heap_close(rel, AccessShareLock);
+    char* ret = pstrdup(concat_name.data);
+    FreeStringInfo(&concat_name);
+    return ret;
+}
+
+#ifdef USE_SPQ
+HeapTuple heaptuple_from_pg_attribute(Relation pg_attribute_rel,
+                                      Form_pg_attribute new_attribute)
+{
+    Datum values[Natts_pg_attribute] = { 0 };
+    bool nulls[Natts_pg_attribute] = { false };
+
+    values[Anum_pg_attribute_attrelid - 1] = ObjectIdGetDatum(new_attribute->attrelid);
+    values[Anum_pg_attribute_attname - 1] = NameGetDatum(&new_attribute->attname);
+    values[Anum_pg_attribute_atttypid - 1] = ObjectIdGetDatum(new_attribute->atttypid);
+    values[Anum_pg_attribute_attstattarget - 1] = Int32GetDatum(new_attribute->attstattarget);
+    values[Anum_pg_attribute_attlen - 1] = Int16GetDatum(new_attribute->attlen);
+    values[Anum_pg_attribute_attnum - 1] = Int16GetDatum(new_attribute->attnum);
+    values[Anum_pg_attribute_attndims - 1] = Int32GetDatum(new_attribute->attndims);
+    values[Anum_pg_attribute_attcacheoff - 1] = Int32GetDatum(new_attribute->attcacheoff);
+    values[Anum_pg_attribute_atttypmod - 1] = Int32GetDatum(new_attribute->atttypmod);
+    values[Anum_pg_attribute_attbyval - 1] = BoolGetDatum(new_attribute->attbyval);
+    values[Anum_pg_attribute_attstorage - 1] = CharGetDatum(new_attribute->attstorage);
+    values[Anum_pg_attribute_attalign - 1] = CharGetDatum(new_attribute->attalign);
+    values[Anum_pg_attribute_attnotnull - 1] = BoolGetDatum(new_attribute->attnotnull);
+    values[Anum_pg_attribute_atthasdef - 1] = BoolGetDatum(new_attribute->atthasdef);
+    values[Anum_pg_attribute_attisdropped - 1] = BoolGetDatum(new_attribute->attisdropped);
+    values[Anum_pg_attribute_attislocal - 1] = BoolGetDatum(new_attribute->attislocal);
+    values[Anum_pg_attribute_attcmprmode - 1] = Int8GetDatum(new_attribute->attcmprmode);
+    values[Anum_pg_attribute_attinhcount - 1] = Int32GetDatum(new_attribute->attinhcount);
+    values[Anum_pg_attribute_attcollation - 1] = ObjectIdGetDatum(new_attribute->attcollation);
+    values[Anum_pg_attribute_attkvtype - 1] = Int8GetDatum(new_attribute->attkvtype);
+
+    /* start out with empty permissions and empty options */
+    nulls[Anum_pg_attribute_attacl - 1] = true;
+    nulls[Anum_pg_attribute_attoptions - 1] = true;
+    nulls[Anum_pg_attribute_attfdwoptions - 1] = true;
+
+    /* at default, new fileld attinitdefval of pg_attribute is null. */
+    nulls[Anum_pg_attribute_attinitdefval - 1] = true;
+    nulls[Anum_pg_attribute_attdroppedname - 1] = true;
+
+    return heap_form_tuple(RelationGetDescr(pg_attribute_rel), values, nulls);
+}
+#endif

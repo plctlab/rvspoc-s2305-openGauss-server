@@ -34,6 +34,7 @@
 #include "access/transam.h"
 #include "access/csnlog.h"
 #include "access/xlog.h"
+#include "access/multi_redo_api.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 #include "storage/buf/buf_internals.h"
 #include "ddes/dms/ss_transaction.h"
@@ -41,11 +42,15 @@
 #include "storage/sinvaladt.h"
 #include "replication/walsender_private.h"
 #include "replication/walreceiver.h"
+#include "replication/ss_disaster_cluster.h"
 #include "ddes/dms/ss_switchover.h"
 #include "ddes/dms/ss_reform_common.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 #include "storage/file/fio_device.h"
 #include "storage/buf/bufmgr.h"
+#include "storage/buf/buf_internals.h"
+#include "storage/buf/bufmgr.h"
+#include "storage/ipc.h"
 
 /*
  * Wake up startup process to replay WAL, or to notice that
@@ -57,7 +62,7 @@ void SSWakeupRecovery(void)
     /* need make sure pagewriter started first */
     bool need_recovery = true;
 
-    if (DORADO_STANDBY_CLUSTER) {
+    if (SS_DISASTER_MAIN_STANDBY_NODE) {
         g_instance.dms_cxt.SSRecoveryInfo.recovery_pause_flag = false;
         return;
     }
@@ -78,6 +83,10 @@ void SSWakeupRecovery(void)
 static int CBGetUpdateXid(void *db_handle, unsigned long long xid, unsigned int t_infomask, unsigned int t_infomask2,
     unsigned long long *uxid)
 {
+    if (!SSCanFetchLocalSnapshotTxnRelatedInfo()) {
+        return DMS_ERROR;
+    }
+
     int result = DMS_SUCCESS;
     uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
 
@@ -170,6 +179,10 @@ static CommitSeqNo TransactionWaitCommittingCSN(dms_opengauss_xid_csn_t *xid_csn
 
 static int CBGetTxnCSN(void *db_handle, dms_opengauss_xid_csn_t *csn_req, dms_opengauss_csn_result_t *csn_res)
 {
+    if (!SSCanFetchLocalSnapshotTxnRelatedInfo()) {
+        return DMS_ERROR;
+    }
+
     int ret;
 	uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
     PG_TRY();
@@ -197,10 +210,18 @@ static int CBGetTxnCSN(void *db_handle, dms_opengauss_xid_csn_t *csn_req, dms_op
     return ret;
 }
 
-static int CBGetSnapshotData(void *db_handle, dms_opengauss_txn_snapshot_t *txn_snapshot)
+static int CBGetSnapshotData(void *db_handle, dms_opengauss_txn_snapshot_t *txn_snapshot, uint8 inst_id)
 {   
-    /* SS_STANDBY_CLUSTER_NORMAL_MAIN_STANDBY always is in recovery progress, but it can acquire snapshot*/
-    if (RecoveryInProgress() && !SS_STANDBY_CLUSTER_NORMAL_MAIN_STANDBY) {
+    /* SS_MAIN_STANDBY_NODE always is in recovery progress, but it can acquire snapshot*/
+    if (RecoveryInProgress() && !(SS_NORMAL_PRIMARY && SS_DISASTER_MAIN_STANDBY_NODE)) {
+        return DMS_ERROR;
+    }
+
+    if (!SSCanFetchLocalSnapshotTxnRelatedInfo()) {
+        return DMS_ERROR;
+    }
+
+    if (!SSCanFetchLocalSnapshotTxnRelatedInfo()) {
         return DMS_ERROR;
     }
 
@@ -216,7 +237,11 @@ static int CBGetSnapshotData(void *db_handle, dms_opengauss_txn_snapshot_t *txn_
             txn_snapshot->xmax = snapshot.xmax;
             txn_snapshot->snapshotcsn = snapshot.snapshotcsn;
             txn_snapshot->localxmin = u_sess->utils_cxt.RecentGlobalXmin;
-            retCode = DMS_SUCCESS;
+            if (RecordSnapshotBeforeSend(inst_id, txn_snapshot->xmin)) {
+                retCode = DMS_SUCCESS;
+            } else {
+                retCode = DMS_ERROR;
+            }
         }
     }
     PG_CATCH();
@@ -237,6 +262,10 @@ static int CBGetTxnSwinfo(void *db_handle, dms_opengauss_txn_sw_info_t *txn_swin
         return DMS_ERROR;
     }
 
+    if (!SSCanFetchLocalSnapshotTxnRelatedInfo()) {
+        return DMS_ERROR;
+    }
+
     int retCode = DMS_SUCCESS;
     uint32 slot = txn_swinfo->server_proc_slot;
     PGXACT* pgxact = &g_instance.proc_base_all_xacts[slot];
@@ -252,6 +281,10 @@ static int CBGetTxnSwinfo(void *db_handle, dms_opengauss_txn_sw_info_t *txn_swin
 
 static int CBGetTxnStatus(void *db_handle, unsigned long long xid, unsigned char type, unsigned char *result)
 {
+    if (!SSCanFetchLocalSnapshotTxnRelatedInfo()) {
+        return DMS_ERROR;
+    }
+
     uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
     PG_TRY();
     {
@@ -263,7 +296,7 @@ static int CBGetTxnStatus(void *db_handle, unsigned long long xid, unsigned char
                 *result = (unsigned char)TransactionIdDidCommit(xid);
                 break;
             default:
-                return DMS_ERROR;
+                PG_TRY_RETURN(DMS_ERROR);
         }
     }
     PG_CATCH();
@@ -309,6 +342,28 @@ static int CBGetCurrModeAndLockBuffer(void *db_handle, int buffer, unsigned char
     return DMS_SUCCESS;
 }
 
+static inline void SSResetDemoteReqType(void)
+{
+    SpinLockAcquire(&t_thrd.walsender_cxt.WalSndCtl->mutex);
+    t_thrd.walsender_cxt.WalSndCtl->demotion = NoDemote;
+    SpinLockRelease(&t_thrd.walsender_cxt.WalSndCtl->mutex);
+}
+
+static inline void SSHandleDemoteFailure(DemoteMode demote_mode)
+{
+    ereport(WARNING,
+        (errmodule(MOD_DMS),
+            errmsg("[SS switchover] Failure in %s primary demote, pmState=%d, need reform rcy.",
+                DemoteModeDesc(demote_mode), pmState)));
+
+    /* backends exiting, simply rollback */
+    if (pmState == PM_WAIT_BACKENDS) {
+        pmState = PM_RUN;
+    }
+    g_instance.demotion = NoDemote;
+    SSResetDemoteReqType();
+}
+
 static int CBSwitchoverDemote(void *db_handle)
 {
     DemoteMode demote_mode = FastDemote;
@@ -338,18 +393,14 @@ static int CBSwitchoverDemote(void *db_handle)
     const int WAIT_DEMOTE = 6000;  /* wait up to 10 min in case of too many dirty pages to be flushed */
     for (int ntries = 0;; ntries++) {
         if (pmState == PM_RUN && g_instance.dms_cxt.SSClusterState == NODESTATE_PROMOTE_APPROVE) {
-            SpinLockAcquire(&t_thrd.walsender_cxt.WalSndCtl->mutex);
-            t_thrd.walsender_cxt.WalSndCtl->demotion = NoDemote;
-            SpinLockRelease(&t_thrd.walsender_cxt.WalSndCtl->mutex);
+            SSResetDemoteReqType();
             ereport(LOG,
                 (errmodule(MOD_DMS), errmsg("[SS switchover] Success in %s primary demote, running as standby,"
                     " waiting for reformer setting new role.", DemoteModeDesc(demote_mode))));
             return DMS_SUCCESS;
         } else {
             if (ntries >= WAIT_DEMOTE || dms_reform_failed()) {
-                ereport(WARNING,
-                    (errmodule(MOD_DMS), errmsg("[SS switchover] Failure in %s primary demote, need reform recovery.",
-                        DemoteModeDesc(demote_mode))));
+                SSHandleDemoteFailure(demote_mode);
                 return DMS_ERROR;
             }
             ntries = 0;
@@ -359,11 +410,6 @@ static int CBSwitchoverDemote(void *db_handle)
         pg_usleep(100000L); /* wait 0.1 sec, then retry */
     }
     return DMS_ERROR;
-}
-
-static int CBDbIsPrimary(void *db_handle)
-{
-    return g_instance.dms_cxt.SSReformerControl.primaryInstId == SS_MY_INST_ID ? 1 : 0;
 }
 
 static int CBSwitchoverPromote(void *db_handle, unsigned char origPrimaryId)
@@ -377,6 +423,10 @@ static int CBSwitchoverPromote(void *db_handle, unsigned char origPrimaryId)
     pg_memory_barrier();
     ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS switchover] Starting to promote standby.")));
 
+    if (ENABLE_ONDEMAND_REALTIME_BUILD) { 
+        OnDemandWaitRealtimeBuildShutDownInSwitchoverPromoting();
+    }
+
     SSNotifySwitchoverPromote();
 
     const int WAIT_PROMOTE = 1200;  /* wait 120 sec */
@@ -384,9 +434,6 @@ static int CBSwitchoverPromote(void *db_handle, unsigned char origPrimaryId)
         if (g_instance.dms_cxt.SSClusterState == NODESTATE_STANDBY_PROMOTED) {
             /* flush control file primary id in advance to save new standby's waiting time */
             SSSavePrimaryInstId(SS_MY_INST_ID);
-
-            SSReadControlFile(REFORM_CTRL_PAGE);
-            Assert(SSGetPrimaryInstId() == SS_MY_INST_ID);
             ereport(LOG, (errmodule(MOD_DMS),
                 errmsg("[SS switchover] Standby promote: success, set new primary:%d.", SS_MY_INST_ID)));
             return DMS_SUCCESS;
@@ -415,7 +462,7 @@ static void CBSwitchoverResult(void *db_handle, int result)
     } else {
         /* abort and restore state */
         g_instance.dms_cxt.SSClusterState = NODESTATE_NORMAL;
-        if (DORADO_STANDBY_CLUSTER) {
+        if (SS_DISASTER_STANDBY_CLUSTER) {
             g_instance.dms_cxt.SSReformInfo.in_reform = false;
         }
         ereport(WARNING, (errmodule(MOD_DMS), errmsg("[SS switchover] Switchover failed, errno: %d.", result)));
@@ -424,16 +471,22 @@ static void CBSwitchoverResult(void *db_handle, int result)
 
 static int SetPrimaryIdOnStandby(int primary_id)
 {
-    g_instance.dms_cxt.SSReformerControl.primaryInstId = primary_id;
-
     for (int ntries = 0;; ntries++) {
         SSReadControlFile(REFORM_CTRL_PAGE); /* need to double check */
         if (g_instance.dms_cxt.SSReformerControl.primaryInstId == primary_id) {
             ereport(LOG, (errmodule(MOD_DMS),
-                errmsg("[SS %s] Reform success, this is a standby:%d confirming new primary:%d.",
-                    SS_PERFORMING_SWITCHOVER ? "switchover" : "reform", SS_MY_INST_ID, primary_id)));
+                errmsg("[SS %s] Reform success, this is a standby:%d confirming new primary:%d, confirm ntries=%d.",
+                    SS_PERFORMING_SWITCHOVER ? "switchover" : "reform", SS_MY_INST_ID, primary_id, ntries)));
             return DMS_SUCCESS;
         } else {
+            if (dms_reform_failed()) {
+                ereport(ERROR,
+                    (errmodule(MOD_DMS), errmsg("[SS %s] Failed to confirm new primary: %d,"
+                        " control file indicates primary is %d; dms reform failed.",
+                        SS_PERFORMING_SWITCHOVER ? "switchover" : "reform", (int)primary_id,
+                        g_instance.dms_cxt.SSReformerControl.primaryInstId)));
+                return DMS_ERROR;
+            }
             if (ntries >= WAIT_REFORM_CTRL_REFRESH_TRIES) {
                 ereport(ERROR,
                     (errmodule(MOD_DMS), errmsg("[SS %s] Failed to confirm new primary: %d,"
@@ -456,25 +509,26 @@ static int CBSaveStableList(void *db_handle, unsigned long long list_stable, uns
                             unsigned long long list_in, unsigned int save_ctrl)
 {
     int primary_id = (int)reformer_id;
+    LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
     g_instance.dms_cxt.SSReformerControl.primaryInstId = primary_id;
     g_instance.dms_cxt.SSReformerControl.list_stable = list_stable;
     int ret = DMS_ERROR;
     SSLockReleaseAll();
+    SSSyncOldestXminWhenReform(reformer_id);
+
     if ((int)primary_id == SS_MY_INST_ID) {
         if (g_instance.dms_cxt.SSClusterState > NODESTATE_NORMAL) {
             Assert(g_instance.dms_cxt.SSClusterState == NODESTATE_STANDBY_PROMOTED ||
                 g_instance.dms_cxt.SSClusterState == NODESTATE_STANDBY_FAILOVER_PROMOTING);
         }
-        SSSaveReformerCtrl();
+        SSUpdateReformerCtrl();
+        LWLockRelease(ControlFileLock);
         Assert(g_instance.dms_cxt.SSReformerControl.primaryInstId == (int)primary_id);
         ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS %s] set current instance:%d as primary.",
             SS_PERFORMING_SWITCHOVER ? "switchover" : "reform", primary_id)));
-        if (g_instance.dms_cxt.SSClusterState == NODESTATE_NORMAL) {
-            /* only send to standby recoveried or new joined */
-            SSLockAcquireAll();
-        }
         ret = DMS_SUCCESS;
     } else { /* we are on standby */
+        LWLockRelease(ControlFileLock);
         ret = SetPrimaryIdOnStandby(primary_id);
     }
     return ret;
@@ -488,6 +542,11 @@ static void ReleaseResource()
     /* buffer pins are released here: */
     ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
     FlushErrorState();
+}
+
+static unsigned int CBIncAndGetSrsn(uint32 sessid)
+{
+    return ++t_thrd.dms_cxt.srsn;
 }
 
 static unsigned int CBPageHashCode(const char pageid[DMS_PAGEID_SIZE])
@@ -512,24 +571,15 @@ static unsigned long long CBGetGlobalLSN(void *db_handle)
     return GetInsertRecPtr();
 }
 
-static void DmsReleaseBuffer(int buffer, bool is_seg)
-{
-    if (is_seg) {
-        SegReleaseBuffer(buffer);
-    } else {
-        ReleaseBuffer(buffer);
-    }
-}
-
 static int tryEnterLocalPage(BufferTag *tag, dms_lock_mode_t mode, dms_buf_ctrl_t **buf_ctrl)
 {
     bool is_seg;
     int ret = DMS_SUCCESS;
     int buf_id = -1;
     uint32 hash;
-    LWLock *partition_lock = NULL;
     BufferDesc *buf_desc = NULL;
     RelFileNode relfilenode = tag->rnode;
+    bool get_lock = false;
 
 #ifdef USE_ASSERT_CHECKING
     if (IsSegmentPhysicalRelNode(relfilenode)) {
@@ -544,16 +594,13 @@ static int tryEnterLocalPage(BufferTag *tag, dms_lock_mode_t mode, dms_buf_ctrl_
 
     *buf_ctrl = NULL;
     hash = BufTableHashCode(tag);
-    partition_lock = BufMappingPartitionLock(hash);
 
     uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
     PG_TRY();
     {
         do {
-            (void)LWLockAcquire(partition_lock, LW_SHARED);
             buf_id = BufTableLookup(tag, hash);
             if (buf_id < 0) {
-                LWLockRelease(partition_lock);
                 break;
             }
 
@@ -566,11 +613,20 @@ static int tryEnterLocalPage(BufferTag *tag, dms_lock_mode_t mode, dms_buf_ctrl_
                 (void)PinBuffer(buf_desc, NULL);
                 is_seg = false;
             }
-            LWLockRelease(partition_lock);
 
-            WaitIO(buf_desc);
+            if (!BUFFERTAGS_PTR_EQUAL(&buf_desc->tag, tag)) {
+                DmsReleaseBuffer(buf_desc->buf_id + 1, is_seg);
+                break;
+            }
 
-            if (!(pg_atomic_read_u32(&buf_desc->state) & BM_VALID)) {
+            bool wait_success = SSWaitIOTimeout(buf_desc);
+            if (!wait_success) {
+                DmsReleaseBuffer(buf_desc->buf_id + 1, is_seg);
+                ret = GS_TIMEOUT;
+                break;
+            }
+
+            if (!(pg_atomic_read_u64(&buf_desc->state) & BM_VALID)) {
                 ereport(WARNING, (errmodule(MOD_DMS),
                     errmsg("[%d/%d/%d/%d %d-%d] try enter page failed, buffer is not valid, state = 0x%x",
                     tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
@@ -581,7 +637,7 @@ static int tryEnterLocalPage(BufferTag *tag, dms_lock_mode_t mode, dms_buf_ctrl_
                 break;
             }
 
-            if (pg_atomic_read_u32(&buf_desc->state) & BM_IO_ERROR) {
+            if (pg_atomic_read_u64(&buf_desc->state) & BM_IO_ERROR) {
                 ereport(WARNING, (errmodule(MOD_DMS),
                     errmsg("[%d/%d/%d/%d %d-%d] try enter page failed, buffer is io error, state = 0x%x",
                     tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
@@ -593,11 +649,21 @@ static int tryEnterLocalPage(BufferTag *tag, dms_lock_mode_t mode, dms_buf_ctrl_
             }
 
             LWLockMode content_mode = (mode == DMS_LOCK_SHARE) ? LW_SHARED : LW_EXCLUSIVE;
-            (void)LWLockAcquire(buf_desc->content_lock, content_mode);
+            get_lock = SSLWLockAcquireTimeout(buf_desc->content_lock, content_mode);
+            if (!get_lock) {
+                DmsReleaseBuffer(buf_desc->buf_id + 1, is_seg);
+                ret = GS_TIMEOUT;
+                ereport(WARNING, (errmodule(MOD_DMS), (errmsg("[SS lwlock][%u/%u/%u/%d %d-%u] request LWLock timeout, "
+                    "buf_id:%d, lwlock:%p",
+                    tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
+                    tag->forkNum, tag->blockNum, buf_id, buf_desc->content_lock))));
+                break;
+            }
             *buf_ctrl = GetDmsBufCtrl(buf_id);
             Assert(buf_id >= 0);
             if ((*buf_ctrl)->been_loaded == false) {
                 *buf_ctrl = NULL;
+                LWLockRelease(buf_desc->content_lock);
                 DmsReleaseBuffer(buf_desc->buf_id + 1, is_seg);
                 ereport(WARNING, (errmodule(MOD_DMS),
                     errmsg("[%u/%u/%u/%d %d-%u] been_loaded marked false, page swapped out and failed to load",
@@ -610,9 +676,10 @@ static int tryEnterLocalPage(BufferTag *tag, dms_lock_mode_t mode, dms_buf_ctrl_
                     errmsg("[%u/%u/%u/%d %d-%u] lock mode is null, still need to transfer page",
                     tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
                     tag->forkNum, tag->blockNum)));
+            } else if (buf_desc->extra->seg_fileno != EXTENT_INVALID) {
+                (*buf_ctrl)->seg_fileno = buf_desc->extra->seg_fileno;
+                (*buf_ctrl)->seg_blockno = buf_desc->extra->seg_blockno;
             }
-            (*buf_ctrl)->seg_fileno = buf_desc->extra->seg_fileno;
-            (*buf_ctrl)->seg_blockno = buf_desc->extra->seg_blockno;
         } while (0);
     }
     PG_CATCH();
@@ -640,7 +707,7 @@ static unsigned char CBPageDirty(dms_buf_ctrl_t *buf_ctrl)
         return 0;
     }
     BufferDesc *buf_desc = GetBufferDescriptor(buf_ctrl->buf_id);
-    bool is_dirty = (pg_atomic_read_u32(&buf_desc->state) & (BM_DIRTY | BM_JUST_DIRTIED)) > 0;
+    bool is_dirty = (pg_atomic_read_u64(&buf_desc->state) & (BM_DIRTY | BM_JUST_DIRTIED)) > 0;
     return (unsigned char)is_dirty;
 }
 
@@ -673,16 +740,13 @@ static int CBInvalidatePage(void *db_handle, char pageid[DMS_PAGEID_SIZE], unsig
     int buf_id = -1;
     BufferTag* tag = (BufferTag *)pageid;
     uint32 hash;
-    LWLock *partition_lock = NULL;
+    uint64 buf_state;
     int ret = DMS_SUCCESS;
-
+    bool get_lock;
     hash = BufTableHashCode(tag);
-    partition_lock = BufMappingPartitionLock(hash);
-    (void)LWLockAcquire(partition_lock, LW_SHARED);
     buf_id = BufTableLookup(tag, hash);
     if (buf_id < 0) {
         /* not found in shared buffer */
-        LWLockRelease(partition_lock);
         return ret;
     }
 
@@ -692,37 +756,90 @@ static int CBInvalidatePage(void *db_handle, char pageid[DMS_PAGEID_SIZE], unsig
     PG_TRY();
     {
         buf_desc = GetBufferDescriptor(buf_id);
+        if (SS_PRIMARY_MODE) {
+            buf_state = LockBufHdr(buf_desc);
+            if (BUF_STATE_GET_REFCOUNT(buf_state) != 0 || BUF_STATE_GET_USAGECOUNT(buf_state) != 0 ||
+               !BUFFERTAGS_PTR_EQUAL(&buf_desc->tag, tag)) {
+                UnlockBufHdr(buf_desc, buf_state);
+                return DMS_ERROR;
+            }
+
+            if (!(buf_state & BM_VALID) || (buf_state & BM_IO_ERROR)) {
+                ereport(LOG, (errmodule(MOD_DMS),
+                    errmsg("[%d/%d/%d/%d %d-%d] invalidate page, buffer is not valid or io error, state = 0x%x",
+                    tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
+                    tag->forkNum, tag->blockNum, buf_desc->state)));
+                UnlockBufHdr(buf_desc, buf_state);
+                buf_ctrl->lock_mode = (unsigned char)DMS_LOCK_NULL;
+                buf_ctrl->seg_fileno = EXTENT_INVALID;
+                buf_ctrl->seg_blockno = InvalidBlockNumber;
+                return DMS_SUCCESS;
+            }
+
+            /* For aio (flush disk not finished), dirty, in dirty queue, dirty need flush, can't recycle */
+            if (buf_desc->extra->aio_in_progress || (buf_state & BM_DIRTY) || (buf_state & BM_JUST_DIRTIED) ||
+                XLogRecPtrIsValid(pg_atomic_read_u64(&buf_desc->extra->rec_lsn)) ||
+                (buf_ctrl->state & BUF_DIRTY_NEED_FLUSH)) {
+                ereport(DEBUG1, (errmodule(MOD_DMS),
+                    errmsg("[%d/%d/%d/%d %d-%d] invalidate owner rejected, buffer is dirty/permanent, state = 0x%x",
+                    tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
+                    tag->forkNum, tag->blockNum, buf_desc->state)));
+                ret = DMS_ERROR;
+            } else {
+                buf_ctrl->lock_mode = (unsigned char)DMS_LOCK_NULL;
+                buf_ctrl->seg_fileno = EXTENT_INVALID;
+                buf_ctrl->seg_blockno = InvalidBlockNumber;
+            }
+
+            UnlockBufHdr(buf_desc, buf_state);
+            return ret;
+        }
+
         if (IsSegmentBufferID(buf_id)) {
             (void)SegPinBuffer(buf_desc);
         } else {
             ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
             (void)PinBuffer(buf_desc, NULL);
         }
-        LWLockRelease(partition_lock);
 
-        WaitIO(buf_desc);
-        if ((!(pg_atomic_read_u32(&buf_desc->state) & BM_VALID)) ||
-            (pg_atomic_read_u32(&buf_desc->state) & BM_IO_ERROR)) {
+        if (!BUFFERTAGS_PTR_EQUAL(&buf_desc->tag, tag)) {
+            DmsReleaseBuffer(buf_id + 1, IsSegmentBufferID(buf_id));
+            return ret;
+        }
+
+        bool wait_success = SSWaitIOTimeout(buf_desc);
+        if (!wait_success) {
+            DmsReleaseBuffer(buf_id + 1, IsSegmentBufferID(buf_id));
+            ret = GS_TIMEOUT;
+            return ret;
+        }
+
+        if ((!(pg_atomic_read_u64(&buf_desc->state) & BM_VALID)) ||
+            (pg_atomic_read_u64(&buf_desc->state) & BM_IO_ERROR)) {
             ereport(LOG, (errmodule(MOD_DMS),
                 errmsg("[%d/%d/%d/%d %d-%d] invalidate page, buffer is not valid or io error, state = 0x%x",
                 tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
                 tag->forkNum, tag->blockNum, buf_desc->state)));
+            DmsReleaseBuffer(buf_id + 1, IsSegmentBufferID(buf_id));
+            buf_ctrl->lock_mode = (unsigned char)DMS_LOCK_NULL;
+            buf_ctrl->seg_fileno = EXTENT_INVALID;
+            buf_ctrl->seg_blockno = InvalidBlockNumber;
             ret = DMS_SUCCESS;
-            break;
+            return ret;
         }
 
-        bool can_invld_owner = (buf_desc->state & (BM_DIRTY | BM_JUST_DIRTIED | BM_PERMANENT)) > 0 ? false : true;
-        if (!invld_owner || (invld_owner && can_invld_owner)) {
-            (void)LWLockAcquire(buf_desc->content_lock, LW_EXCLUSIVE);
-            buf_ctrl = GetDmsBufCtrl(buf_id);
-            buf_ctrl->lock_mode = (unsigned char)DMS_LOCK_NULL;
-            LWLockRelease(buf_desc->content_lock);
-        } else { /* invalidate owner which buffer is dirty/permanent */
-            ereport(DEBUG1, (errmodule(MOD_DMS),
-                errmsg("[%d/%d/%d/%d %d-%d] invalidate owner rejected, buffer is dirty/permanent, state = 0x%x",
+        get_lock = SSLWLockAcquireTimeout(buf_desc->content_lock, LW_EXCLUSIVE);
+        if (!get_lock) {
+            ereport(WARNING, (errmodule(MOD_DMS), (errmsg("[SS lwlock][%u/%u/%u/%d %d-%u] request LWLock timeout, "
+                "buf_id:%d, lwlock:%p",
                 tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
-                tag->forkNum, tag->blockNum, buf_desc->state)));
-            ret = DMS_ERROR;
+                tag->forkNum, tag->blockNum, buf_id, buf_desc->content_lock))));
+            ret = GS_TIMEOUT;
+        } else {
+            buf_ctrl->lock_mode = (unsigned char)DMS_LOCK_NULL;
+            buf_ctrl->seg_fileno = EXTENT_INVALID;
+            buf_ctrl->seg_blockno = InvalidBlockNumber;
+            LWLockRelease(buf_desc->content_lock);
         }
 
         if (IsSegmentBufferID(buf_id)) {
@@ -762,19 +879,21 @@ static void CBVerifyPage(dms_buf_ctrl_t *buf_ctrl, char *new_page)
 
     BufferDesc *buf_desc = GetBufferDescriptor(buf_ctrl->buf_id);
 
-    if (buf_desc->extra->seg_fileno == EXTENT_INVALID) {
-        buf_desc->extra->seg_fileno = buf_ctrl->seg_fileno;
-        buf_desc->extra->seg_blockno = buf_ctrl->seg_blockno;
-    } else if (buf_desc->extra->seg_fileno != buf_ctrl->seg_fileno ||
-               buf_desc->extra->seg_blockno != buf_ctrl->seg_blockno) {
-        ereport(PANIC, (errmsg("[%u/%u/%u/%d/%d %d-%u] location mismatch, seg_fileno:%d, seg_blockno:%u",
-                               buf_desc->tag.rnode.spcNode, buf_desc->tag.rnode.dbNode, buf_desc->tag.rnode.relNode,
-                               buf_desc->tag.rnode.bucketNode, buf_desc->tag.rnode.opt, buf_desc->tag.forkNum,
-                               buf_desc->tag.blockNum, buf_desc->extra->seg_fileno, buf_desc->extra->seg_blockno)));
+    if (buf_ctrl->seg_fileno != EXTENT_INVALID) {
+        if (buf_desc->extra->seg_fileno == EXTENT_INVALID) {
+            buf_desc->extra->seg_fileno = buf_ctrl->seg_fileno;
+            buf_desc->extra->seg_blockno = buf_ctrl->seg_blockno;
+        } else if (buf_desc->extra->seg_fileno != buf_ctrl->seg_fileno ||
+                buf_desc->extra->seg_blockno != buf_ctrl->seg_blockno) {
+            ereport(PANIC, (errmsg("[%u/%u/%u/%d/%d %d-%u] location mismatch, seg_fileno:%d, seg_blockno:%u",
+                                buf_desc->tag.rnode.spcNode, buf_desc->tag.rnode.dbNode, buf_desc->tag.rnode.relNode,
+                                buf_desc->tag.rnode.bucketNode, buf_desc->tag.rnode.opt, buf_desc->tag.forkNum,
+                                buf_desc->tag.blockNum, buf_desc->extra->seg_fileno, buf_desc->extra->seg_blockno)));
+        }
     }
 
     /* page content is not valid */
-    if ((pg_atomic_read_u32(&buf_desc->state) & BM_VALID) == 0) {
+    if ((pg_atomic_read_u64(&buf_desc->state) & BM_VALID) == 0) {
         return;
     }
 
@@ -859,9 +978,50 @@ static int CBSetBufLoadStatus(dms_buf_ctrl_t *buf_ctrl, dms_buf_load_status_t dm
 
 static void *CBGetHandle(unsigned int *db_handle_index, dms_session_type_e session_type)
 {
-    void *db_handle = g_instance.proc_base->allProcs[g_instance.dms_cxt.dmsProcSid];
-    *db_handle_index = pg_atomic_fetch_add_u32(&g_instance.dms_cxt.dmsProcSid, 1);
-    return db_handle;
+    ss_fake_seesion_context_t *fs_cxt = &g_instance.dms_cxt.SSFakeSessionCxt;
+    SpinLockAcquire(&fs_cxt->lock);
+    if (!fs_cxt->fake_sessions[fs_cxt->quickFetchIndex]) {
+        int index = fs_cxt->quickFetchIndex;
+        fs_cxt->fake_sessions[index] = true;
+        fs_cxt->quickFetchIndex++;
+        if (fs_cxt->quickFetchIndex >= fs_cxt->fake_session_cnt) {
+            fs_cxt->quickFetchIndex = 0;
+        }
+        SpinLockRelease(&fs_cxt->lock);
+        *db_handle_index = index + fs_cxt->session_start;
+        return &g_instance.proc_base->allProcs[index + fs_cxt->session_start];
+    }
+
+    int start_index = fs_cxt->quickFetchIndex;
+    int cur_index = 0;
+    bool found = false;
+    for (int i = 0; i < (int)fs_cxt->fake_session_cnt; i++) {
+        cur_index = (start_index + i) % fs_cxt->fake_session_cnt;
+        if (!fs_cxt->fake_sessions[cur_index]) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        SpinLockRelease(&fs_cxt->lock);
+        ereport(PANIC, (errmsg("[SS] can not find a session. please check")));
+    }
+
+    fs_cxt->quickFetchIndex = cur_index + 1;
+    if (fs_cxt->quickFetchIndex >= fs_cxt->fake_session_cnt) {
+       fs_cxt->quickFetchIndex = 0;
+    }
+    SpinLockRelease(&fs_cxt->lock);
+    *db_handle_index = cur_index;
+    return &g_instance.proc_base->allProcs[cur_index + fs_cxt->session_start];
+}
+
+static void CBReleaseHandle(void *db_handle)
+{
+    ss_fake_seesion_context_t *fs_cxt = &g_instance.dms_cxt.SSFakeSessionCxt;
+    int index = ((char*)db_handle - (char*)&g_instance.proc_base->allProcs[fs_cxt->session_start]) / sizeof(PGPROC*);
+    fs_cxt->fake_sessions[index] = false;
 }
 
 static char *CBMemAlloc(void *context, unsigned int size)
@@ -1010,9 +1170,12 @@ static int32 CBProcessReleaseAllLock(uint32 len)
     return res;
 }
 
-static int32 CBProcessBroadcast(void *db_handle, char *data, unsigned int len, char *output_msg,
-    uint32 *output_msg_len)
+static int32 CBProcessBroadcast(void *db_handle, dms_broadcast_context_t *broad_ctx)
 {
+    char *data = broad_ctx->data;
+    unsigned int len = broad_ctx->len;
+    char *output_msg = broad_ctx->output_msg;
+    unsigned int *output_msg_len = broad_ctx->output_msg_len;
     int32 ret = DMS_SUCCESS;
     SSBroadcastOp bcast_op = *(SSBroadcastOp *)data;
 
@@ -1022,9 +1185,6 @@ static int32 CBProcessBroadcast(void *db_handle, char *data, unsigned int len, c
     PG_TRY();
     {
         switch (bcast_op) {
-            case BCAST_GET_XMIN:
-                ret = SSGetOldestXmin(data, len, output_msg, output_msg_len);
-                break;
             case BCAST_SI:
                 ret = SSProcessSharedInvalMsg(data, len);
                 break;
@@ -1055,6 +1215,12 @@ static int32 CBProcessBroadcast(void *db_handle, char *data, unsigned int len, c
             case BCAST_CHECK_DB_BACKENDS:
                 ret = SSCheckDbBackends(data, len, output_msg, output_msg_len);
                 break;
+            case BCAST_SEND_SNAPSHOT:
+                ret = SSUpdateLatestSnapshotOfStandby(data, len);
+                break;
+            case BCAST_RELOAD_REFORM_CTRL_PAGE:
+                ret = SSReloadReformCtrlPage(len);
+                break;
             default:
                 ereport(WARNING, (errmodule(MOD_DMS), errmsg("invalid broadcast operate type")));
                 ret = DMS_ERROR;
@@ -1073,15 +1239,14 @@ static int32 CBProcessBroadcast(void *db_handle, char *data, unsigned int len, c
     return ret;
 }
 
-static int32 CBProcessBroadcastAck(void *db_handle, char *data, unsigned int len)
+static int32 CBProcessBroadcastAck(void *db_handle, dms_broadcast_context_t *broad_ctx)
 {
+    char *data = broad_ctx->data;
+    unsigned int len = broad_ctx->len;
     int32 ret = DMS_SUCCESS;
     SSBroadcastOpAck bcast_op = *(SSBroadcastOpAck *)data;
 
     switch (bcast_op) {
-        case BCAST_GET_XMIN_ACK:
-            ret = SSGetOldestXminAck((SSBroadcastXminAck *)data);
-            break;
         case BCAST_CHECK_DB_BACKENDS_ACK:
             ret = SSCheckDbBackendsAck(data, len);
             break;
@@ -1102,13 +1267,13 @@ static void CBSetDmsStatus(void *db_handle, int dms_status)
     g_instance.dms_cxt.dms_status = (dms_status_t)dms_status;
 }
 
-static bool SSCheckBufferIfCanGoRebuild(BufferDesc* buf_desc, uint32 buf_state)
+static bool SSCheckBufferIfCanGoRebuild(BufferDesc* buf_desc, uint64 buf_state)
 {
     bool ret = false;
     dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(buf_desc->buf_id);
     if ((buf_state & BM_VALID) && (buf_ctrl->lock_mode != (unsigned char)DMS_LOCK_NULL)) {
         ret = true;
-    } else if ((buf_state & BM_TAG_VALID) && (buf_ctrl->lock_mode != (unsigned char)DMS_LOCK_NULL)) {
+    } else if ((buf_state & BM_TAG_VALID) && (buf_ctrl->lock_mode != (unsigned char)DMS_LOCK_NULL) && !(buf_ctrl->state | BUF_IS_EXTEND)) {
         if (LWLockConditionalAcquire(buf_desc->io_in_progress_lock, LW_SHARED)) {
             ret = true;
         } else {
@@ -1120,6 +1285,9 @@ static bool SSCheckBufferIfCanGoRebuild(BufferDesc* buf_desc, uint32 buf_state)
              * page. The stucked process will request the page again when it add content lock and the reformer will
              * become owner when it request the page.
              */
+            ereport(WARNING, (errmsg("[%u/%u/%u/%d/0 %d-%u] Set lock mode to NULL, desc state:%lu, ctrl state:%u, lock mode:%d.",
+                buf_desc->tag.rnode.spcNode, buf_desc->tag.rnode.dbNode, buf_desc->tag.rnode.relNode,
+                buf_desc->tag.rnode.bucketNode, buf_desc->tag.forkNum, buf_desc->tag.blockNum, buf_state, buf_ctrl->state, buf_ctrl->lock_mode)));
             buf_ctrl->lock_mode = DMS_LOCK_NULL;
         }
     }
@@ -1159,19 +1327,23 @@ static int32 SSRebuildBuf(BufferDesc *buf_desc, unsigned char thread_index)
 
 static int32 CBDrcBufRebuildInternal(int begin, int len, unsigned char thread_index)
 {
-    uint32 buf_state;
+    uint64 buf_state;
     Assert(begin >= 0 && len > 0 && (begin + len) <= TOTAL_BUFFER_NUM);
     for (int i = begin; i < begin + len; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
+        bool need_rebuild = true;
         if (LWLockConditionalAcquire(buf_desc->content_lock, LW_EXCLUSIVE)) {
             buf_state = LockBufHdr(buf_desc);
-            if (buf_state & BM_VALID) {
+            if ((buf_state & BM_VALID) && !(buf_state & BM_DIRTY)) {
                 dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(buf_desc->buf_id);
                 buf_ctrl->lock_mode = DMS_LOCK_NULL;
+                need_rebuild = false;
             }
             UnlockBufHdr(buf_desc, buf_state);
             LWLockRelease(buf_desc->content_lock);
-        } else {
+        } 
+        
+        if (need_rebuild) {
             buf_state = LockBufHdr(buf_desc);
             if (SSCheckBufferIfCanGoRebuild(buf_desc, buf_state)) {
                 int ret = SSRebuildBuf(buf_desc, thread_index);
@@ -1229,7 +1401,7 @@ static int32 CBDrcBufValidate(void *db_handle)
     SSReadControlFile(src_id, true);
     int buf_cnt = 0;
 
-    uint32 buf_state;
+    uint64 buf_state;
     ereport(LOG, (errmodule(MOD_DMS),
         errmsg("[SS reform]CBDrcBufValidate starts before reform done.")));
     for (int i = 0; i < TOTAL_BUFFER_NUM; i++) {
@@ -1248,13 +1420,13 @@ static int32 CBDrcBufValidate(void *db_handle)
 }
 
 // used for find bufferdesc in dms
-static void SSGetBufferDesc(char *pageid, bool *is_valid, BufferDesc** ret_buf_desc)
+static bool SSGetBufferDesc(char *pageid, bool *is_valid, BufferDesc** ret_buf_desc)
 {
     int buf_id;
     uint32 hash;
-    LWLock *partition_lock = NULL;
     BufferTag *tag = (BufferTag *)pageid;
     BufferDesc *buf_desc;
+    bool ret = true;
 
     RelFileNode relfilenode = tag->rnode;
 
@@ -1270,12 +1442,10 @@ static void SSGetBufferDesc(char *pageid, bool *is_valid, BufferDesc** ret_buf_d
 #endif
 
     hash = BufTableHashCode(tag);
-    partition_lock = BufMappingPartitionLock(hash);
 
     uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
     PG_TRY();
     {
-        (void)LWLockAcquire(partition_lock, LW_SHARED);
         buf_id = BufTableLookup(tag, hash);
         if (buf_id >= 0) {
             buf_desc = GetBufferDescriptor(buf_id);
@@ -1285,14 +1455,24 @@ static void SSGetBufferDesc(char *pageid, bool *is_valid, BufferDesc** ret_buf_d
                 ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
                 (void)PinBuffer(buf_desc, NULL);
             }
-            LWLockRelease(partition_lock);
 
-            WaitIO(buf_desc);
-            Assert(!(pg_atomic_read_u32(&buf_desc->state) & BM_IO_ERROR));
-            *is_valid = (pg_atomic_read_u32(&buf_desc->state) & BM_VALID) != 0;
+            if (!BUFFERTAGS_PTR_EQUAL(&buf_desc->tag, tag)) {
+                SSUnPinBuffer(buf_desc);
+                *ret_buf_desc = NULL;
+                break;
+            }
+
+            bool wait_success = SSWaitIOTimeout(buf_desc);
+            if (!wait_success) {
+                SSUnPinBuffer(buf_desc);
+                ret = false;
+                break;
+            }
+
+            Assert(!(pg_atomic_read_u64(&buf_desc->state) & BM_IO_ERROR));
+            *is_valid = (pg_atomic_read_u64(&buf_desc->state) & BM_VALID) != 0;
             *ret_buf_desc = buf_desc;
         } else {
-            LWLockRelease(partition_lock);
             *ret_buf_desc = NULL;
         }
     }
@@ -1302,6 +1482,7 @@ static void SSGetBufferDesc(char *pageid, bool *is_valid, BufferDesc** ret_buf_d
         ReleaseResource();
     }
     PG_END_TRY();
+    return ret;
 }
 
 void SSUnPinBuffer(BufferDesc* buf_desc)
@@ -1320,9 +1501,16 @@ static int CBConfirmOwner(void *db_handle, char *pageid, unsigned char *lock_mod
     bool valid;
     dms_buf_ctrl_t *buf_ctrl = NULL;
 
-    SSGetBufferDesc(pageid, &valid, &buf_desc);
+    bool ret = SSGetBufferDesc(pageid, &valid, &buf_desc);
+    if (!ret) {
+        ereport(WARNING, (errmodule(MOD_DMS),
+            errmsg("[SS] CBConfirmOwner, require LWLock timeout")));
+        return GS_TIMEOUT;
+    }
+
     if (buf_desc == NULL) {
-        return DMS_ERROR;
+        *lock_mode = (uint8)DMS_LOCK_NULL;
+        return GS_SUCCESS;
     }
 
     if (!valid) {
@@ -1352,14 +1540,20 @@ static int CBConfirmConverting(void *db_handle, char *pageid, unsigned char smon
     BufferDesc *buf_desc = NULL;
     bool valid;
     dms_buf_ctrl_t *buf_ctrl = NULL;
-    bool timeout = false;
 
     *lsn = 0;
     *edp_map = 0;
     
-    SSGetBufferDesc(pageid, &valid, &buf_desc);
+    bool ret = SSGetBufferDesc(pageid, &valid, &buf_desc);
+    if (!ret) {
+        ereport(WARNING, (errmodule(MOD_DMS),
+            errmsg("[SS] CBConfirmConverting, require LWLock timeout")));
+        return GS_TIMEOUT;
+    }
+
     if (buf_desc == NULL) {
-        return DMS_ERROR;
+        *lock_mode = (uint8)DMS_LOCK_NULL;
+        return GS_SUCCESS;
     }
 
     if (!valid) {
@@ -1368,38 +1562,23 @@ static int CBConfirmConverting(void *db_handle, char *pageid, unsigned char smon
         return GS_SUCCESS;
     }
 
-    struct timeval begin_tv;
-    struct timeval now_tv;
-    (void)gettimeofday(&begin_tv, NULL);
-    long begin = GET_US(begin_tv);
-    long now;
-
-    while (true) {
-        bool is_locked = LWLockConditionalAcquire(buf_desc->io_in_progress_lock, LW_EXCLUSIVE);
-        if (is_locked) {
-            buf_ctrl = GetDmsBufCtrl(buf_desc->buf_id);
-            *lock_mode = buf_ctrl->lock_mode;
-            LWLockRelease(buf_desc->io_in_progress_lock);
-            break;
-        }
-
-        (void)gettimeofday(&now_tv, NULL);
-        now = GET_US(now_tv);
-        if (now - begin > REFORM_CONFIRM_TIMEOUT) {
-            timeout = true;
-            break;
-        }
-        pg_usleep(REFORM_CONFIRM_INTERVAL); /* sleep 5ms */
-    }
-
-    if (!timeout) {
+    bool get_lock = SSLWLockAcquireTimeout(buf_desc->io_in_progress_lock, LW_EXCLUSIVE);
+    if (get_lock) {
+        buf_ctrl = GetDmsBufCtrl(buf_desc->buf_id);
+        *lock_mode = buf_ctrl->lock_mode;
+        LWLockRelease(buf_desc->io_in_progress_lock);
         SSUnPinBuffer(buf_desc);
         return GS_SUCCESS;
     }
 
     if (smon_chk) {
         SSUnPinBuffer(buf_desc);
-        return GS_TIMEDOUT;
+        BufferTag *tag = &buf_desc->tag;
+        ereport(WARNING, (errmodule(MOD_DMS), (errmsg("[SS lwlock][%u/%u/%u/%d %d-%u] request LWLock timeout, "
+            "buf_id:%d, lwlock:%p",
+            tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
+            tag->forkNum, tag->blockNum, buf_desc->buf_id, buf_desc->io_in_progress_lock))));
+        return GS_TIMEOUT;
     }
 
     // without lock
@@ -1471,17 +1650,11 @@ static int CBFlushCopy(void *db_handle, char *pageid)
 
     BufferTag* tag = (BufferTag*)pageid;
     Buffer buffer;
-    SegSpace *spc = NULL;
 
     uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
     PG_TRY();
     {
-        if (IsSegmentPhysicalRelNode(tag->rnode)) {
-            spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false, false);
-            buffer = ReadBufferFast(spc, tag->rnode, tag->forkNum, tag->blockNum, RBM_NORMAL);
-        } else {
-            buffer = ReadBufferWithoutRelcache(tag->rnode, tag->forkNum, tag->blockNum, RBM_NORMAL, NULL, NULL);
-        }
+        buffer = SSReadBuffer(tag, RBM_NORMAL);
     }
     PG_CATCH();
     {
@@ -1576,18 +1749,7 @@ static void CBReformSetDmsRole(void *db_handle, unsigned int reformer_id)
     dms_role_t new_dms_role = reformer_id == (unsigned int)SS_MY_INST_ID ? DMS_ROLE_REFORMER : DMS_ROLE_PARTNER;
     if (new_dms_role == DMS_ROLE_REFORMER) {
         ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS switchover]begin to set currrent DSS as primary")));
-        /* standby of standby cluster need to set mode to STANDBY_MODE in dual cluster*/
-        if (DORADO_STANDBY_CLUSTER) {
-            t_thrd.postmaster_cxt.HaShmData->current_mode = STANDBY_MODE;
-        }
-        while (dss_set_server_status_wrapper() != GS_SUCCESS) {
-            pg_usleep(REFORM_WAIT_LONG);
-            ereport(WARNING, (errmodule(MOD_DMS),
-                errmsg("Failed to set DSS as primary, vgname: \"%s\", socketpath: \"%s\"",
-                    g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name,
-                    g_instance.attr.attr_storage.dss_attr.ss_dss_conn_path),
-                    errhint("Check vgname and socketpath and restart later.")));
-        }
+        SSGrantDSSWritePermission();
         g_instance.dms_cxt.SSClusterState = NODESTATE_STANDBY_PROMOTING;
     }
 
@@ -1595,6 +1757,10 @@ static void CBReformSetDmsRole(void *db_handle, unsigned int reformer_id)
     ereport(LOG, (errmodule(MOD_DMS),
         errmsg("[SS switchover]role and lock switched, updated inst:%d with role:%d success",
             SS_MY_INST_ID, reform_info->dms_role)));
+    /* we need change ha cur mode for switchover in ss double cluster here */
+    if (SS_DISASTER_CLUSTER) {
+        SSDisasterUpdateHAmode();
+    }
 }
 
 static void ReformCleanBackends()
@@ -1605,6 +1771,17 @@ static void ReformCleanBackends()
     }
 
     while (true) {
+        int ticks = 0;
+        if (g_instance.pid_cxt.StartupPID != 0) {
+            if (ticks++ > REFORM_START_CLEAN_TICKS) {
+                ereport(WARNING, (errmodule(MOD_DMS),
+                    errmsg("[SS reform] StartupXLOG debris sigterm timeout 10s, exit now")));
+                _exit(0);
+            }
+            pg_usleep(REFORM_WAIT_LONG);
+            continue;
+        }
+        
         if (dms_reform_failed()) {
             ereport(WARNING, (errmodule(MOD_DMS), errmsg("[SS reform]reform failed during caneling backends")));
             return;
@@ -1617,14 +1794,18 @@ static void ReformCleanBackends()
     }
 }
 
-static void AliveFailoverCleanBackends()
+static void FailoverCleanBackends()
 {
     if (g_instance.dms_cxt.SSRecoveryInfo.startup_reform) {
         return;
     }
 
+    if (ENABLE_ONDEMAND_REALTIME_BUILD && SS_STANDBY_MODE) {
+        OnDemandWaitRealtimeBuildShutDownInPartnerFailover();
+    }
+
     /**
-     * for alive failover: wait for backend threads to exit, at most 30s
+     * for failover: wait for backend threads to exit, at most 30s
      * why wait code write this
      *      step 1, sned signal to tell thread to exit
      *      step 2, PM detected backend exit
@@ -1635,7 +1816,8 @@ static void AliveFailoverCleanBackends()
     long max_wait_time = 30000000L;
     long wait_time = 0;
     while (true) {
-        if (g_instance.dms_cxt.SSRecoveryInfo.no_backend_left) {
+        if (g_instance.dms_cxt.SSRecoveryInfo.no_backend_left && g_instance.pid_cxt.StartupPID == 0 &&
+            !CheckpointInProgress()) {
             ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS failover] backends exit successfully")));
             break;
         }
@@ -1655,7 +1837,7 @@ static void AliveFailoverCleanBackends()
 }
 
 static int reform_type_str_len = 30;
-static void ReformTypeToString(SSReformType reform_type, char* ret_str)
+static void ReformTypeToString(dms_reform_type_t reform_type, char* ret_str)
 {
     switch (reform_type)
     {
@@ -1678,19 +1860,39 @@ static void ReformTypeToString(SSReformType reform_type, char* ret_str)
     return;
 }
 
-static void CBReformStartNotify(void *db_handle, dms_role_t role, unsigned char reform_type)
+static void SSXminInfoPrepare()
+{
+    ss_xmin_info_t *xmin_info = &g_instance.dms_cxt.SSXminInfo;
+    if (g_instance.dms_cxt.SSReformInfo.dms_role == DMS_ROLE_REFORMER) {
+        SpinLockAcquire(&xmin_info->global_oldest_xmin_lock);
+        xmin_info->prev_global_oldest_xmin = xmin_info->global_oldest_xmin;
+        xmin_info->global_oldest_xmin_active = false;
+        xmin_info->global_oldest_xmin = MaxTransactionId;
+        SpinLockRelease(&xmin_info->global_oldest_xmin_lock);
+        for (int i = 0; i < DMS_MAX_INSTANCES; i++) {
+            ss_node_xmin_item_t *item = &xmin_info->node_table[i];
+            SpinLockAcquire(&item->item_lock);
+            item->active = false;
+            item->notify_oldest_xmin = MaxTransactionId;
+            SpinLockRelease(&item->item_lock);
+        }
+
+        if (!SSPerformingStandbyScenario()) {
+            SpinLockAcquire(&xmin_info->snapshot_available_lock);
+            xmin_info->snapshot_available = false;
+            SpinLockRelease(&xmin_info->snapshot_available_lock);
+        }
+    }
+    xmin_info->bitmap_active_nodes = 0;
+}
+
+static void FailoverStartNotify(dms_reform_start_context_t *rs_cxt)
 {
     ss_reform_info_t *reform_info = &g_instance.dms_cxt.SSReformInfo;
-    reform_info->reform_type = (SSReformType)reform_type;
-    g_instance.dms_cxt.SSClusterState = NODESTATE_NORMAL;
-    g_instance.dms_cxt.SSRecoveryInfo.reform_ready = false;
-    g_instance.dms_cxt.SSRecoveryInfo.in_flushcopy = false;
-    g_instance.dms_cxt.SSRecoveryInfo.startup_need_exit_normally = false;
-    g_instance.dms_cxt.resetSyscache = true;
     if (reform_info->reform_type == DMS_REFORM_TYPE_FOR_FAILOVER_OPENGAUSS) {
         g_instance.dms_cxt.SSRecoveryInfo.in_failover = true;
         g_instance.dms_cxt.SSRecoveryInfo.recovery_pause_flag = true;
-        if (role == DMS_ROLE_REFORMER) {
+        if (rs_cxt->role == DMS_ROLE_REFORMER) {
             g_instance.dms_cxt.dw_init = false;
             // variable set order: SharedRecoveryInProgress -> failover_ckpt_status -> dms_role
             volatile XLogCtlData *xlogctl = t_thrd.shemem_ptr_cxt.XLogCtl;
@@ -1707,37 +1909,54 @@ static void CBReformStartNotify(void *db_handle, dms_role_t role, unsigned char 
             ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS failover] failover trigger.")));
         }
     }
-    reform_info->dms_role = role;
+}
+
+static void CBReformStartNotify(void *db_handle, dms_reform_start_context_t *rs_cxt)
+{
+    ereport(LOG, (errmsg("[SS Reform] starts, pmState=%d, SSClusterState=%d, demotion=%d-%d, rec=%d",
+        pmState, g_instance.dms_cxt.SSClusterState, g_instance.demotion,
+        t_thrd.walsender_cxt.WalSndCtl->demotion, t_thrd.xlog_cxt.InRecovery)));
+
+    ss_reform_info_t *reform_info = &g_instance.dms_cxt.SSReformInfo;
+    reform_info->is_hashmap_constructed = false;
+    reform_info->reform_type = rs_cxt->reform_type;
+    g_instance.dms_cxt.SSClusterState = NODESTATE_NORMAL;
+    g_instance.dms_cxt.SSRecoveryInfo.reform_ready = false;
+    g_instance.dms_cxt.SSRecoveryInfo.in_flushcopy = false;
+    g_instance.dms_cxt.SSRecoveryInfo.startup_need_exit_normally = false;
+    g_instance.dms_cxt.resetSyscache = true;
+    g_instance.dms_cxt.SSRecoveryInfo.in_failover = false;
+    FailoverStartNotify(rs_cxt);
+
+    reform_info->reform_start_time = GetCurrentTimestamp();
+    reform_info->bitmap_nodes = rs_cxt->bitmap_participated;
+    reform_info->bitmap_reconnect = rs_cxt->bitmap_reconnect;
+    reform_info->dms_role = rs_cxt->role;
+    SSXminInfoPrepare();
     reform_info->in_reform = true;
 
     char reform_type_str[reform_type_str_len] = {0};
     ReformTypeToString(reform_info->reform_type, reform_type_str);
     ereport(LOG, (errmodule(MOD_DMS),
-        errmsg("[SS reform] dms reform start, role:%d, reform type:%s", role, reform_type_str)));
+        errmsg("[SS reform] dms reform start, role:%d, reform type:SS %s, standby scenario:%d",
+            reform_info->dms_role, reform_type_str, SSPerformingStandbyScenario())));
     if (reform_info->dms_role == DMS_ROLE_REFORMER) {
-        while (dss_set_server_status_wrapper() != GS_SUCCESS) {
-            pg_usleep(REFORM_WAIT_LONG);
-            ereport(WARNING, (errmodule(MOD_DMS),
-                errmsg("Failed to set DSS as primary, vgname: \"%s\", socketpath: \"%s\"",
-                    g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name,
-                    g_instance.attr.attr_storage.dss_attr.ss_dss_conn_path),
-                    errhint("Check vgname and socketpath and restart later.")));
-        }
+        SSGrantDSSWritePermission();
     }
 
     int old_primary = SSGetPrimaryInstId();
     SSReadControlFile(old_primary, true);
+    g_instance.dms_cxt.SSReformInfo.old_bitmap = g_instance.dms_cxt.SSReformerControl.list_stable;
+    ereport(LOG, (errmsg("[SS reform] old cluster node bitmap: %lld", g_instance.dms_cxt.SSReformInfo.old_bitmap)));
 
-    if (SS_STANDBY_FAILOVER) {
-        AliveFailoverCleanBackends();
-    } else {
+    if (g_instance.dms_cxt.SSRecoveryInfo.in_failover) {
+        FailoverCleanBackends();
+    } else if (!SSPerformingStandbyScenario() && !SSPrimaryRestartScenario()) {
         ReformCleanBackends();
     }
 
-    /* After reform done, standby of standby cluster need to set mode to STANDBY_MODE in dual cluster. */
-    if (SS_REFORM_REFORMER && (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY) &&
-       (g_instance.attr.attr_storage.xlog_file_path != 0)) {
-        t_thrd.postmaster_cxt.HaShmData->current_mode = STANDBY_MODE;
+    if (SS_DISASTER_CLUSTER && reform_info->reform_type != DMS_REFORM_TYPE_FOR_SWITCHOVER_OPENGAUSS) {
+        SSDisasterUpdateHAmode();
     }
 }
 
@@ -1750,25 +1969,27 @@ static int CBReformDoneNotify(void *db_handle)
                 g_instance.attr.attr_storage.dms_attr.instance_id)));
         }
     }
-    
-    /* After reform done, primary of master cluster need to set mode to PRIMARY_MODE in dual cluster. */
-    if (SS_REFORM_REFORMER && (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_PRIMARY) &&
-       (g_instance.attr.attr_storage.xlog_file_path != 0)) {
-        t_thrd.postmaster_cxt.HaShmData->current_mode = PRIMARY_MODE;    
+
+    if (SS_DISASTER_CLUSTER) {
+        SSDisasterUpdateHAmode();
     }
    
     /* SSClusterState and in_reform must be set atomically */
     g_instance.dms_cxt.SSRecoveryInfo.startup_reform = false;
     g_instance.dms_cxt.SSRecoveryInfo.restart_failover_flag = false;
     g_instance.dms_cxt.SSRecoveryInfo.failover_ckpt_status = NOT_ACTIVE;
-    SSReadControlFile(REFORM_CTRL_PAGE);
     Assert(g_instance.dms_cxt.SSRecoveryInfo.in_flushcopy == false);
+    g_instance.dms_cxt.SSReformInfo.new_bitmap = g_instance.dms_cxt.SSReformerControl.list_stable;
+    ereport(LOG, (errmsg("[SS reform] new cluster node bitmap: %lld", g_instance.dms_cxt.SSReformInfo.new_bitmap)));
+    g_instance.dms_cxt.SSReformInfo.reform_end_time = GetCurrentTimestamp();
+    g_instance.dms_cxt.SSReformInfo.reform_success = true;
     ereport(LOG,
             (errmodule(MOD_DMS),
                 errmsg("[SS reform/SS switchover/SS failover] Reform success, instance:%d is running.",
                        g_instance.attr.attr_storage.dms_attr.instance_id)));
 
     /* reform success indicates that reform of primary and standby all complete, then update gaussdb.state */
+    g_instance.dms_cxt.dms_status = (dms_status_t)DMS_STATUS_IN;
     SendPostmasterSignal(PMSIGNAL_DMS_REFORM_DONE);
     g_instance.dms_cxt.SSClusterState = NODESTATE_NORMAL;
     g_instance.dms_cxt.SSReformInfo.in_reform = false;
@@ -1799,13 +2020,19 @@ static int CBCacheMsg(void *db_handle, char* msg)
     return GS_SUCCESS;
 }
 
-static int CBMarkNeedFlush(void *db_handle, char *pageid)
+static int CBMarkNeedFlush(void *db_handle, char *pageid, unsigned char *is_edp)
 {
     bool valid = false;
     BufferDesc *buf_desc = NULL;
     BufferTag *tag = (BufferTag *)pageid;
 
-    SSGetBufferDesc(pageid, &valid, &buf_desc);
+    bool ret = SSGetBufferDesc(pageid, &valid, &buf_desc);
+    if (!ret) {
+        ereport(WARNING, (errmodule(MOD_DMS),
+            errmsg("[SS] CBMarkNeedFlush, require LWLock timeout")));
+        return GS_TIMEOUT;
+    }
+
     if (buf_desc == NULL) {
         ereport(WARNING, (errmodule(MOD_DMS),
             errmsg("[SS] CBMarkNeedFlush, buf_desc not found")));
@@ -1819,6 +2046,14 @@ static int CBMarkNeedFlush(void *db_handle, char *pageid)
         return DMS_ERROR;
     }
 
+#ifdef USE_ASSERT_CHECKING
+    dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(buf_desc->buf_id);
+    if (buf_ctrl->is_edp) {
+        ereport(PANIC, (errmsg("[SS] CBMarkNeedFlush, do not allow edp exist, please check")));
+    }
+#endif
+    *is_edp = false;
+
     ereport(LOG, (errmsg("[SS] CBMarkNeedFlush found buf: %u/%u/%u/%d %d-%u",
         tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
         tag->forkNum, tag->blockNum)));
@@ -1826,11 +2061,16 @@ static int CBMarkNeedFlush(void *db_handle, char *pageid)
     return DMS_SUCCESS;
 }
 
+static int CBUpdateNodeOldestXmin(void *db_handle, uint8 inst_id, unsigned long long oldest_xmin)
+{
+    SSUpdateNodeOldestXmin(inst_id, oldest_xmin);
+    return GS_SUCCESS;
+}
+
 void DmsCallbackThreadShmemInit(unsigned char need_startup, char **reg_data)
 {
     /* in dorado mode, we need to wait sharestorageinit finished */
-    while (!g_instance.dms_cxt.SSRecoveryInfo.dorado_sharestorage_inited &&
-            g_instance.attr.attr_storage.xlog_file_path != 0) {
+    while (!g_instance.dms_cxt.SSRecoveryInfo.dorado_sharestorage_inited && SS_DORADO_CLUSTER) {
         pg_usleep(REFORM_WAIT_TIME);
     }
     IsUnderPostmaster = true;
@@ -1898,17 +2138,12 @@ int CBOndemandRedoPageForStandby(void *block_key, int32 *redo_status)
     }
 
     Buffer buffer;
-    SegSpace *spc = NULL;
     uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
     *redo_status = ONDEMAND_REDO_DONE;
+    smgrcloseall();
     PG_TRY();
     {
-        if (IsSegmentPhysicalRelNode(tag->rnode)) {
-            spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false, false);
-            buffer = ReadBufferFast(spc, tag->rnode, tag->forkNum, tag->blockNum, RBM_NORMAL);
-        } else {
-            buffer = ReadBufferWithoutRelcache(tag->rnode, tag->forkNum, tag->blockNum, RBM_NORMAL, NULL, NULL);
-        }
+        buffer = SSReadBuffer(tag, RBM_NORMAL);
         ReleaseBuffer(buffer);
     }
     PG_CATCH();
@@ -1934,6 +2169,33 @@ int CBOndemandRedoPageForStandby(void *block_key, int32 *redo_status)
     return GS_SUCCESS;;
 }
 
+void CBGetBufInfo(char* resid, stat_buf_info_t *buf_info)
+{
+    BufferTag tag;
+    errno_t err = memcpy_s(&tag, DMS_RESID_SIZE, resid, DMS_RESID_SIZE);
+    securec_check(err, "\0", "\0");
+    buftag_get_buf_info(tag, buf_info);
+}
+
+static void CBBufCtrlRecycle(void *db_handle)
+{
+    SSTryEliminateBuf(TRY_ELIMINATE_BUF_TIMES);
+}
+
+void DmsThreadDeinit()
+{
+    proc_exit(0);
+}
+
+int CBDoCheckpointImmediately(unsigned long long *ckpt_lsn)
+{
+    Assert(SS_PRIMARY_MODE);
+
+    RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_WAIT);
+    *ckpt_lsn = (unsigned long long)t_thrd.shemem_ptr_cxt.ControlFile->checkPoint;
+    return GS_SUCCESS;
+}
+
 void DmsInitCallback(dms_callback_t *callback)
 {
     // used in reform
@@ -1955,6 +2217,7 @@ void DmsInitCallback(dms_callback_t *callback)
     callback->reform_set_dms_role = CBReformSetDmsRole;
     callback->opengauss_ondemand_redo_buffer = CBOndemandRedoPageForStandby;
 
+    callback->inc_and_get_srsn = CBIncAndGetSrsn;
     callback->get_page_hash_val = CBPageHashCode;
     callback->read_local_page4transfer = CBEnterLocalPage;
     callback->leave_local_page = CBLeaveLocalPage;
@@ -1964,6 +2227,7 @@ void DmsInitCallback(dms_callback_t *callback)
     callback->remove_buf_load_status = CBRemoveBufLoadStatus;
     callback->invalidate_page = CBInvalidatePage;
     callback->get_db_handle = CBGetHandle;
+    callback->release_db_handle = CBReleaseHandle;
     callback->display_pageid = CBDisplayBufferTag;
     callback->verify_page = CBVerifyPage;
 
@@ -1990,11 +2254,16 @@ void DmsInitCallback(dms_callback_t *callback)
     callback->switchover_demote = CBSwitchoverDemote;
     callback->switchover_promote_opengauss = CBSwitchoverPromote;
     callback->set_switchover_result = CBSwitchoverResult;
-    callback->db_is_primary = CBDbIsPrimary;
     callback->reform_done_notify = CBReformDoneNotify;
     callback->log_wait_flush = CBXLogWaitFlush;
     callback->drc_validate = CBDrcBufValidate;
     callback->db_check_lock = CBDBCheckLock;
     callback->cache_msg = CBCacheMsg;
     callback->need_flush = CBMarkNeedFlush;
+    callback->update_node_oldest_xmin = CBUpdateNodeOldestXmin;
+
+    callback->get_buf_info = CBGetBufInfo;
+    callback->buf_ctrl_recycle = CBBufCtrlRecycle;
+    callback->dms_thread_deinit = DmsThreadDeinit;
+    callback->opengauss_do_ckpt_immediate = CBDoCheckpointImmediately;
 }

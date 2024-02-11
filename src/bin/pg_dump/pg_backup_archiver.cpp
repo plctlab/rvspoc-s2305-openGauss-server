@@ -32,6 +32,7 @@
 #include <sys/wait.h>
 #include "postgres.h"
 #include "knl/knl_variable.h"
+#include "bin/elog.h"
 
 #ifdef WIN32
 #include <windows.h>
@@ -132,6 +133,15 @@ typedef struct _outputContext {
 
 /* translator: this is a module name */
 static const char* modulename = gettext_noop("archiver");
+/* Progress Counter */
+static int g_totalEntries = 0;
+static int g_restoredEntries = 0;
+static volatile bool g_progressFlag = false;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+#if defined(USE_ASSERT_CHECKING) || defined(FASTCHECK)
+static bool disable_progress;
+#endif
 
 static ArchiveHandle* _allocAH(const char* FileSpec, const ArchiveFormat fmt, const int compression, ArchiveMode mode);
 static void _getObjectDescription(PQExpBuffer buf, TocEntry* te, ArchiveHandle* AH);
@@ -298,23 +308,141 @@ void SetArchiveRestoreOptions(Archive* AHX, RestoreOptions* ropt)
     }
 }
 
+static char* try_remove_nsname_in_drop_stmt(RestoreOptions* ropt, const char *stmt, int len)
+{
+    char* dropStmt = NULL;
+    if (ropt->targetV1 || ropt->targetV5) {
+        char *result = (char *)pg_malloc(len);
+        errno_t tnRet = 0;
+        tnRet = memset_s(result, len, 0, len);
+        securec_check_c(tnRet, "\0", "\0");
+        take_down_nsname_in_drop_stmt(stmt, result, len);
+        dropStmt = gs_strdup(result);
+        free(result);
+    } else {
+        dropStmt = gs_strdup(stmt);
+    }
+    return dropStmt;
+}
+
 static void out_drop_stmt(ArchiveHandle* AH, const TocEntry* te)
 {
     RestoreOptions* ropt = AH->ropt;
-
-    if (ropt->targetV1 || ropt->targetV5) {
-        char *result = (char *)pg_malloc(strlen(te->dropStmt) + PATCH_LEN);
-        errno_t tnRet = 0;
-        tnRet = memset_s(result, strlen(te->dropStmt) + PATCH_LEN, 0, strlen(te->dropStmt) + PATCH_LEN);
-        securec_check_c(tnRet, "\0", "\0");
-        take_down_nsname_in_drop_stmt(te->dropStmt, result, strlen(te->dropStmt) + PATCH_LEN);
-        
-        ahprintf(AH, "%s", result);
-        free(result);
-    } else {
-        ahprintf(AH, "%s", te->dropStmt);
+    char* dropStmt = NULL;
+    char* dropStmtOrig = NULL;
+    errno_t	rc = EOK;
+    if (*te->dropStmt != '\0') {
+        dropStmt = try_remove_nsname_in_drop_stmt(ropt, te->dropStmt, strlen(te->dropStmt) + PATCH_LEN);
+        dropStmtOrig = dropStmt;
+        if (strstr(te->dropStmt, "IF EXISTS") != NULL ||
+            strncmp(te->dropStmt, "--", 2) == 0) {
+            /* if it's just a comment (as happends for the public schema) or  
+             * already contains if-exists clause, then just use the original 
+             */
+            ahprintf(AH, "%s", dropStmt);
+        }
+        else {
+            PQExpBuffer ftStmt = createPQExpBuffer();
+            /*
+            * Need to inject IF EXISTS clause after ALTER
+            * TABLE part in ALTER TABLE .. DROP statement
+            */
+            if (strncmp(dropStmt, "ALTER TABLE", 11) == 0) {
+                appendPQExpBuffer(ftStmt,
+                                    "ALTER TABLE IF EXISTS");
+                dropStmt = dropStmt + 11;
+            }
+            /*
+            * Cases that should be emitted unchanged:
+            * ALTER TABLE..ALTER COLUMN..DROP DEFAULT
+            * DATABASE PROPERTIES as well
+            * CREATE OR REPLACE VIEW as a means of quasi-dropping an ON SELECT rule
+            */
+            if (strcmp(te->desc, "DEFAULT") == 0 ||
+                strcmp(te->desc, "DATABASE PROPERTIES") == 0 ||
+                strncmp(dropStmt, "CREATE OR REPLACE VIEW", 22) == 0) {
+                appendPQExpBufferStr(ftStmt, dropStmt);
+            }
+            /**
+             * For other object types, extract the first part of the DROP 
+             * which includes the object type.  Most of the time this matches
+             * te->desc, so search for that; however for the different kinds of CONSTRAINTs,
+             * search for hardcoded "DROP CONSTRAINT" instead.
+             */
+            else {
+                char buffer[PATCH_LEN];
+                char *mark;
+                if (strcmp(te->desc, "CONSTRAINT") == 0 ||
+                    strcmp(te->desc, "CHECK CONSTRAINT") == 0 ||
+                    strcmp(te->desc, "FK CONSTRAINT") == 0) {
+                    rc = strcpy_s(buffer, PATCH_LEN, "DROP CONSTRAINT");
+                    securec_check(rc, "\0", "\0");
+                } else {
+                    rc = snprintf_s(buffer, sizeof(buffer), sizeof(buffer) -1, "DROP %s", te->desc);
+                    securec_check(rc, "\0", "\0");
+                }
+                mark = strstr(dropStmt, buffer);
+                if (mark) {
+                    *mark = '\0';
+                    appendPQExpBuffer(ftStmt, "%s%s IF EXISTS%s",
+                                        dropStmt, buffer,
+                                        mark + strlen(buffer));
+                }
+                else {
+                    /* could not find where to insert IF EXISTS in statement and emit unmodified command */
+                    appendPQExpBufferStr(ftStmt, dropStmt);
+                }
+            }
+            ahprintf(AH, "%s", ftStmt->data);
+            destroyPQExpBuffer(ftStmt);
+        }
+        free(dropStmtOrig);
     }
 }
+
+/*
+ * Print a progress report based on the global variables.
+ * Execute this function in another thread and print the progress periodically.
+ */
+static void *ProgressReportRestore(void *arg)
+{
+#if defined(USE_ASSERT_CHECKING) || defined(FASTCHECK)
+    if (disable_progress) {
+        return nullptr;
+    }
+#endif
+    if (g_totalEntries == 0) {
+        return nullptr;
+    }
+    char progressBar[53];
+    int percent;
+    do {
+        /* progress report */
+        percent = (int)(g_restoredEntries * 100 / g_totalEntries);
+        GenerateProgressBar(percent, progressBar);
+        fprintf(stdout, "Progress: %s %d%% (%d/%d, restored_entries/total_entries). restore entires \r",
+            progressBar, percent, g_restoredEntries, g_totalEntries);
+                pthread_mutex_lock(&g_mutex);
+        timespec timeout;
+        timeval now;
+        gettimeofday(&now, nullptr);
+        timeout.tv_sec = now.tv_sec + 1;
+        timeout.tv_nsec = 0;
+        int ret = pthread_cond_timedwait(&g_cond, &g_mutex, &timeout);
+        pthread_mutex_unlock(&g_mutex);
+        if (ret == ETIMEDOUT) {
+            continue;
+        } else {
+            break;
+        }
+    } while ((g_restoredEntries  < g_totalEntries) && !g_progressFlag);
+    percent = 100;
+    GenerateProgressBar(percent, progressBar);
+    fprintf(stdout, "Progress: %s %d%% (%d/%d, restored_entries/total_entries). restore entires \n",
+            progressBar, percent, g_restoredEntries, g_totalEntries);
+    return nullptr;
+}
+
 /* Public */
 void RestoreArchive(Archive* AHX)
 {
@@ -326,6 +454,11 @@ void RestoreArchive(Archive* AHX)
     char* p = NULL;
     errno_t rc = 0;
     AH->stage = STAGE_INITIALIZING;
+
+    g_totalEntries = AH->tocCount;
+#if defined(USE_ASSERT_CHECKING) || defined(FASTCHECK)
+    disable_progress = ropt->disable_progress;
+#endif
 
     /*
      * Check for nonsensical option combinations.
@@ -540,29 +673,28 @@ void RestoreArchive(Archive* AHX)
      *
      * In parallel mode, turn control over to the parallel-restore logic.
      */
+    pthread_t progressThread;
+    if (RestoringToDB(AH)) {
+            write_msg(NULL, "start restore operation ...\n");
+            pthread_create(&progressThread, NULL, ProgressReportRestore, NULL);
+    }
     if (parallel_mode) {
         restore_toc_entries_parallel(AH);
     } else {
-        int sqlCnt = 0;
-        if (RestoringToDB(AH)) {
-            write_msg(NULL, "start restore operation ...\n");
-        }
-
         for (te = AH->toc->next; te != AH->toc; te = te->next) {
             (void)restore_toc_entry(AH, te, ropt, false);
-
-            sqlCnt++;
-            if (RestoringToDB(AH) && (sqlCnt != 0) && ((sqlCnt % RESTORE_READ_CNT) == 0)) {
-                write_msg(NULL, "%d SQL statements read in !\n", sqlCnt);
-            }
-        }
-
-        if (RestoringToDB(AH)) {
-            write_msg(NULL, "Finish reading %d SQL statements!\n", sqlCnt);
-            write_msg(NULL, "end restore operation ...\n");
+            g_restoredEntries++;
         }
     }
-
+    if (RestoringToDB(AH)) {
+        g_progressFlag = true;
+        pthread_mutex_lock(&g_mutex);
+        pthread_cond_signal(&g_cond);
+        pthread_mutex_unlock(&g_mutex);
+        pthread_join(progressThread, NULL);
+        write_msg(NULL, "end restore operation ...\n");
+    }
+    
     /*
      * Scan TOC again to output ownership commands and ACLs
      */
@@ -791,10 +923,11 @@ static int restore_toc_entry(ArchiveHandle* AH, TocEntry* te, RestoreOptions* ro
                          * TRUNCATE with ONLY so that child tables are not
                          * wiped.
                          */
-                        (void)ahprintf(AH,
-                            "TRUNCATE TABLE %s%s;\n\n",
-                            (PQserverVersion(AH->connection) >= 80400 ? "ONLY " : ""),
-                            fmtId(te->tag));
+                        if (PQserverVersion(AH->connection) >= 80400) {
+                            (void)ahprintf(AH, "TRUNCATE TABLE ONLY (%s);\n\n", fmtId(te->tag));
+                        } else {
+                            (void)ahprintf(AH, "TRUNCATE TABLE %s;\n\n", fmtId(te->tag));
+                        }
                     }
 
                     /*
@@ -2120,6 +2253,7 @@ static ArchiveHandle* _allocAH(const char* FileSpec, const ArchiveFormat fmt, co
     AH->publicArc.exit_on_error = true;
     AH->publicArc.n_errors = 0;
     AH->publicArc.getHashbucketInfo = false;
+    AH->publicArc.workingVersionNum = 0;
 
     AH->archiveDumpVersion = gs_strdup(PG_VERSION);
 
@@ -3633,7 +3767,6 @@ static void restore_toc_entries_parallel(ArchiveHandle* AH)
      */
     skipped_some = false;
 
-    int sqlCnt = 0;
     if (RestoringToDB(AH)) {
         write_msg(NULL, "start restore operation ...\n");
     }
@@ -3662,10 +3795,7 @@ static void restore_toc_entries_parallel(ArchiveHandle* AH)
 
         (void)restore_toc_entry(AH, next_work_item, ropt, false);
 
-        sqlCnt++;
-        if (RestoringToDB(AH) && (sqlCnt != 0) && ((sqlCnt % RESTORE_READ_CNT) == 0)) {
-            write_msg(NULL, "%d SQL statements read in !\n", sqlCnt);
-        }
+        g_restoredEntries++;
 
         /* there should be no touch of ready_list here, so pass NULL */
         reduce_dependencies(AH, next_work_item, NULL);
@@ -3779,10 +3909,7 @@ static void restore_toc_entries_parallel(ArchiveHandle* AH)
                 /* run the step in a worker child */
                 thandle child = spawn_restore(args);
 
-                sqlCnt++;
-                if ((ropt->useDB) && (sqlCnt != 0) && ((sqlCnt % RESTORE_READ_CNT) == 0)) {
-                    write_msg(NULL, "%d SQL statements read in !\n", sqlCnt);
-                }
+                g_restoredEntries++;
 
                 slots[next_slot].child_id = child;
                 slots[next_slot].args = args;
@@ -3839,14 +3966,10 @@ static void restore_toc_entries_parallel(ArchiveHandle* AH)
         ahlog(AH, 1, "processing missed item %d %s %s\n", te->dumpId, te->desc, te->tag);
         (void)restore_toc_entry(AH, te, ropt, false);
 
-        sqlCnt++;
-        if (RestoringToDB(AH) && (sqlCnt != 0) && ((sqlCnt % RESTORE_READ_CNT) == 0)) {
-            write_msg(NULL, "%d SQL statements read in !\n", sqlCnt);
-        }
+        g_restoredEntries++;
     }
 
     if (RestoringToDB(AH)) {
-        write_msg(NULL, "Finish reading %d SQL statements!\n", sqlCnt);
         write_msg(NULL, "end restore operation ...\n");
     }
 

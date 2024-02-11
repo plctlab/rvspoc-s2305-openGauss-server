@@ -93,14 +93,6 @@ extern volatile uint64 sync_system_identifier;
 #define XLOG_FROM_PG_XLOG (1 << 1) /* Existing file in pg_xlog */
 #define XLOG_FROM_STREAM (1 << 2)  /* Streamed from master */
 
-#define DORADO_STANDBY_CLUSTER (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY && \
-                                g_instance.attr.attr_storage.xlog_file_path != 0)
-#define DORADO_PRIMARY_CLUSTER (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_PRIMARY && \
-                                g_instance.attr.attr_storage.xlog_file_path != 0)
-#define DORADO_STANDBY_CLUSTER_MAINSTANDBY_NODE ((t_thrd.postmaster_cxt.HaShmData->current_mode ==  STANDBY_MODE) && \
-                                                (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY) && \
-                                                (g_instance.attr.attr_storage.xlog_file_path != 0))
-
 /*
  * Recovery target type.
  * Only set during a Point in Time recovery, not when standby_mode = on
@@ -432,7 +424,7 @@ typedef struct XLogCtlInsert {
     uint32 PrevByteSize;
     int32 CurrLRC;
 
-#if (!defined __x86_64__) && (!defined __aarch64__)
+#if ((!defined __x86_64__) && (!defined __aarch64__)) || defined(__USE_SPINLOCK)
     slock_t insertpos_lck; /* protects CurrBytePos and PrevBytePos */
 #endif
     /*
@@ -541,7 +533,7 @@ typedef struct XLogCtlData {
 
     bool IsRecoveryDone;
     bool IsOnDemandBuildDone;
-    bool IsOnDemandRecoveryDone;
+    bool IsOnDemandRedoDone;
 
     /*
      * SharedHotStandbyActive indicates if we're still in crash or archive
@@ -562,6 +554,13 @@ typedef struct XLogCtlData {
      * to appear.
      */
     Latch recoveryWakeupLatch;
+
+    /**
+     * used to wake up startup process in extroRtoMode and recovery_min_apply_delay > 0,
+     * to wake up startup process,  which is waiting in RecoveryApplyDelay(), to avoid 
+     * startup process contend for recoveryWakeupLatch with XLogPageRead process.
+     */
+    Latch recoveryWakeupDelayLatch;
 
     Latch dataRecoveryLatch;
 
@@ -657,6 +656,39 @@ struct XlogFlushStats{
     TimestampTz lastRestTime;
 };
 
+typedef enum WalKeeper {
+    WALKEEPER_BASECHECK = 0,
+    WALKEEPER_SEGMENT_KEEP,
+    WALKEEPER_SLOTS,
+    WALKEEPER_BASEBACKUP,
+    WALKEEPER_BUILD,
+    WALKEEPER_INVALIDSEND,
+    WALKEEPER_DUMMYSTANDBY,
+    WALKEEPER_INVALIDSLOT,
+    WALKEEPER_CBM,
+    WALKEEPER_CHECKPOINT,
+    WALKEEPER_ARCHIVE,
+    WALKEEPER_RESISTARCHIVE,
+    WALKEEPER_COODRECYCLE,
+    WALKEEPER_MAX
+} WalKeeper;
+
+typedef struct WalKeeperDesc {
+    WalKeeper   keeper_id;
+    char        *keeper_name;
+    char        *keeper_desc;
+}WalKeeperDesc;
+
+typedef struct XlogKeeper {
+    XLogSegNo   segno;
+    bool        valid;
+} XlogKeeper;
+
+typedef struct WalKeeperPriv {
+    int             loop;
+    XlogKeeper      *keeper;
+}WalKeeperPriv;
+
 extern XLogSegNo GetNewestXLOGSegNo(const char* workingPath);
 /*
  * Hint bit for whether xlog contains CSN info, which is stored in xl_term.
@@ -695,7 +727,6 @@ extern bool RecoveryInProgress(void);
 extern bool HotStandbyActive(void);
 extern bool HotStandbyActiveInReplay(void);
 extern bool XLogInsertAllowed(void);
-extern bool SSXLogInsertAllowed(void);
 extern bool SSModifySharedLunAllowed(void);
 extern void GetXLogReceiptTime(TimestampTz* rtime, bool* fromStream);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID* targetTLI, XLogRecPtr* ReplayReadPtr = NULL);
@@ -966,4 +997,5 @@ extern void InitUndoCountThreshold();
 
 /* for recovery */
 void SSWriteInstanceControlFile(int fd, const char* buffer, int id, off_t size);
+extern XlogKeeper* generate_xlog_keepers(void);
 #endif /* XLOG_H */

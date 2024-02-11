@@ -40,6 +40,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/multixact.h"
+#include "access/multi_redo_api.h"
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
 #include "catalog/catversion.h"
@@ -1366,7 +1367,7 @@ HeapTuple ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
      * relfilenode of non mapped system relations during decoding.
      */
     snapshot = SnapshotNow;
-    if (HistoricSnapshotActive() && !force_non_historic) {
+    if ((HistoricSnapshotActive() && !force_non_historic) || IS_EXRTO_RECOVERY_IN_PROGRESS) {
         snapshot = GetCatalogSnapshot();
     }
 
@@ -1601,7 +1602,7 @@ static void RelationBuildTupleDesc(Relation relation, bool onlyLoadInitDefVal)
      */
     Snapshot snapshot = NULL;
     snapshot = SnapshotNow;
-    if (HistoricSnapshotActive()) {
+    if (HistoricSnapshotActive() || IS_EXRTO_RECOVERY_IN_PROGRESS) {
         snapshot =  GetCatalogSnapshot();
     }
 
@@ -2822,6 +2823,13 @@ void RelationInitIndexAccessInfo(Relation relation, HeapTuple index_tuple)
     relation->rd_exclstrats = NULL;
     relation->rd_amcache = NULL;
     relation->rd_rootcache = InvalidBuffer;
+    
+    /* check usability status if partitioned index */
+    if (RelationIsPartitioned(relation)) {
+        relation->rd_ind_partition_all_usable = PartCheckPartitionedIndexAllUsable(relation);
+    } else {
+        relation->rd_ind_partition_all_usable = true; /* trivial for non-partitioned index */
+    }
 }
 
 /*
@@ -3512,6 +3520,13 @@ void RelationReloadIndexInfo(Relation relation)
         ReleaseSysCache(tuple);
     }
 
+    /* check usability status if partitioned index */
+    if (RelationIsPartitioned(relation)) {
+        relation->rd_ind_partition_all_usable = PartCheckPartitionedIndexAllUsable(relation);
+    } else {
+        relation->rd_ind_partition_all_usable = true; /* trivial for non-partitioned index */
+    }
+    
     /* Okay, now it's valid again */
     relation->rd_isvalid = true;
 }
@@ -3520,8 +3535,8 @@ static void RelationDestroySliceMap(Relation relation)
 {
     RangePartitionMap* range_map = (RangePartitionMap*)(relation->sliceMap);
 
-    pfree_ext(range_map->partitionKey);
-    pfree_ext(range_map->partitionKeyDataType);
+    pfree_ext(range_map->base.partitionKey);
+    pfree_ext(range_map->base.partitionKeyDataType);
     pfree_ext(range_map->intervalValue);
     pfree_ext(range_map->intervalTablespace);
     partitionMapDestroyRangeArray(range_map->rangeElements, range_map->rangeElementsNum);
@@ -4055,8 +4070,6 @@ void RelationCacheInvalidate(void)
             /* Delete this entry immediately */
             Assert(!relation->rd_isnailed);
             RelationClearRelation(relation, false);
-            hash_seq_term(&status);
-            hash_seq_init(&status, u_sess->relcache_cxt.RelationIdCache);
         } else {
             /*
              * If it's a mapped relation, immediately update its rd_node in
@@ -4151,19 +4164,7 @@ void InvalidateRelationNodeList()
         relation = idhentry->reldesc;
 
         if (relation->rd_locator_info != NULL) {
-            bool clear = RelationHasReferenceCountZero(relation) &&
-                    !(RelationIsIndex(relation) && relation->rd_refcnt > 0 && relation->rd_indexcxt != NULL);
             RelationClearRelation(relation, !RelationHasReferenceCountZero(relation));
-            if (!clear) {
-                hash_seq_term(&status);
-                hash_seq_init(&status, u_sess->relcache_cxt.RelationIdCache);
-                while ((idhentry = (RelIdCacheEnt*)hash_seq_search(&status)) != NULL) {
-                    Relation start_relation = idhentry->reldesc;
-                    if (start_relation == relation) {
-                        break;
-                    }
-                }
-            }
         }
     }
 }
@@ -4394,8 +4395,6 @@ void AtEOXact_RelationCache(bool isCommit)
                 relation->rd_createSubid = InvalidSubTransactionId;
             } else if (RelationHasReferenceCountZero(relation)) {
                 RelationClearRelation(relation, false);
-                hash_seq_term(&status);
-                hash_seq_init(&status, u_sess->relcache_cxt.RelationIdCache);
                 continue;
             } else {
                 /*
@@ -4430,8 +4429,6 @@ void AtEOXact_RelationCache(bool isCommit)
         }
         if (relation->partMap != NULL && relation->partMap->isDirty) {
             RelationClearRelation(relation, false);
-            hash_seq_term(&status);
-            hash_seq_init(&status, u_sess->relcache_cxt.RelationIdCache);
         }
     }
 
@@ -8759,4 +8756,3 @@ bool IsRelationReplidentKey(Relation r, int attno)
     RelationClose(idx_rel);
     return false;
 }
-

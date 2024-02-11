@@ -36,6 +36,7 @@
 #include "storage/file/fio_device.h"
 #include "storage/smgr/segment_internal.h"
 #include "replication/walreceiver.h"
+#include "replication/ss_disaster_cluster.h"
 
 /*
  * Add xlog reader private structure for page read.
@@ -46,7 +47,7 @@ typedef struct XLogPageReadPrivate {
     bool randAccess;
 } XLogPageReadPrivate;
 
-int SSXLogFileReadAnyTLI(XLogSegNo segno, int emode, uint32 sources, char* xlog_path)
+int SSXLogFileOpenAnyTLI(XLogSegNo segno, int emode, uint32 sources, char* xlog_path)
 {
     char path[MAXPGPATH];
     ListCell *cell = NULL;
@@ -65,6 +66,7 @@ int SSXLogFileReadAnyTLI(XLogSegNo segno, int emode, uint32 sources, char* xlog_
         t_thrd.xlog_cxt.restoredFromArchive = false;
 
         fd = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
+
         if (fd >= 0) {
             /* Success! */
             t_thrd.xlog_cxt.curFileTLI = tli;
@@ -80,6 +82,15 @@ int SSXLogFileReadAnyTLI(XLogSegNo segno, int emode, uint32 sources, char* xlog_
 
             return fd;
         }
+
+        /* 
+        * When SS_DORADO_CLUSTER enabled, current xlog dictionary may be not the correct dictionary,
+        * because all xlog dictionaries are in the same LUN, we need loop over other dictionaries.
+        */
+        if (fd < 0 && SS_DORADO_CLUSTER) {
+            return -1;
+        }
+
         if (!FILE_POSSIBLY_DELETED(errno)) { 
             ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\" (log segment %s): %m", path,
                                                               XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, segno))));
@@ -87,7 +98,7 @@ int SSXLogFileReadAnyTLI(XLogSegNo segno, int emode, uint32 sources, char* xlog_
     }
 
     /* Couldn't find it.  For simplicity, complain about front timeline */
-    errorno = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%08X%08X%08X", SS_XLOGDIR,
+    errorno = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%08X%08X%08X", xlog_path,
                          t_thrd.xlog_cxt.recoveryTargetTLI, (uint32)((segno) / XLogSegmentsPerXLogId),
                          (uint32)((segno) % XLogSegmentsPerXLogId));
     securec_check_ss(errorno, "", "");
@@ -110,32 +121,19 @@ int SSReadXlogInternal(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, XL
     Assert(readLen <= XLogPreReadSize);
 
     do {
-        /* 
-         * That source is XLOG_FROM_STREAM indicate that walreceiver receive xlog and walrecwriter have wrriten xlog
-         * into pg_xlog segment file in dss. There exists a condition which preReadBuf possibly is zero for some xlog
-         * record just writing into pg_xlog file when source is XLOG_FROM_STREAM and dms and dss are enabled. So we
-         * need to reread xlog from dss to preReadBuf.
-         */
-        if (SS_STANDBY_CLUSTER_MAIN_STANDBY) {
-            volatile XLogCtlData *xlogctl = t_thrd.shemem_ptr_cxt.XLogCtl;
-            if (XLByteInPreReadBuf(targetPagePtr, xlogreader->preReadStartPtr) && 
-               ((targetRecPtr < xlogFlushPtrForPerRead && t_thrd.xlog_cxt.readSource == XLOG_FROM_STREAM) || 
-               (!xlogctl->IsRecoveryDone) || (t_thrd.xlog_cxt.readSource != XLOG_FROM_STREAM))) {
-                   isReadFile = false;
-               }
-        }
-
-        if ((XLByteInPreReadBuf(targetPagePtr, xlogreader->preReadStartPtr) &&
-             !SS_STANDBY_CLUSTER_MAIN_STANDBY) || (!isReadFile)) {
+        if ((XLByteInPreReadBuf(targetPagePtr, xlogreader->preReadStartPtr))) {
             preReadOff = targetPagePtr % XLogPreReadSize;
             int err = memcpy_s(buf, readLen, xlogreader->preReadBuf + preReadOff, readLen);
             securec_check(err, "\0", "\0");
             break;
         } else {
-            if (SS_STANDBY_CLUSTER_MAIN_STANDBY) {
-                xlogreader->xlogFlushPtrForPerRead = GetWalRcvWriteRecPtr(NULL);
-                xlogFlushPtrForPerRead = xlogreader->xlogFlushPtrForPerRead;
+            /*
+             * That preReadStartPtr is InvalidXlogPreReadStartPtr has three kinds of occasions.
+             */
+            if (xlogreader->preReadStartPtr == InvalidXlogPreReadStartPtr && SS_DISASTER_CLUSTER) {
+                ereport(LOG, (errmsg("In ss disaster cluster mode, preReadStartPtr is 0.")));
             }
+
             // pre-reading for dss
             uint32 targetPageOff = targetPagePtr % XLogSegSize;
             preReadOff = targetPageOff - targetPageOff % XLogPreReadSize;
@@ -192,119 +190,82 @@ void SSGetRecoveryXlogPath()
     securec_check_ss(rc, "", "");
 }
 
-static void SSSaveOldReformerCtrl()
+char* SSGetNextXLogPath(TimeLineID tli, XLogRecPtr startptr)
 {
-    ss_reformer_ctrl_t new_ctrl = g_instance.dms_cxt.SSReformerControl;
-    ss_old_reformer_ctrl_t old_ctrl = {new_ctrl.list_stable, new_ctrl.primaryInstId, new_ctrl.crc};
+    char path[MAXPGPATH];
+    char fileName[MAXPGPATH];
+    char temp[MAXPGPATH];
+    struct stat buffer;
+    errno_t rc = EOK;
+    XLogSegNo segno;
+    XLByteToSeg(startptr, segno);
+    rc = snprintf_s(fileName, MAXPGPATH, MAXPGPATH - 1, "%08X%08X%08X", tli,
+                        (uint32)((segno) / XLogSegmentsPerXLogId),
+                        (uint32)((segno) % XLogSegmentsPerXLogId));
+    securec_check_ss_c(rc, "\0", "\0");
 
-    int len = sizeof(ss_old_reformer_ctrl_t);
-    int write_size = (int)BUFFERALIGN(len);
-    char buffer[write_size] __attribute__((__aligned__(ALIGNOF_BUFFER))) = { 0 };
-    char *fname[2];
-    int fd = -1;
-
-    errno_t err = memcpy_s(&buffer, write_size, &old_ctrl, len);
-    securec_check(err, "\0", "\0");
-
-    INIT_CRC32C(((ss_old_reformer_ctrl_t *)buffer)->crc);
-    COMP_CRC32C(((ss_old_reformer_ctrl_t *)buffer)->crc, (char *)buffer, offsetof(ss_old_reformer_ctrl_t, crc));
-    FIN_CRC32C(((ss_old_reformer_ctrl_t *)buffer)->crc);
-
-    fname[0] = XLOG_CONTROL_FILE_BAK;
-    fname[1] = XLOG_CONTROL_FILE;
-
-    for (int i = 0; i < BAK_CTRL_FILE_NUM; i++) {
-        if (i == 0) {
-            fd = BasicOpenFile(fname[i], O_CREAT | O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
-        } else {
-            fd = BasicOpenFile(fname[i], O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
+    for (int i = 1; i < DMS_MAX_INSTANCE; i++) {
+        if (g_instance.dms_cxt.SSRecoveryInfo.xlog_list[i][0] == '\0') {
+            ereport(LOG, (errmsg("No valid next xlog file path")));
+            break;
         }
+        rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", g_instance.dms_cxt.SSRecoveryInfo.xlog_list[i], fileName);
+        securec_check_ss_c(rc, "\0", "\0");
 
-        if (fd < 0) {
-            ereport(FATAL, (errcode_for_file_access(), errmsg("could not open control file \"%s\": %m", fname[i])));
-        }
-
-        SSWriteInstanceControlFile(fd, buffer, REFORM_CTRL_PAGE, write_size);
-        if (close(fd)) {
-            ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %m")));
+        if (stat(path, &buffer) == 0) {
+            rc = strcpy_s(temp, sizeof(temp), g_instance.dms_cxt.SSRecoveryInfo.xlog_list[i]);
+            securec_check_c(rc, "\0", "\0");
+            rc = strcpy_s(g_instance.dms_cxt.SSRecoveryInfo.xlog_list[i], MAXPGPATH, g_instance.dms_cxt.SSRecoveryInfo.xlog_list[0]);
+            securec_check_c(rc, "\0", "\0");
+            rc = strcpy_s(g_instance.dms_cxt.SSRecoveryInfo.xlog_list[0], MAXPGPATH, temp);
+            securec_check_c(rc, "\0", "\0");
+            break;
         }
     }
+
+    return g_instance.dms_cxt.SSRecoveryInfo.xlog_list[0];
 }
 
-static bool SSReadOldReformerCtrl()
+void SSDisasterGetXlogPathList()
 {
-    ss_reformer_ctrl_t *new_ctrl = &g_instance.dms_cxt.SSReformerControl;
-    ss_old_reformer_ctrl_t old_ctrl;
-    pg_crc32c crc;
-    int fd = -1;
-    bool retry = false;
-    char *fname = XLOG_CONTROL_FILE;
-
-loop:
-    fd = BasicOpenFile(fname, O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
-    if (fd < 0) {
-        ereport(FATAL, (errcode_for_file_access(), errmsg("could not open control file \"%s\": %m", fname)));
+    errno_t rc = EOK;
+    for (int i = 0; i < DMS_MAX_INSTANCE; i++) {
+        rc = memset_s(g_instance.dms_cxt.SSRecoveryInfo.xlog_list[i], MAXPGPATH, '\0', MAXPGPATH);
+        securec_check_c(rc, "\0", "\0");
+    }
+    struct dirent *entry;
+    
+    DIR* dssdir = opendir(g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name);
+    if (dssdir == NULL) {
+        ereport(PANIC, (errcode_for_file_access(), errmsg("Error opening dssdir %s", 
+                        g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name)));                                                  
     }
 
-    off_t seekpos = (off_t)BLCKSZ * REFORM_CTRL_PAGE;
-    int len = sizeof(ss_old_reformer_ctrl_t);
-
-    int read_size = (int)BUFFERALIGN(len);
-    char buffer[read_size] __attribute__((__aligned__(ALIGNOF_BUFFER)));
-    if (pread(fd, buffer, read_size, seekpos) != read_size) {
-        ereport(PANIC, (errcode_for_file_access(), errmsg("could not read from control file: %m")));
-    }
-
-    errno_t rc = memcpy_s(&old_ctrl, len, buffer, len);
-    securec_check(rc, "", "");
-    if (close(fd) < 0) {
-        ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %m")));
-    }
-
-    /* Now check the CRC. */
-    INIT_CRC32C(crc);
-    COMP_CRC32C(crc, (char *)&old_ctrl, offsetof(ss_old_reformer_ctrl_t, crc));
-    FIN_CRC32C(crc);
-
-    if (!EQ_CRC32C(crc, old_ctrl.crc)) {
-        if (retry == false) {
-            ereport(WARNING,
-                (errmsg("control file \"%s\" contains incorrect checksum in upgrade mode, try backup file", fname)));
-            fname = XLOG_CONTROL_FILE_BAK;
-            retry = true;
-            goto loop;
+    uint8_t len = strlen("pg_xlog");
+    uint8_t index = 0;
+    while ((entry = readdir(dssdir)) != NULL) {
+        if (strncmp(entry->d_name, "pg_xlog", len) == 0) {
+            if (strlen(entry->d_name) > len) {
+                rc = memmove_s(entry->d_name, MAX_PATH, entry->d_name + len, strlen(entry->d_name) - len + 1);
+                securec_check_c(rc, "\0", "\0");
+                rc = snprintf_s(g_instance.dms_cxt.SSRecoveryInfo.xlog_list[index++], MAXPGPATH, MAXPGPATH - 1,
+                    "%s/%s%d", g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name, "pg_xlog", atoi(entry->d_name));
+                securec_check_ss(rc, "", "");
+            }
         } else {
-            ereport(WARNING,
-                (errmsg("backup control file \"%s\" contains incorrect checksum in upgrade mode, "
-                "try again in post-upgrade mode", fname)));
-            return false;
+            continue;
         }
     }
-
-    // new params set to initial value
-    new_ctrl->version = REFORM_CTRL_VERSION;
-    new_ctrl->recoveryInstId = INVALID_INSTANCEID;
-    new_ctrl->clusterStatus = CLUSTER_NORMAL;
-
-    // exist param inherit
-    new_ctrl->primaryInstId = old_ctrl.primaryInstId;
-    new_ctrl->list_stable = old_ctrl.list_stable;
-    new_ctrl->crc = old_ctrl.crc;
-
-    return true;
+    closedir(dssdir);
 }
 
-void SSSaveReformerCtrl(bool force)
+void SSUpdateReformerCtrl()
 {
+    Assert(SS_PRIMARY_MODE || SS_DISASTER_CLUSTER);
     int fd = -1;
     int len;
     errno_t err = EOK;
     char *fname[2];
-
-    if ((pg_atomic_read_u32(&WorkingGrandVersionNum) < ONDEMAND_REDO_VERSION_NUM) && !force) {
-        SSSaveOldReformerCtrl();
-        return;
-    }
 
     len = sizeof(ss_reformer_ctrl_t);
     int write_size = (int)BUFFERALIGN(len);
@@ -328,12 +289,12 @@ void SSSaveReformerCtrl(bool force)
         }
 
         if (fd < 0) {
-            ereport(FATAL, (errcode_for_file_access(), errmsg("could not open control file \"%s\": %m", fname[i])));
+            ereport(FATAL, (errcode_for_file_access(), errmsg("could not open control file \"%s\": %s", fname[i], TRANSLATE_ERRNO)));
         }
 
         SSWriteInstanceControlFile(fd, buffer, REFORM_CTRL_PAGE, write_size);
         if (close(fd)) {
-            ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %m")));
+            ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %s", TRANSLATE_ERRNO)));
         }
     }
 }
@@ -348,24 +309,12 @@ void SSReadControlFile(int id, bool updateDmsCtx)
     int read_size = 0;
     int len = 0;
     fname = XLOG_CONTROL_FILE;
-
-    if ((pg_atomic_read_u32(&WorkingGrandVersionNum) < ONDEMAND_REDO_VERSION_NUM) && (id == REFORM_CTRL_PAGE)) {
-        if (SSReadOldReformerCtrl()) {
-            return;
-        }
-
-        // maybe primary node already upgrade pg_control file, sleep and try read in lastest mode again
-        if (SS_STANDBY_MODE) {
-            pg_usleep(5000000);  /* 5 sec */
-            goto loop;
-        } else {
-            ereport(PANIC, (errmsg("incorrect checksum in control file")));
-        }
-    }
+    LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
 loop:
     fd = BasicOpenFile(fname, O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
     if (fd < 0) {
+        LWLockRelease(ControlFileLock);
         ereport(FATAL, (errcode_for_file_access(), errmsg("could not open control file \"%s\": %m", fname)));
     }
 
@@ -380,6 +329,7 @@ loop:
     read_size = (int)BUFFERALIGN(len);
     char buffer[read_size] __attribute__((__aligned__(ALIGNOF_BUFFER)));
     if (pread(fd, buffer, read_size, seekpos) != read_size) {
+        LWLockRelease(ControlFileLock);
         ereport(PANIC, (errcode_for_file_access(), errmsg("could not read from control file: %m")));
     }
 
@@ -387,6 +337,7 @@ loop:
         rc = memcpy_s(&g_instance.dms_cxt.SSReformerControl, len, buffer, len);
         securec_check(rc, "", "");
         if (close(fd) < 0) {
+            LWLockRelease(ControlFileLock);
             ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %m")));
         }
 
@@ -402,9 +353,11 @@ loop:
                 retry = true;
                 goto loop;
             } else {
+                LWLockRelease(ControlFileLock);
                 ereport(FATAL, (errmsg("incorrect checksum in control file")));
             }
         }
+        g_instance.dms_cxt.SSRecoveryInfo.cluster_ondemand_status = g_instance.dms_cxt.SSReformerControl.clusterStatus;
     } else {
         ControlFileData* controlFile = NULL;
         ControlFileData tempControlFile;
@@ -417,6 +370,7 @@ loop:
         rc = memcpy_s(controlFile, (size_t)len, buffer, (size_t)len);
         securec_check(rc, "", "");
         if (close(fd) < 0) {
+            LWLockRelease(ControlFileLock);
             ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %m")));
         }
 
@@ -432,6 +386,7 @@ loop:
                 retry = true;
                 goto loop;
             } else {
+                LWLockRelease(ControlFileLock);
                 ereport(FATAL, (errmsg("incorrect checksum in control file")));
             }
         }
@@ -440,6 +395,7 @@ loop:
             g_instance.dms_cxt.ckptRedo = controlFile->checkPointCopy.redo;
         }
     }
+    LWLockRelease(ControlFileLock);
 }
 
 void SSClearSegCache()
@@ -486,4 +442,111 @@ void SSStandbySetLibpqswConninfo()
     g_instance.dms_cxt.conninfo[MAXCONNINFO - 1] = '\0';
 
     return;
+}
+
+static void SSReadClusterRunMode()
+{
+    int fd = -1;
+    char *fname = NULL;
+    int read_size = 0;
+    int len = sizeof(ss_reformer_ctrl_t);
+    fname = XLOG_CONTROL_FILE;
+    LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+
+    fd = BasicOpenFile(fname, O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        LWLockRelease(ControlFileLock);
+        ereport(FATAL, (errcode_for_file_access(), errmsg("could not open control file \"%s\": %m", fname)));
+    }
+
+    off_t seekpos = (off_t)BLCKSZ * REFORM_CTRL_PAGE;
+
+    read_size = (int)BUFFERALIGN(len);
+    char buffer[read_size] __attribute__((__aligned__(ALIGNOF_BUFFER)));
+    if (pread(fd, buffer, read_size, seekpos) != read_size) {
+        (void)close(fd);
+        LWLockRelease(ControlFileLock);
+        ereport(PANIC, (errcode_for_file_access(), errmsg("could not read from control file: %m")));
+    }
+    
+    g_instance.dms_cxt.SSReformerControl.clusterRunMode = ((ss_reformer_ctrl_t*)buffer)->clusterRunMode;
+
+    if (close(fd) < 0) {
+        LWLockRelease(ControlFileLock);
+        ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %m")));
+    }
+    LWLockRelease(ControlFileLock);
+}
+
+void SSDisasterRefreshMode()
+{
+    LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+
+    SSUpdateReformerCtrl();
+    LWLockRelease(ControlFileLock);
+    ereport(LOG, (errmsg("SSDisasterRefreshMode change control file cluster run mode to: %d",
+        g_instance.dms_cxt.SSReformerControl.clusterRunMode)));
+}
+
+void SSDisasterUpdateHAmode() 
+{
+    SSReadClusterRunMode();
+    if (SS_REFORM_REFORMER) {
+        if (SS_DISASTER_PRIMARY_CLUSTER) {
+            t_thrd.postmaster_cxt.HaShmData->current_mode = PRIMARY_MODE;
+        } else if (SS_DISASTER_STANDBY_CLUSTER) {
+            t_thrd.postmaster_cxt.HaShmData->current_mode = STANDBY_MODE;
+        }
+        ereport(LOG, (errmsg("SSDisasterUpdateHAmode change Ha current mode to: %d",
+            t_thrd.postmaster_cxt.HaShmData->current_mode)));
+    }
+}
+
+bool SSPerformingStandbyScenario()
+{
+    if (SS_IN_REFORM) {
+        if (g_instance.dms_cxt.SSReformInfo.reform_type == DMS_REFORM_TYPE_FOR_NORMAL_OPENGAUSS &&
+            ((uint64)(0x1 << SS_PRIMARY_ID) & g_instance.dms_cxt.SSReformInfo.bitmap_reconnect) == 0) {
+            return true;
+        } else if (g_instance.dms_cxt.SSReformInfo.reform_type == DMS_REFORM_TYPE_FOR_FULL_CLEAN) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SSGrantDSSWritePermission(void)
+{
+    while (dss_set_server_status_wrapper() != GS_SUCCESS) {
+        pg_usleep(REFORM_WAIT_LONG);
+        ereport(WARNING, (errmodule(MOD_DMS),
+            errmsg("Failed to set DSS as primary, vgname: \"%s\", socketpath: \"%s\"",
+                g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name,
+                g_instance.attr.attr_storage.dss_attr.ss_dss_conn_path),
+                errhint("Check vgname and socketpath and restart later.")));
+    }
+    ereport(LOG, (errmsg("set dss server status as primary")));
+}
+
+bool SSPrimaryRestartScenario()
+{
+    if (SS_IN_REFORM) {
+        if (g_instance.dms_cxt.SSReformInfo.reform_type == DMS_REFORM_TYPE_FOR_NORMAL_OPENGAUSS &&
+            ((uint64)(0x1 << SS_PRIMARY_ID) & g_instance.dms_cxt.SSReformInfo.bitmap_reconnect) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SSBackendNeedExitScenario()
+{
+    if (!SS_IN_REFORM) {
+        return false;
+    }
+
+    if (SSPerformingStandbyScenario() || SSPrimaryRestartScenario()) {
+        return false;
+    }
+    return true;
 }

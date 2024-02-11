@@ -100,6 +100,7 @@ typedef struct knl_instance_attr_dms {
     bool enable_catalog_centralized;
     bool enable_dss_aio;
     bool enable_verify_page;
+    bool enable_ondemand_realtime_build;
     bool enable_ondemand_recovery;
     int ondemand_recovery_mem_size;
     int instance_id;
@@ -124,6 +125,10 @@ typedef struct knl_instance_attr_dms {
     int32 sslog_backup_file_count;
     int32 sslog_max_file_size; //Unit:KB
     int parallel_thread_num;
+    int32 txnstatus_cache_size;
+    bool enable_bcast_snapshot;
+    char* work_thread_pool_attr;
+    int32 work_thread_pool_max_cnt;
 } knl_instance_attr_dms;
 
 typedef struct knl_instance_attr_storage {
@@ -206,11 +211,36 @@ typedef struct knl_instance_attr_storage {
     int max_logical_replication_workers;
     char *redo_bind_cpu_attr;
     int max_active_gtt;
+
+    /* extreme-rto standby read */
+    int base_page_saved_interval;
+    double standby_force_recycle_ratio;
+    int standby_recycle_interval;
+    int standby_max_query_time;
+    bool enable_exrto_standby_read_opt;
 #ifndef ENABLE_MULTIPLE_NODES
     bool enable_save_confirmed_lsn;
 #endif
     bool enable_huge_pages;
     int huge_page_size;
+    bool enable_time_report;
+    bool enable_batch_dispatch;
+    int parallel_recovery_timeout;
+    int parallel_recovery_batch;
+    bool ss_enable_dorado;
+    bool ss_stream_cluster;
+    
+    bool enable_uwal;
+    char* uwal_config;
+
+    int64 uwal_disk_size;
+    char* uwal_devices_path;
+    char* uwal_log_path;
+
+    bool uwal_rpc_compression_switch;
+    bool uwal_rpc_flowcontrol_switch;
+    int uwal_rpc_flowcontrol_value;
+    bool uwal_async_append_switch;
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */

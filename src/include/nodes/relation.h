@@ -25,6 +25,47 @@
 
 #include "optimizer/bucketinfo.h"
 
+#ifdef USE_SPQ
+/*
+ * ApplyShareInputContext is used in different stages of ShareInputScan
+ * processing. This is mostly used as working area during the stages, but
+ * some information is also carried through multiple stages.
+ */
+typedef struct ApplyShareInputContextPerShare {
+    int producer_slice_id;
+    Bitmapset *participant_slices;
+} ApplyShareInputContextPerShare;
+ 
+struct PlanSlice;
+struct Plan;
+ 
+typedef struct ApplyShareInputContext {
+    /* curr_rtable is used by all stages when traversing into subqueries */
+    List *curr_rtable;
+ 
+    /*
+     * Populated in dag_to_tree() (or collect_shareinput_producers() for ORCA),
+     * used in replace_shareinput_targetlists()
+     */
+    Plan **shared_plans;
+    int shared_input_count;
+ 
+    /*
+     * State for replace_shareinput_targetlists()
+     */
+    int *share_refcounts;
+    int share_refcounts_sz; /* allocated sized of 'share_refcounts' */
+ 
+    /*
+     * State for apply_sharinput_xslice() walkers.
+     */
+    PlanSlice *slices;                             /* root->glob->slices */
+    List *motStack;                                /* stack of motionIds leading to current node */
+    ApplyShareInputContextPerShare *shared_inputs; /* one for each share */
+    Bitmapset *qdShares;                           /* share_ids that are referenced from QD slices */
+} ApplyShareInputContext;
+#endif
+
 /*
  * Determines if query has to be launched
  * on Coordinators only (SEQUENCE DDL),
@@ -219,6 +260,9 @@ typedef struct PlannerGlobal {
 
     /* There is a counter attempt to get name for sublinks */
     int sublink_counter;
+#ifdef USE_SPQ
+    ApplyShareInputContext share;       /* workspace for GPDB plan sharing */
+#endif
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -293,6 +337,14 @@ typedef struct PlannerInfo {
      * been expanded.
      */
     RangeTblEntry** simple_rte_array; /* rangetable as an array */
+
+    /*
+     * append_rel_array is the same length as the above arrays, and holds
+     * pointers to the corresponding AppendRelInfo entry indexed by
+     * child_relid, or NULL if the rel is not an appendrel child.  The array
+     * itself is not allocated if append_rel_list is empty.
+     */
+    struct AppendRelInfo **append_rel_array;
 
     /*
      * all_baserels is a Relids set of all base relids (but not "other"
@@ -785,6 +837,7 @@ typedef struct RelOptInfo {
     List* joininfo;                  /* RestrictInfo structures for join clauses
                                       * involving this rel */
     bool has_eclass_joins;           /* T means joininfo is incomplete */
+    Relids top_parent_relids;        /* Relids of topmost parents (if "other"* rel) */
     RelOrientation orientation;      /* the store type of base rel */
     RelstoreType relStoreLocation;   /* the relation store location. */
     char locator_type;               /* the location type of base rel */

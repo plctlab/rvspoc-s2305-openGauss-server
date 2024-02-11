@@ -61,7 +61,7 @@
 #define XLogSegmentsNum(val) (((val) * XLogBaseSize + XLogSegSize - 1) / XLogSegSize)
 
 
-#define XLogPreReadSize 67108864 // 64MB
+#define XLogPreReadSize 4194304 // 4MB
 
 /* Compute XLogRecPtr with segment number and offset. */
 #define XLogSegNoOffsetToRecPtr(segno, offset, dest) \
@@ -109,6 +109,8 @@
 #define PG_LSN_XLOG_FLUSH_CHK_FILE "global/pg_lsnxlogflushchk"
 #define REDO_STATS_FILE             "redo.state"
 #define REDO_STATS_FILE_TMP         "redo.state.tmp"
+
+#define SS_DORADO_CTRL_FILE (g_instance.datadir_cxt.controlInfoPath)
 
 
 #define InvalidRepOriginId 0

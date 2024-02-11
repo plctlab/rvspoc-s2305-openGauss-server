@@ -143,6 +143,9 @@ extern bool CodeGenThreadObjectReady();
 extern void CodeGenThreadRuntimeCodeGenerate();
 extern void CodeGenThreadTearDown();
 extern bool anls_opt_is_on(AnalysisOpt dfx_opt);
+#ifdef USE_SPQ
+extern void build_backward_connection(PlannedStmt *planstmt);
+#endif
 
 /*
  * Note that GetUpdatedColumns() also exists in commands/trigger.c.  There does
@@ -173,22 +176,23 @@ static void report_iud_time(QueryDesc *query)
     }
 
     PlannedStmt *plannedstmt = query->plannedstmt;
-
-    foreach (lc, (List*)linitial(plannedstmt->resultRelations)) {
-        Index idx = lfirst_int(lc);
-        rid = getrelid(idx, plannedstmt->rtable);
-        if (OidIsValid(rid) == false || rid < FirstNormalObjectId) {
-            continue;
-        }
-        Relation rel = NULL;
-        rel = heap_open(rid, AccessShareLock);
-        if (rel->rd_rel->relkind == RELKIND_RELATION) {
-            if (rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT ||
-                rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED) {
-                pgstat_report_data_changed(rid, STATFLG_RELATION, rel->rd_rel->relisshared);
+    if (plannedstmt->resultRelations) {
+        foreach (lc, (List*)linitial(plannedstmt->resultRelations)) {
+            Index idx = lfirst_int(lc);
+            rid = getrelid(idx, plannedstmt->rtable);
+            if (OidIsValid(rid) == false || rid < FirstNormalObjectId) {
+                continue;
             }
+            Relation rel = NULL;
+            rel = heap_open(rid, AccessShareLock);
+            if (rel->rd_rel->relkind == RELKIND_RELATION) {
+                if (rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT ||
+                    rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED) {
+                    pgstat_report_data_changed(rid, STATFLG_RELATION, rel->rd_rel->relisshared);
+                }
+            }
+            heap_close(rel, AccessShareLock);
         }
-        heap_close(rel, AccessShareLock);
     }
 }
 
@@ -274,7 +278,9 @@ void standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
     }
 
 #ifndef ENABLE_MULTIPLE_NODES
-    (void)InitStreamObject(queryDesc->plannedstmt);
+    if (!IS_SPQ_COORDINATOR) {
+        (void)InitStreamObject(queryDesc->plannedstmt);
+    }
 #endif
 
     if (StreamTopConsumerAmI() && queryDesc->instrument_options != 0 && IS_PGXC_DATANODE) {
@@ -319,6 +325,13 @@ void standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
         estate->es_param_exec_vals =
             (ParamExecData *)palloc0(queryDesc->plannedstmt->nParamExec * sizeof(ParamExecData));
     }
+
+#ifdef USE_SPQ
+    estate->es_sharenode = nullptr;
+    if (IS_SPQ_EXECUTOR && StreamTopConsumerAmI()) {
+        build_backward_connection(queryDesc->plannedstmt);
+    }
+#endif
 
     /*
      * If non-read-only query, set the command ID to mark output tuples with
@@ -456,6 +469,7 @@ void ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count)
     if (u_sess->SPI_cxt._connected >= 0) {
         u_sess->pcache_cxt.cur_stmt_name = NULL;
     }
+    instr_stmt_report_query_plan(queryDesc);
     exec_explain_plan(queryDesc);
     if (u_sess->attr.attr_resource.use_workload_manager &&
         u_sess->attr.attr_resource.resource_track_level == RESOURCE_TRACK_OPERATOR && 
@@ -517,7 +531,6 @@ void ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count)
         }
     }
     print_duration(queryDesc);
-    instr_stmt_report_query_plan(queryDesc);
     instr_stmt_report_cause_type(queryDesc->plannedstmt->cause_type);
 
     /* sql active feature, opeartor history statistics */
@@ -1416,26 +1429,30 @@ void InitPlan(QueryDesc *queryDesc, int eflags)
         estate->dataDestRelIndex = plannedstmt->dataDestRelIndex;
     }
 
+    /* deprecated: explain_info_hashtbl/collected_info_hashtbl
+     * set false disable data insertion into the hash table.
+     * deprecated function: 
+     * - pg_stat_get_wlm_realtime_operator_info
+     * - pg_stat_get_wlm_realtime_ec_operator_info
+     * - pg_stat_get_wlm_ec_operator_info
+     * - gs_stat_get_wlm_plan_operator_info
+     * - pg_stat_get_wlm_operator_info
+     * */
     estate->es_can_realtime_statistics = false;
     estate->es_can_history_statistics = false;
 
     if (u_sess->attr.attr_resource.use_workload_manager &&
         u_sess->attr.attr_resource.resource_track_level == RESOURCE_TRACK_OPERATOR && !IsInitdb) {
-        int max_plan_id = plannedstmt->num_plannodes;
         int current_realtime_num = hash_get_num_entries(g_operator_table.explain_info_hashtbl);
-        if (current_realtime_num + max_plan_id < g_operator_table.max_realtime_num) {
-            /* too many collect info now, ignore this time. */
-            estate->es_can_realtime_statistics = true;
-        } else {
+        if (current_realtime_num != 0) {
+            /* unreached branch */
             ereport(LOG, (errmsg("Too many realtime info in the memory, current realtime record num is %d.",
-                current_realtime_num)));
+                                 current_realtime_num)));
         }
 
         int current_collectinfo_num = hash_get_num_entries(g_operator_table.collected_info_hashtbl);
-        if (current_collectinfo_num + max_plan_id <= g_operator_table.max_collectinfo_num) {
-            /* too many collect info now, ignore this time. */
-            estate->es_can_history_statistics = true;
-        } else {
+        if (current_collectinfo_num != 0) {
+            /* unreached branch */
             ereport(LOG, (errmsg("Too many history info in the memory, current history record num is %d.",
                 current_collectinfo_num)));
         }
@@ -1500,7 +1517,8 @@ void InitPlan(QueryDesc *queryDesc, int eflags)
 #ifdef ENABLE_MULTIPLE_NODES
             (IS_PGXC_COORDINATOR && list_nth_int(plannedstmt->subplan_ids, i - 1) != 0) ||
 #else
-            (StreamTopConsumerAmI() && list_nth_int(plannedstmt->subplan_ids, i - 1) != 0) ||
+            (!IS_SPQ_RUNNING && StreamTopConsumerAmI() && list_nth_int(plannedstmt->subplan_ids, i - 1) != 0) ||
+            (IS_SPQ_COORDINATOR && list_nth_int(plannedstmt->subplan_ids, i - 1) != 0) ||
 #endif
             plannedstmt->planTree->plan_node_id == list_nth_int(plannedstmt->subplan_ids, i - 1))) {
             estate->es_under_subplan = true;
@@ -1827,6 +1845,9 @@ void InitResultRelInfo(ResultRelInfo *resultRelInfo, Relation resultRelationDesc
     resultRelInfo->ri_projectReturning = NULL;
     resultRelInfo->ri_mergeTargetRTI = 0;
     resultRelInfo->ri_mergeState = (MergeState *)palloc0(sizeof(MergeState));
+#ifdef USE_SPQ
+    resultRelInfo->ri_actionAttno = InvalidAttrNumber;
+#endif
 }
 
 /*
@@ -2172,6 +2193,9 @@ static void ExecutePlan(EState *estate, PlanState *planstate, CmdType operation,
 #ifdef ENABLE_MOT
     bool motFinishedExecution = false;
 #endif
+    /* set the flag to false, prepare to record */
+    u_sess->storage_cxt.is_in_pre_read = false;
+    u_sess->storage_cxt.bulk_read_count = 0;
 
     /* Mark sync-up step is required */
     if (unlikely(NeedSyncUpProducerStep(planstate->plan))) {
@@ -2192,7 +2216,7 @@ static void ExecutePlan(EState *estate, PlanState *planstate, CmdType operation,
      */
     estate->es_direction = direction;
 
-    if (IS_PGXC_DATANODE) {
+    if (!IS_SPQ_COORDINATOR && IS_PGXC_DATANODE) {
         /* Collect Material for Subplan first */
         ExecCollectMaterialForSubplan(estate);
 
@@ -2297,8 +2321,8 @@ static void ExecutePlan(EState *estate, PlanState *planstate, CmdType operation,
             slot = ExecFilterJunk(estate->es_junkFilter, slot);
         }
 
-#ifdef ENABLE_MULTIPLE_NDOES
-        if (stream_instrument) {
+#if defined(ENABLE_MULTIPLE_NDOES) || defined(USE_SPQ)
+        if (t_thrd.spq_ctx.spq_role != ROLE_UTILITY && stream_instrument) {
             t_thrd.pgxc_cxt.GlobalNetInstr = planstate->instrument;
         }
 #endif
@@ -2336,6 +2360,14 @@ static void ExecutePlan(EState *estate, PlanState *planstate, CmdType operation,
         if (numberTuples == current_tuple_count) {
             break;
         }
+    }
+
+    /* end of plan, we should flush the record for pre-read process */
+    if (u_sess->storage_cxt.is_in_pre_read) {
+        /* it's useless to record the record for last time, because it will be mod of the blocks */
+        int minValue = u_sess->storage_cxt.bulk_read_max == 1 ? 1 : u_sess->storage_cxt.bulk_read_min;
+        ereport(LOG, (errmsg("End of pre-Read, the max blocks batch is %d, the small blocks batch is %d.",
+                u_sess->storage_cxt.bulk_read_max, minValue)));
     }
 
     /*
@@ -3937,11 +3969,11 @@ void EvalPlanQualEnd(EPQState *epqstate)
     epqstate->origslot = NULL;
 }
 
-TupleTableSlot* FetchPlanSlot(PlanState* subPlanState, ProjectionInfo** projInfos)
+TupleTableSlot* FetchPlanSlot(PlanState* subPlanState, ProjectionInfo** projInfos, bool isinherit)
 {
     int result_rel_index = subPlanState->state->result_rel_index;
 
-    if (result_rel_index > 0) {
+    if (result_rel_index > 0 && !isinherit) {
         return ExecProject(projInfos[result_rel_index], NULL);
     } else {
         return ExecProcNode(subPlanState);

@@ -74,6 +74,7 @@
 #include "utils/evp_cipher.h"
 #include "replication/walsender_private.h"
 #include "replication/walsender.h"
+#include "replication/ss_disaster_cluster.h"
 #include "workload/workload.h"
 #include "utils/builtins.h"
 #include "catalog/pg_namespace.h"
@@ -129,9 +130,7 @@ static int ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
 static bool ReadBuffer_common_ReadBlock(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
     BlockNumber blockNum, ReadBufferMode mode, bool isExtend, Block bufBlock, const XLogPhyBlock *pblk,
     bool *need_repair);
-static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
-    ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk);
-static void TerminateBufferIO_common(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
+
 
 /*
  * Ensure that the the PrivateRefCountArray has sufficient space to store one
@@ -349,10 +348,8 @@ void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 }
 
 static void BufferSync(int flags);
-static void TerminateBufferIO_common(BufferDesc* buf, bool clear_dirty, uint32 set_flag_bits);
+static void TerminateBufferIO_common(BufferDesc* buf, bool clear_dirty, uint64 set_flag_bits);
 void shared_buffer_write_error_callback(void* arg);
-static BufferDesc* BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
-                               BufferAccessStrategy strategy, bool* foundPtr, const XLogPhyBlock *pblk);
 
 static int rnode_comparator(const void* p1, const void* p2);
 
@@ -454,7 +451,7 @@ void PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
  */
 static bool ConditionalStartBufferIO(BufferDesc *buf, bool for_input)
 {
-    uint32 buf_state;
+    uint64 buf_state;
 
     /*
      * Grab the io_in_progress lock so that other processes can wait for
@@ -487,7 +484,7 @@ static bool ConditionalStartBufferIO(BufferDesc *buf, bool for_input)
      * At this point, there is no I/O active on this buffer
      * We are holding the BufHdr lock and the io_in_progress_lock.
      */
-    buf_state = pg_atomic_read_u32(&buf->state);
+    buf_state = pg_atomic_read_u64(&buf->state);
     if (for_input ? (buf_state & BM_VALID) : !(buf_state & BM_DIRTY)) {
         /* Another thread already did the I/O */
         UnlockBufHdr(buf, buf_state);
@@ -560,8 +557,8 @@ static volatile BufferDesc *PageListBufferAlloc(SMgrRelation smgr, char relpersi
     BufferTag old_tag;                 /* previous identity of buffer */
     uint32 old_hash;                   /* hash value for oldTag */
     LWLock *old_partition_lock = NULL; /* buffer partition lock for it */
-    uint32 old_flags;
-    uint32 buf_state;
+    uint64 old_flags;
+    uint64 buf_state;
 
     /* create a tag so we can lookup the buffer */
     INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
@@ -943,7 +940,7 @@ void PageListPrefetch(Relation reln, ForkNumber fork_num, BlockNumber *block_lis
          * are NOT valid.  For a shared buffer the IO_IN_PROGRESS
          * flag is set.
          */
-        Assert(!(pg_atomic_read_u32(&buf_desc->state) & BM_VALID)); /* spinlock not needed */
+        Assert(!(pg_atomic_read_u64(&buf_desc->state) & BM_VALID)); /* spinlock not needed */
 
         buf_block = is_local_buf ? LocalBufHdrGetBlock(buf_desc) : BufHdrGetBlock(buf_desc);
 
@@ -1161,7 +1158,7 @@ void PageListBackWrite(uint32 *buf_list, int32 nbufs, uint32 flags = 0, SMgrRela
             XLogRecPtr recptr;
             SMgrRelation smgrReln;
             BufferDesc *bufHdr = NULL;
-            uint32 buf_state;
+            uint64 buf_state;
 
             t_thrd.storage_cxt.InProgressAioBuf = NULL;
 
@@ -1579,13 +1576,13 @@ void AsyncUnpinBuffer(volatile void *buf_desc, bool forget_buffer)
  */
 void AsyncCompltrPinBuffer(volatile void *buf_desc)
 {
-    uint32 buf_state;
+    uint64 buf_state;
     BufferDesc *buf = (BufferDesc *)buf_desc;
 
     buf_state = LockBufHdr(buf);
 
     /* Increment the shared reference count */
-    buf_state += BUF_REFCOUNT_ONE;
+    buf_state = __sync_fetch_and_add(&buf->state, 1);
 
     UnlockBufHdr(buf, buf_state);
 }
@@ -1598,14 +1595,14 @@ void AsyncCompltrPinBuffer(volatile void *buf_desc)
  */
 void AsyncCompltrUnpinBuffer(volatile void *buf_desc)
 {
-    uint32 buf_state;
+    uint64 buf_state;
     BufferDesc *buf = (BufferDesc *)buf_desc;
 
     buf_state = LockBufHdr(buf);
 
     /* Decrement the shared reference count */
     Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-    buf_state -= BUF_REFCOUNT_ONE;
+    buf_state -= 1;
 
     /* Support the function LockBufferForCleanup() */
     if ((buf_state & BM_PIN_COUNT_WAITER) && BUF_STATE_GET_REFCOUNT(buf_state) == 1) {
@@ -1613,10 +1610,13 @@ void AsyncCompltrUnpinBuffer(volatile void *buf_desc)
         ThreadId wait_backend_pid = buf->wait_backend_pid;
 
         buf_state &= ~BM_PIN_COUNT_WAITER;
+        __sync_add_and_fetch(&buf->state, -1);
         UnlockBufHdr(buf, buf_state);
         ProcSendSignal(wait_backend_pid);
-    } else
+    } else {
+        buf_state = __sync_add_and_fetch(&buf->state, -1);
         UnlockBufHdr(buf, buf_state);
+    }
 }
 
 /*
@@ -1629,6 +1629,118 @@ void AsyncCompltrUnpinBuffer(volatile void *buf_desc)
 Buffer ReadBuffer(Relation reln, BlockNumber block_num)
 {
     return ReadBufferExtended(reln, MAIN_FORKNUM, block_num, RBM_NORMAL, NULL);
+}
+
+Buffer MultiReadBufferExtend(Relation reln, ForkNumber fork_num, BlockNumber block_num, ReadBufferMode mode,
+                                     BufferAccessStrategy strategy, int maxBulkCount, bool isVacuum)
+{
+    bool hit;
+    Buffer buf;
+    char* bufRead;
+    int paramNum = 0;
+    MemoryContext* memCxt = NULL;
+    MemoryContext oldContext;
+
+    if (block_num == P_NEW) {
+        STORAGE_SPACE_OPERATION(reln, BLCKSZ);
+    }
+
+    RelationOpenSmgr(reln);
+    if (RELATION_IS_OTHER_TEMP(reln) && fork_num <= INIT_FORKNUM) {
+        /* We would be likely to get wrong data since we have no visibility into the owning session's local buffers. */
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot access temporary tables of other sessions")));
+    }
+
+    /* Read the buffer. */
+    pgstat_count_buffer_read(reln);
+    pgstatCountBlocksFetched4SessionLevel();
+
+    if (RelationisEncryptEnable(reln)) {
+        reln->rd_smgr->encrypt = true;
+    }
+     /*
+      * We will charge what parms we will use by isVacuum.
+      * Two Branch is same, we will check cxt and bulk_buf.
+      */
+    paramNum = isVacuum ? u_sess->attr.attr_storage.vacuum_bulk_read_size : u_sess->attr.attr_storage.heap_bulk_read_size;
+    if (u_sess->pre_read_mem_cxt == NULL) {
+        u_sess->pre_read_mem_cxt = AllocSetContextCreate(
+                u_sess->top_mem_cxt, "Memory Context for pre-read and pre-extend", ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+        oldContext = MemoryContextSwitchTo(u_sess->pre_read_mem_cxt);
+        /*
+         * Due to vacuum_bulk_read_size can be writed into postgres.conf,
+         * we should try to load max_vacuum_bulk_read_size at first.
+         */
+        u_sess->storage_cxt.max_vacuum_bulk_read_size = Max(u_sess->storage_cxt.max_vacuum_bulk_read_size, 
+            u_sess->attr.attr_storage.vacuum_bulk_read_size);
+
+        u_sess->storage_cxt.bulk_buf_vacuum = (char*)palloc(u_sess->storage_cxt.max_vacuum_bulk_read_size * BLCKSZ);
+        u_sess->storage_cxt.bulk_buf_read = (char*)palloc(u_sess->storage_cxt.max_heap_bulk_read_size * BLCKSZ);
+        (void) MemoryContextSwitchTo(oldContext);
+    }
+
+    bufRead = isVacuum ? u_sess->storage_cxt.bulk_buf_vacuum : u_sess->storage_cxt.bulk_buf_read;
+    buf = MultiBulkReadBufferCommon(reln->rd_smgr, reln->rd_rel->relpersistence, fork_num, block_num, mode, strategy, &hit, maxBulkCount, NULL, paramNum, bufRead);
+    
+    if (hit) {
+        /* Update pgstat counters to reflect a cache hit */
+        pgstat_count_buffer_hit(reln);
+        u_sess->storage_cxt.bulk_read_count++;
+    } else if (u_sess->storage_cxt.is_in_pre_read) {
+        /* if not first to unhit, need to record */
+        u_sess->storage_cxt.bulk_read_max = Max(u_sess->storage_cxt.bulk_read_count + 1, u_sess->storage_cxt.bulk_read_max);
+        u_sess->storage_cxt.bulk_read_min = Min(u_sess->storage_cxt.bulk_read_count + 1, u_sess->storage_cxt.bulk_read_min);
+        u_sess->storage_cxt.bulk_read_count = 0;
+    } else {
+        /* if first time to unhit, it is normal to start */
+        u_sess->storage_cxt.is_in_pre_read = true;
+        u_sess->storage_cxt.bulk_read_max = 1;
+        u_sess->storage_cxt.bulk_read_min = MAX_BULK_IO_SIZE + 1;
+    }
+    return buf;
+
+}
+
+Buffer buffer_read_extended_internal(Relation reln, ForkNumber fork_num, BlockNumber block_num, ReadBufferMode mode,
+                                     BufferAccessStrategy strategy)
+{
+    bool hit = false;
+    Buffer buf;
+
+    if (block_num == P_NEW) {
+        STORAGE_SPACE_OPERATION(reln, BLCKSZ);
+    }
+
+    /* Open it at the smgr level */
+    RelationOpenSmgr(reln);
+
+    /*
+     * * Test for a temporary relation that belongs to some other session.
+     */
+    if (RELATION_IS_OTHER_TEMP(reln) && fork_num <= INIT_FORKNUM)
+        /*
+         * We would be likely to get wrong data since we have no visibility into the owning session's local buffers.
+         */
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot access temporary tables of other sessions")));
+
+    /*
+     * Read the buffer.
+     */
+    pgstat_count_buffer_read(reln);
+    pgstatCountBlocksFetched4SessionLevel();
+
+    if (RelationisEncryptEnable(reln)) {
+        reln->rd_smgr->encrypt = true;
+    }
+    buf =
+        ReadBuffer_common(reln->rd_smgr, reln->rd_rel->relpersistence, fork_num, block_num, mode, strategy, &hit, NULL);
+    if (hit) {
+        /* Update pgstat counters to reflect a cache hit */
+        pgstat_count_buffer_hit(reln);
+    }
+    return buf;
 }
 
 /*
@@ -1675,42 +1787,14 @@ Buffer ReadBuffer(Relation reln, BlockNumber block_num)
  */
 Buffer ReadBufferExtended(Relation reln, ForkNumber fork_num, BlockNumber block_num, ReadBufferMode mode,
                           BufferAccessStrategy strategy)
-{
-    bool hit = false;
-    Buffer buf;
-
-    if (block_num == P_NEW) {
-        STORAGE_SPACE_OPERATION(reln, BLCKSZ);
+{   
+    /* In ss replication dorado cluster mode, it is not supported that standby read in extreme rto. */
+    if (IsDefaultExtremeRtoMode() && RecoveryInProgress() && IsExtremeRtoRunning() && is_exrto_standby_read_worker() &&
+        !SS_DISASTER_STANDBY_CLUSTER) {
+        return standby_read_buf(reln, fork_num, block_num, mode, strategy);
+    } else {
+        return buffer_read_extended_internal(reln, fork_num, block_num, mode, strategy);
     }
-
-    /* Open it at the smgr level if not already done */
-    RelationOpenSmgr(reln);
-
-    /*
-     * Reject attempts to read non-local temporary relations; we would be
-     * likely to get wrong data since we have no visibility into the owning
-     * session's local buffers.
-     */
-    if (RELATION_IS_OTHER_TEMP(reln) && fork_num <= INIT_FORKNUM)
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot access temporary tables of other sessions")));
-
-    /*
-     * Read the buffer, and update pgstat counters to reflect a cache hit or
-     * miss.
-     */
-    pgstat_count_buffer_read(reln);
-    pgstatCountBlocksFetched4SessionLevel();
-
-    if (RelationisEncryptEnable(reln)) {
-        reln->rd_smgr->encrypt = true;
-    }
-    buf = ReadBuffer_common(reln->rd_smgr, reln->rd_rel->relpersistence, fork_num,
-                            block_num, mode, strategy, &hit, NULL);
-    if (hit) {
-        pgstat_count_buffer_hit(reln);
-    }
-    return buf;
 }
 
 /*
@@ -1874,11 +1958,11 @@ Buffer ReadBuffer_common_for_localbuf(RelFileNode rnode, char relpersistence, Fo
          */
 
         /* Only need to adjust flags */
-        uint32 buf_state = pg_atomic_read_u32(&bufHdr->state);
+        uint64 buf_state = pg_atomic_read_u64(&bufHdr->state);
 
         Assert(buf_state & BM_VALID);
         buf_state &= ~BM_VALID;
-        pg_atomic_write_u32(&bufHdr->state, buf_state);
+        pg_atomic_write_u32(((volatile uint32 *)&bufHdr->state) + 1, buf_state >> 32);
     }
 
     /*
@@ -1893,16 +1977,16 @@ Buffer ReadBuffer_common_for_localbuf(RelFileNode rnode, char relpersistence, Fo
      * it's not been recycled) but come right back here to try smgrextend
      * again.
      */
-    Assert(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID)); /* spinlock not needed */
+    Assert(!(pg_atomic_read_u64(&bufHdr->state) & BM_VALID)); /* spinlock not needed */
 
     bufBlock = LocalBufHdrGetBlock(bufHdr);
 
     (void)ReadBuffer_common_ReadBlock(smgr, relpersistence, forkNum, blockNum, mode,
                                       isExtend, bufBlock, NULL, &need_reapir);
 
-    uint32 buf_state = pg_atomic_read_u32(&bufHdr->state);
+    uint64 buf_state = pg_atomic_read_u64(&bufHdr->state);
     buf_state |= BM_VALID;
-    pg_atomic_write_u32(&bufHdr->state, buf_state);
+    pg_atomic_write_u32(((volatile uint32 *)&bufHdr->state) + 1, buf_state >> 32);
 
     return BufferDescriptorGetBuffer(bufHdr);
 }
@@ -2105,6 +2189,14 @@ static bool ReadBuffer_common_ReadBlock(SMgrRelation smgr, char relpersistence, 
         }
     }
 
+    if (ENABLE_DMS) {
+        Buffer buf = BlockGetBuffer((char *)bufBlock);
+        dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(buf - 1);
+        if (buf_ctrl->lock_mode == DMS_LOCK_NULL) {
+            ereport(PANIC, (errmsg("It seemd read buffer not across DMS!")));
+        }
+    }
+
     return needputtodirty;
 }
 
@@ -2157,7 +2249,7 @@ Buffer ReadBuffer_common_for_dms(ReadBufferMode readmode, BufferDesc* buf_desc, 
 
 #ifdef USE_ASSERT_CHECKING
     bool need_verify = (!RecoveryInProgress() && !SS_IN_ONDEMAND_RECOVERY &&
-        ((pg_atomic_read_u32(&buf_desc->state) & BM_VALID) != 0) && ENABLE_VERIFY_PAGE_VERSION);
+        ((pg_atomic_read_u64(&buf_desc->state) & BM_VALID) != 0) && ENABLE_VERIFY_PAGE_VERSION);
     char *past_image = NULL;
     if (need_verify) {
         past_image = (char *)palloc(BLCKSZ);
@@ -2222,12 +2314,226 @@ static inline void BufferDescSetPBLK(BufferDesc *buf, const XLogPhyBlock *pblk)
     }
 }
 
+/* 
+ * 
+ * MultiBulkReadBufferCommon
+ * This function is prepared for pre-read, and it cant be use to allocate new buffer
+ */
+Buffer MultiBulkReadBufferCommon(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber firstBlockNum,
+                                ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, int maxBulkCount, const XLogPhyBlock *pblk, int paramNum, char* bufRead)
+{
+    BufferDesc *bufHdr = NULL;
+    BufferDesc *firstBufHdr = NULL;
+    char* buf_read = NULL;
+    Block bufBlock;
+    int index = 0;
+    int actual_bulk_count = 0;
+    int remaining_lwlock = 0;
+    bool found = false;
+    bool isLocalBuf = SmgrIsTemp(smgr);
+    MemoryContext oldContext;
+    bool* check_fail;
+
+    *hit = false;
+
+    maxBulkCount = Min(paramNum, maxBulkCount);
+
+    if (firstBlockNum == P_NEW || maxBulkCount <= 1 || mode != RBM_NORMAL || IsSegmentFileNode(smgr->smgr_rnode.node) 
+        || IS_COMPRESSED_MAINFORK(smgr, forkNum) || ENABLE_DSS) {
+        /* If dont have qualify to pre-read (PS: including DSS)*/
+        return ReadBuffer_common(smgr, relpersistence, forkNum, firstBlockNum, mode, strategy, hit, pblk);
+    }
+    /* Formmer BufferAlloc and TerimateIO cant satisfied this condition，so we must use more array */
+    Assert(!u_sess->storage_cxt.bulk_io_is_in_progress);
+    Assert(u_sess->storage_cxt.bulk_io_in_progress_count == 0);
+
+    u_sess->storage_cxt.bulk_io_is_in_progress = true;
+
+    /* Allocate Memory Context for arrays once */
+    /* If bulk_io_in_progress_buf is not NULL, it means we have mem_cxt already */
+    if (u_sess->storage_cxt.bulk_io_in_progress_buf == NULL) {
+        /* The first switch is to create the bulk buf for record buffer reading */
+        oldContext = MemoryContextSwitchTo(u_sess->pre_read_mem_cxt);
+        u_sess->storage_cxt.bulk_io_in_progress_buf = (BufferDesc**)palloc(MAX_BULK_IO_SIZE * sizeof(u_sess->storage_cxt.bulk_io_in_progress_buf[0]));
+        u_sess->storage_cxt.bulk_io_is_for_input = (bool*)palloc(MAX_BULK_IO_SIZE * sizeof(u_sess->storage_cxt.bulk_io_is_for_input[0]));
+        (void) MemoryContextSwitchTo(oldContext);
+        Assert(u_sess->storage_cxt.bulk_io_is_for_input != NULL);
+    } 
+
+    *hit = false;
+    /* Make sure we will have room to remember the buffer pin */
+    ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);   
+    /* IO compand operation */
+
+    TRACE_POSTGRESQL_BUFFER_READ_START(forkNum, firstBlockNum, smgr->smgr_rnode.node.spcNode, smgr->smgr_rnode.node.dbNode,
+                                       smgr->smgr_rnode.node.relNode, smgr->smgr_rnode.backend, false);
+
+    if (isLocalBuf) {
+        bufHdr = LocalBufferAlloc(smgr, forkNum, firstBlockNum, &found);
+        if (found) {
+            u_sess->instr_cxt.pg_buffer_usage->local_blks_hit++;
+        } else {
+            u_sess->instr_cxt.pg_buffer_usage->local_blks_read++;
+            pgstatCountLocalBlocksRead4SessionLevel();
+        }
+    } else {
+        /*
+         * lookup the buffer.  IO_IN_PROGRESS is set if the requested block is
+         * not currently in memory.
+         */
+        bufHdr = BufferAlloc(smgr->smgr_rnode.node, relpersistence, forkNum, firstBlockNum, strategy, &found, pblk);
+        if (g_instance.attr.attr_security.enable_tde && IS_PGXC_DATANODE) {
+            bufHdr->extra->encrypt = smgr->encrypt ? true : false; 
+        }
+        if (found) {
+            u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit++;
+        } else {
+            u_sess->instr_cxt.pg_buffer_usage->shared_blks_read++;
+            pgstatCountSharedBlocksRead4SessionLevel();
+        }
+    }
+found_branch:
+    if (found) {
+        *hit = true;
+        t_thrd.vacuum_cxt.VacuumPageHit++;
+
+        if (t_thrd.vacuum_cxt.VacuumCostActive)
+            t_thrd.vacuum_cxt.VacuumCostBalance += u_sess->attr.attr_storage.VacuumCostPageHit;
+
+        TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, firstBlockNum, smgr->smgr_rnode.node.spcNode,
+                                          smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode,
+                                          smgr->smgr_rnode.backend, isExtend, found);
+        /*
+         * Mode cannot be RBM_ZERO_AND_CLEANUP_LOCK/RBM_ZERO_AND_LOCK here.
+         * So, "In RBM_ZERO_AND_LOCK mode the caller expects the page to
+         * be locked on return." can be ignored.
+         */
+        if (!isLocalBuf && t_thrd.role != PAGEREDO && SS_ONDEMAND_BUILD_DONE && SS_PRIMARY_MODE) {
+            /* Mode cannot be RBM_ZERO_AND_CLEANUP_LOCK/RBM_ZERO_AND_LOCK here */
+            bufHdr = RedoForOndemandExtremeRTOQuery(bufHdr, relpersistence, forkNum, firstBlockNum, mode);
+        }
+        u_sess->storage_cxt.bulk_io_is_in_progress = false;
+        return BufferDescriptorGetBuffer(bufHdr);
+    }
+    /* If we must read buffers from disk right now. */
+    Assert(!(pg_atomic_read_u64(&bufHdr->state) & BM_VALID)); /* spinlock not needed */
+    Assert(u_sess->storage_cxt.bulk_io_in_progress_count == 1);
+    Assert(u_sess->storage_cxt.bulk_io_in_progress_buf[u_sess->storage_cxt.bulk_io_in_progress_count - 1] == bufHdr);
+
+    /* The first buffer Desc for return */
+    firstBufHdr =bufHdr;
+
+    /* We should caculate the max-blocks again, MAX_SIMUL_LWLOCKS is 4224 */
+    maxBulkCount = Min(maxBulkCount, (BlockNumber) RELSEG_SIZE - (firstBlockNum % (BlockNumber) RELSEG_SIZE));
+    remaining_lwlock = MAX_SIMUL_LWLOCKS - t_thrd.storage_cxt.num_held_lwlocks;
+    maxBulkCount = Min(remaining_lwlock, maxBulkCount);
+
+    /* We start to allocate buffers array for preparing reading */
+    for (index = 1; index < maxBulkCount; index++) {
+        BlockNumber blockNum = firstBlockNum + index;
+        ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
+        if (isLocalBuf) {
+            bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, &found);
+        } else {
+            bufHdr = BufferAlloc(smgr->smgr_rnode.node, relpersistence, forkNum, blockNum, strategy, &found, pblk);
+            if (g_instance.attr.attr_security.enable_tde && IS_PGXC_DATANODE) {
+                bufHdr->extra->encrypt = smgr->encrypt ? true : false; /* set tde flag */
+            }
+        }
+        if(found) {
+            /* If we found a needed block, we should stop pre-read right now */
+            ReleaseBuffer(BufferDescriptorGetBuffer(bufHdr));
+            break;
+        }
+        Assert(!(pg_atomic_read_u64(&bufHdr->state) & BM_VALID));   /* spinlock not needed */
+    }
+
+    Assert(index == u_sess->storage_cxt.bulk_io_in_progress_count);
+
+    /* The numbers of blocks we really need to pre-read */
+    actual_bulk_count = u_sess->storage_cxt.bulk_io_in_progress_count;
+
+    if (actual_bulk_count == 1) {
+        buf_read = isLocalBuf ? (char*)LocalBufHdrGetBlock(firstBufHdr) : (char*)BufHdrGetBlock(firstBufHdr);
+    } else {
+        buf_read = bufRead;
+    }
+    
+    /* Bulk-read function, read a batch of pages from disk */
+    smgrbulkread(smgr, forkNum, firstBlockNum, actual_bulk_count, buf_read);
+    
+    /* We start to get blocks from buf_read one by one */
+    for (index = 0; index < actual_bulk_count; index++) {
+        BlockNumber blockNum = firstBlockNum + index;
+        bufBlock = (Block)(buf_read + index * BLCKSZ);
+
+        /* If the page is not legal, it always occurs by CRC error */
+        if (!PageIsVerified((Page)bufBlock, blockNum)) {
+            u_sess->storage_cxt.bulk_io_error_count++;
+            if (u_sess->attr.attr_security.zero_damaged_pages) {
+                ereport(WARNING, (errcode(ERRCODE_DATA_CORRUPTED),
+                                  errmsg("invalid page in block %u of relation %s; zeroing out page", blockNum,
+                                         relpath(smgr->smgr_rnode, forkNum)),
+                                  handle_in_client(true)));
+                MemSet((char *)bufBlock, 0, BLCKSZ);
+            } else {
+                ereport(ERROR,
+                            (errcode(ERRCODE_DATA_CORRUPTED),
+                             errmsg("invalid page in block %u of relation %s",
+                                    blockNum,
+                                    relpath(smgr->smgr_rnode, forkNum))));
+            }
+        } else {
+            PageDataDecryptIfNeed((Page)bufBlock);
+        }
+    }
+
+    /* We will fill blocks in buffers one by one */
+    for (index = actual_bulk_count -1; index >= 0; index--) {
+        bufHdr = u_sess->storage_cxt.bulk_io_in_progress_buf[index];
+
+        bufBlock = isLocalBuf ? LocalBufHdrGetBlock(bufHdr) : BufHdrGetBlock(bufHdr);
+        if (actual_bulk_count != 1) {
+            memcpy((char *)bufBlock, buf_read + index * BLCKSZ, BLCKSZ);
+        }
+
+        /* Attension, in local buffer, we do bulk_io_in_progress_count-- directly*/
+        if (isLocalBuf) {
+            uint64 buf_state = pg_atomic_read_u64(&bufHdr->state);
+            buf_state |= BM_VALID;
+            pg_atomic_write_u64(&bufHdr->state, buf_state);
+            u_sess->storage_cxt.bulk_io_in_progress_count--;
+        } else {
+            TerminateBufferIO(bufHdr, false, BM_VALID);
+        }
+
+        /* important: buffers except firstBlockNum should release pin */
+        if (index != 0) {
+            ReleaseBuffer(BufferDescriptorGetBuffer(bufHdr));
+        }
+
+        t_thrd.vacuum_cxt.VacuumPageMiss++;
+        if (t_thrd.vacuum_cxt.VacuumCostActive) {
+            t_thrd.vacuum_cxt.VacuumCostBalance += u_sess->attr.attr_storage.VacuumCostPageMiss; 
+        }
+    }
+    TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, firstBlockNum, smgr->smgr_rnode.node.spcNode, smgr->smgr_rnode.node.dbNode,
+                                      smgr->smgr_rnode.node.relNode, smgr->smgr_rnode.backend, isExtend, found);
+
+    /*  We will record the number we really done */
+    u_sess->storage_cxt.bulk_io_count += actual_bulk_count;
+    u_sess->storage_cxt.bulk_io_is_in_progress = false;
+    Assert(!u_sess->storage_cxt.bulk_io_is_in_progress);
+    Assert(u_sess->storage_cxt.bulk_io_in_progress_count == 0);
+    return BufferDescriptorGetBuffer(firstBufHdr);
+}
+
 /*
  * ReadBuffer_common -- common logic for all ReadBuffer variants
  *
  * *hit is set to true if the request was satisfied from shared buffer cache.
  */
-static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
+Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
                                 ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk)
 {
     BufferDesc *bufHdr = NULL;
@@ -2236,6 +2542,7 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
     bool isExtend = false;
     bool isLocalBuf = SmgrIsTemp(smgr);
     bool need_repair = false;
+    dms_buf_ctrl_t *buf_ctrl = NULL;
 
     *hit = false;
 
@@ -2243,6 +2550,13 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
     ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
 
     isExtend = (blockNum == P_NEW);
+
+    if (!ENABLE_DMS && IsSegmentFileNode(smgr->smgr_rnode.node) && RecoveryInProgress() &&
+        !t_thrd.xlog_cxt.InRecovery) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("bucket and undo segment standby read is not yet supported.")));
+    }
 
     TRACE_POSTGRESQL_BUFFER_READ_START(forkNum, blockNum, smgr->smgr_rnode.node.spcNode, smgr->smgr_rnode.node.dbNode,
                                        smgr->smgr_rnode.node.relNode, smgr->smgr_rnode.backend, isExtend);
@@ -2288,7 +2602,7 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
          * lookup the buffer.  IO_IN_PROGRESS is set if the requested block is
          * not currently in memory.
          */
-        bufHdr = BufferAlloc(smgr, relpersistence, forkNum, blockNum, strategy, &found, pblk);
+        bufHdr = BufferAlloc(smgr->smgr_rnode.node, relpersistence, forkNum, blockNum, strategy, &found, pblk);
         if (g_instance.attr.attr_security.enable_tde && IS_PGXC_DATANODE) {
             bufHdr->extra->encrypt = smgr->encrypt ? true : false; /* set tde flag */
         }
@@ -2297,6 +2611,13 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
         } else {
             u_sess->instr_cxt.pg_buffer_usage->shared_blks_read++;
             pgstatCountSharedBlocksRead4SessionLevel();
+        }
+    }
+
+    if (ENABLE_DMS) {
+        buf_ctrl = GetDmsBufCtrl(bufHdr->buf_id);
+        if (mode == RBM_FOR_ONDEMAND_REALTIME_BUILD) {
+            buf_ctrl->state |= BUF_READ_MODE_ONDEMAND_REALTIME_BUILD;
         }
     }
 
@@ -2328,7 +2649,7 @@ found_branch:
             if (!isLocalBuf) {
                 if (mode == RBM_ZERO_AND_LOCK) {
                     if (ENABLE_DMS) {
-                        GetDmsBufCtrl(bufHdr->buf_id)->state |= BUF_READ_MODE_ZERO_LOCK;
+                        buf_ctrl->state |= BUF_READ_MODE_ZERO_LOCK;
                         LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_EXCLUSIVE);
                     } else {
                         LWLockAcquire(bufHdr->content_lock, LW_EXCLUSIVE);
@@ -2344,7 +2665,7 @@ found_branch:
                     BufferDescSetPBLK(bufHdr, pblk);
                 } else if (mode == RBM_ZERO_AND_CLEANUP_LOCK) {
                     if (ENABLE_DMS) {
-                        GetDmsBufCtrl(bufHdr->buf_id)->state |= BUF_READ_MODE_ZERO_LOCK;
+                        buf_ctrl->state |= BUF_READ_MODE_ZERO_LOCK;
                     }
                     LockBufferForCleanup(BufferDescriptorGetBuffer(bufHdr));
                 }
@@ -2391,11 +2712,11 @@ found_branch:
          */
         if (isLocalBuf) {
             /* Only need to adjust flags */
-            uint32 buf_state = pg_atomic_read_u32(&bufHdr->state);
+            uint64 buf_state = pg_atomic_read_u64(&bufHdr->state);
 
             Assert(buf_state & BM_VALID);
             buf_state &= ~BM_VALID;
-            pg_atomic_write_u32(&bufHdr->state, buf_state);
+            pg_atomic_write_u32(((volatile uint32 *)&bufHdr->state) + 1, buf_state >> 32);
         } else {
             /*
              * Loop to handle the very small possibility that someone re-sets
@@ -2403,7 +2724,7 @@ found_branch:
              * it.
              */
             do {
-                uint32 buf_state = LockBufHdr(bufHdr);
+                uint64 buf_state = LockBufHdr(bufHdr);
 
                 Assert(buf_state & BM_VALID);
                 buf_state &= ~BM_VALID;
@@ -2414,28 +2735,24 @@ found_branch:
 
     /* DMS: Try get page remote */
     if (ENABLE_DMS) {
-        // standby node must notify primary node for prepare lastest page in ondemand recovery
-        if (SS_STANDBY_ONDEMAND_RECOVERY) {
-            while (!SSOndemandRequestPrimaryRedo(bufHdr->tag)) {
-                SSReadControlFile(REFORM_CTRL_PAGE);
-                if (SS_STANDBY_ONDEMAND_NORMAL) {
-                    break; // ondemand recovery finish, skip
-                } else if (SS_STANDBY_ONDEMAND_BUILD) {
-                    return 0; // in new reform
-                }
-                // still need requset page
-            }
-        }
         MarkReadHint(bufHdr->buf_id, relpersistence, isExtend, pblk);
         if (mode != RBM_FOR_REMOTE && relpersistence != RELPERSISTENCE_TEMP && !isLocalBuf) {
-            Assert(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID));
+            Assert(!(pg_atomic_read_u64(&bufHdr->state) & BM_VALID));
 
             do {
                 if (!DmsCheckBufAccessible()) {
-                    if(LWLockHeldByMe(bufHdr->io_in_progress_lock)) {
+                    if (LWLockHeldByMe(bufHdr->io_in_progress_lock)) {
                         TerminateBufferIO(bufHdr, false, 0);
                     }
                     pg_usleep(5000L);
+                    continue;
+                }
+
+                // standby node must notify primary node for prepare lastest page in ondemand recovery
+                if (SS_STANDBY_ONDEMAND_NOT_NORMAL && !SSOndemandRequestPrimaryRedo(bufHdr->tag)) {
+                    if (LWLockHeldByMe(bufHdr->io_in_progress_lock)) {
+                        TerminateBufferIO(bufHdr, false, 0);
+                    }
                     continue;
                 }
 
@@ -2447,27 +2764,20 @@ found_branch:
                 }
 
                 if (!startio) {
-                    Assert(pg_atomic_read_u32(&bufHdr->state) & BM_VALID);
+                    Assert(pg_atomic_read_u64(&bufHdr->state) & BM_VALID);
                     found = true;
                     goto found_branch;
                 }
 
-                dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(bufHdr->buf_id);
                 LWLockMode req_lock_mode = isExtend ? LW_EXCLUSIVE : LW_SHARED;
                 if (!LockModeCompatible(buf_ctrl, req_lock_mode)) {
                     if (!StartReadPage(bufHdr, req_lock_mode)) {
                         TerminateBufferIO(bufHdr, false, 0);
                         // when reform fail, should return InvalidBuffer to reform proc thread
-                        if (AmDmsReformProcProcess() && dms_reform_failed()) {
+                        if (SSNeedTerminateRequestPageInReform(buf_ctrl)) {
                             SSUnPinBuffer(bufHdr);
                             return InvalidBuffer;
                         }
-
-                        if ((AmPageRedoProcess() || AmStartupProcess()) && dms_reform_failed()) {
-                            SSUnPinBuffer(bufHdr);
-                            return InvalidBuffer;
-                        }
-
                         pg_usleep(5000L);
                         continue;
                     }
@@ -2480,9 +2790,15 @@ found_branch:
                     buf_ctrl->state |= BUF_NEED_LOAD;
                 }
                 break;
-            }while (true);
+            } while (true);
 
-            return TerminateReadPage(bufHdr, mode, pblk);
+            Buffer tmp_buffer =  TerminateReadPage(bufHdr, mode, pblk);
+            if (BufferIsInvalid(tmp_buffer) && (mode == RBM_FOR_ONDEMAND_REALTIME_BUILD) &&
+                !(buf_ctrl->state & BUF_READ_MODE_ONDEMAND_REALTIME_BUILD)) {
+                SSUnPinBuffer(bufHdr);
+                return InvalidBuffer;
+            }
+            return tmp_buffer;
         }
         ClearReadHint(bufHdr->buf_id);
     }
@@ -2499,7 +2815,7 @@ found_branch:
      * it's not been recycled) but come right back here to try smgrextend
      * again.
      */
-    Assert(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID)); /* spinlock not needed */
+    Assert(!(pg_atomic_read_u64(&bufHdr->state) & BM_VALID)); /* spinlock not needed */
 
     bufBlock = isLocalBuf ? LocalBufHdrGetBlock(bufHdr) : BufHdrGetBlock(bufHdr);
 
@@ -2513,8 +2829,8 @@ found_branch:
     }
     if (needputtodirty) {
         /* set  BM_DIRTY to overwrite later */
-        uint32 old_buf_state = LockBufHdr(bufHdr);
-        uint32 buf_state = old_buf_state | (BM_DIRTY | BM_JUST_DIRTIED);
+        uint64 old_buf_state = LockBufHdr(bufHdr);
+        uint64 buf_state = old_buf_state | (BM_DIRTY | BM_JUST_DIRTIED);
 
         /*
          * When the page is marked dirty for the first time, needs to push the dirty page queue.
@@ -2555,10 +2871,10 @@ found_branch:
 
     if (isLocalBuf) {
         /* Only need to adjust flags */
-        uint32 buf_state = pg_atomic_read_u32(&bufHdr->state);
+        uint64 buf_state = pg_atomic_read_u64(&bufHdr->state);
 
         buf_state |= BM_VALID;
-        pg_atomic_write_u32(&bufHdr->state, buf_state);
+        pg_atomic_write_u32(((volatile uint32 *)&bufHdr->state) + 1, buf_state >> 32);
     } else {
         bufHdr->extra->lsn_on_disk = PageGetLSN(bufBlock);
 #ifdef USE_ASSERT_CHECKING
@@ -2581,8 +2897,8 @@ found_branch:
 void SimpleMarkBufDirty(BufferDesc *buf)
 {
     /* set  BM_DIRTY to overwrite later */
-    uint32 oldBufState = LockBufHdr(buf);
-    uint32 bufState = oldBufState | (BM_DIRTY | BM_JUST_DIRTIED);
+    uint64 oldBufState = LockBufHdr(buf);
+    uint64 bufState = oldBufState | (BM_DIRTY | BM_JUST_DIRTIED);
 
     /*
      * When the page is marked dirty for the first time, needs to push the dirty page queue.
@@ -2608,7 +2924,7 @@ void SimpleMarkBufDirty(BufferDesc *buf)
 
 }
 
-void PageCheckIfCanEliminate(BufferDesc *buf, uint32 *oldFlags, bool *needGetLock)
+void PageCheckIfCanEliminate(BufferDesc *buf, uint64 *oldFlags, bool *needGetLock)
 {
     if (ENABLE_DMS) {
         return;
@@ -2636,9 +2952,9 @@ void PageCheckIfCanEliminate(BufferDesc *buf, uint32 *oldFlags, bool *needGetLoc
 }
 
 #ifdef USE_ASSERT_CHECKING
-void PageCheckWhenChosedElimination(const BufferDesc *buf, uint32 oldFlags)
+void PageCheckWhenChosedElimination(const BufferDesc *buf, uint64 oldFlags)
 {
-    if (SS_REFORM_REFORMER) {
+    if (SS_REFORM_REFORMER || SS_DISASTER_STANDBY_CLUSTER) {
         return;
     }
 
@@ -2670,14 +2986,15 @@ void PageCheckWhenChosedElimination(const BufferDesc *buf, uint32 oldFlags)
  *
  * No locks are held either at entry or exit.
  */
-static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num, BlockNumber block_num,
-                               BufferAccessStrategy strategy, bool *found, const XLogPhyBlock *pblk)
+BufferDesc *BufferAlloc(const RelFileNode &rel_file_node, char relpersistence, ForkNumber fork_num,
+                               BlockNumber block_num, BufferAccessStrategy strategy, bool *found,
+                               const XLogPhyBlock *pblk)
 {
     if (g_instance.attr.attr_storage.nvm_attr.enable_nvm) {
-        return NvmBufferAlloc(smgr, relpersistence, fork_num, block_num, strategy, found, pblk);
+        return NvmBufferAlloc(rel_file_node, relpersistence, fork_num, block_num, strategy, found, pblk);
     }
 
-    Assert(!IsSegmentPhysicalRelNode(smgr->smgr_rnode.node));
+    Assert(!IsSegmentPhysicalRelNode(rel_file_node));
 
     BufferTag new_tag;                 /* identity of requested block */
     uint32 new_hash;                   /* hash value for newTag */
@@ -2685,21 +3002,20 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
     BufferTag old_tag;                 /* previous identity of selected buffer */
     uint32 old_hash;                   /* hash value for oldTag */
     LWLock *old_partition_lock = NULL; /* buffer partition lock for it */
-    uint32 old_flags;
+    uint64 old_flags;
     int buf_id;
     BufferDesc *buf = NULL;
     bool valid = false;
-    uint32 buf_state;
+    uint64 buf_state;
 
     /* create a tag so we can lookup the buffer */
-    INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
+    INIT_BUFFERTAG(new_tag, rel_file_node, fork_num, block_num);
 
     /* determine its hash code and partition lock ID */
     new_hash = BufTableHashCode(&new_tag);
-    new_partition_lock = BufMappingPartitionLock(new_hash);
 
+retry:
     /* see if the block is in the buffer pool already */
-    (void)LWLockAcquire(new_partition_lock, LW_SHARED);
     pgstat_report_waitevent(WAIT_EVENT_BUF_HASH_SEARCH);
     buf_id = BufTableLookup(&new_tag, new_hash);
     pgstat_report_waitevent(WAIT_EVENT_END);
@@ -2713,8 +3029,10 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
 
         valid = PinBuffer(buf, strategy);
 
-        /* Can release the mapping lock as soon as we've pinned it */
-        LWLockRelease(new_partition_lock);
+        if (!BUFFERTAGS_PTR_EQUAL(&buf->tag, &new_tag)) {
+            UnpinBuffer(buf, true);
+            goto retry;
+        }
 
         *found = TRUE;
 
@@ -2746,11 +3064,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         return buf;
     }
 
-    /*
-     * Didn't find it in the buffer pool.  We'll have to initialize a new
-     * buffer.	Remember to unlock the mapping lock while doing the work.
-     */
-    LWLockRelease(new_partition_lock);
+    new_partition_lock = BufMappingPartitionLock(new_hash);
     /* Loop here in case we have to try another victim buffer */
     for (;;) {
         bool needGetLock = false;
@@ -2775,7 +3089,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         /* Pin the buffer and then release the buffer spinlock */
         PinBuffer_Locked(buf);
 
-        if (!SSHelpFlushBufferIfNeed(buf)) {
+        if (!SSHelpFlushBufferIfNeed(buf) || !SSOndemandRealtimeBuildAllowFlush(buf)) {
             // for dms this page cannot eliminate, get another one 
             UnpinBuffer(buf, true);
             continue;
@@ -2844,8 +3158,8 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
                 }
 
                 /* OK, do the I/O */
-                TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_START(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
-                                                          smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode);
+                TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_START(fork_num, block_num, rel_file_node.spcNode,
+                                                          rel_file_node.dbNode, rel_file_node.relNode);
 
                 /* during initdb, not need flush dw file */
                 if (dw_enabled() && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 0) {
@@ -2868,8 +3182,8 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
 
                 ScheduleBufferTagForWriteback(t_thrd.storage_cxt.BackendWritebackContext, &buf->tag);
 
-                TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_DONE(fork_num, block_num, smgr->smgr_rnode.node.spcNode,
-                                                         smgr->smgr_rnode.node.dbNode, smgr->smgr_rnode.node.relNode);
+                TRACE_POSTGRESQL_BUFFER_WRITE_DIRTY_DONE(fork_num, block_num, rel_file_node.spcNode,
+                                                         rel_file_node.dbNode, rel_file_node.relNode);
             } else {
                 /*
                  * Someone else has locked the buffer, so give it up and loop
@@ -2884,6 +3198,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
          * To change the association of a valid buffer, we'll need to have
          * exclusive lock on both the old and new mapping partitions.
          */
+        old_flags = buf_state & BUF_FLAG_MASK;
         if (old_flags & BM_TAG_VALID) {
             /*
              * Need to compute the old tag's hashcode and partition lock ID.
@@ -2906,6 +3221,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
             old_partition_lock = NULL;
         }
 
+        buf_state = LockBufHdr(buf);
         /*
          * Try to make a hashtable entry for the buffer under its new tag.
          * This could fail because while we were writing someone else
@@ -2921,6 +3237,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
              * pool in the first place.  First, give up the buffer we were
              * planning to use.
              */
+            UnlockBufHdr(buf, buf_state);
             UnpinBuffer(buf, true);
 
             /* Can give up that buffer's mapping partition lock now */
@@ -2958,10 +3275,6 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         }
 
         /*
-         * Need to lock the buffer header too in order to change its tag.
-         */
-        buf_state = LockBufHdr(buf);
-        /*
          * Somebody could have pinned or re-dirtied the buffer while we were
          * doing the I/O and making the new hashtable entry.  If so, we can't
          * recycle this buffer; we must undo everything we've done and start
@@ -2986,11 +3299,12 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
             }
         }
 
-        UnlockBufHdr(buf, buf_state);
         BufTableDelete(&new_tag, new_hash);
         if ((old_flags & BM_TAG_VALID) && old_partition_lock != new_partition_lock) {
             LWLockRelease(old_partition_lock);
         }
+
+        UnlockBufHdr(buf, buf_state);
         LWLockRelease(new_partition_lock);
         UnpinBuffer(buf, true);
     }
@@ -3022,8 +3336,6 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
     }
 
-    UnlockBufHdr(buf, buf_state);
-
     if (ENABLE_DMS) {
         GetDmsBufCtrl(buf->buf_id)->lock_mode = DMS_LOCK_NULL;
         GetDmsBufCtrl(buf->buf_id)->been_loaded = false;
@@ -3049,7 +3361,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         buf->extra->seg_blockno = InvalidBlockNumber;
     }
     LWLockRelease(new_partition_lock);
-
+    UnlockBufHdr(buf, buf_state);
     /*
      * Buffer contents are currently invalid.  Try to get the io_in_progress
      * lock.  If StartBufferIO returns false, then someone else managed to
@@ -3086,13 +3398,13 @@ void InvalidateBuffer(BufferDesc *buf)
     BufferTag old_tag;
     uint32 old_hash;                   /* hash value for oldTag */
     LWLock *old_partition_lock = NULL; /* buffer partition lock for it */
-    uint32 old_flags;
-    uint32 buf_state;
+    uint64 old_flags;
+    uint64 buf_state;
 
     /* Save the original buffer tag before dropping the spinlock */
     old_tag = ((BufferDesc *)buf)->tag;
 
-    buf_state = pg_atomic_read_u32(&buf->state);
+    buf_state = pg_atomic_read_u64(&buf->state);
     Assert(buf_state & BM_LOCKED);
     UnlockBufHdr(buf, buf_state);
 
@@ -3221,8 +3533,8 @@ static void recheck_page_content(const BufferDesc *buf_desc)
 void MarkBufferDirty(Buffer buffer)
 {
     BufferDesc *buf_desc = NULL;
-    uint32 buf_state;
-    uint32 old_buf_state;
+    uint64 buf_state;
+    uint64 old_buf_state;
 
     if (!BufferIsValid(buffer)) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("bad buffer ID: %d", buffer))));
@@ -3292,22 +3604,22 @@ void MarkBufferDirty(Buffer buffer)
 void MarkBufferMetaFlag(Buffer bufId, bool isSet)
 {
     BufferDesc *buf = GetBufferDescriptor(bufId - 1);
-    uint32 bufState;
-    uint32 oldBufState;
+    uint64 bufState;
+    uint64 oldBufState;
     for (;;) {
-        oldBufState = pg_atomic_read_u32(&buf->state);
+        oldBufState = pg_atomic_read_u64(&buf->state);
         if (oldBufState & BM_LOCKED) {
             oldBufState = WaitBufHdrUnlocked(buf);
         }
         bufState = oldBufState;
         if (isSet) {
             bufState |= BM_IS_META;
-            ereport(DEBUG1, (errmsg("mark buffer %d meta buffer stat %u.", bufId, bufState)));
+            ereport(DEBUG1, (errmsg("mark buffer %d meta buffer stat %lu.", bufId, bufState)));
         } else {
             bufState &= ~(BM_IS_META);
-            ereport(DEBUG1, (errmsg("unmark buffer %d meta buffer stat %u.", bufId, bufState)));
+            ereport(DEBUG1, (errmsg("unmark buffer %d meta buffer stat %lu.", bufId, bufState)));
         }
-        if (pg_atomic_compare_exchange_u32(&buf->state, &oldBufState, bufState)) {
+        if (pg_atomic_compare_exchange_u64(&buf->state, &oldBufState, bufState)) {
             break;
         }
     }
@@ -3383,37 +3695,41 @@ bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
     ref = GetPrivateRefCountEntry(b, true);
 
     if (ref == NULL) {
-        uint32 buf_state;
-        uint32 old_buf_state;
+        uint64 buf_state;
+        uint64 new_buf_state;
 
         ReservePrivateRefCountEntry();
         ref = NewPrivateRefCountEntry(b);
 
-        old_buf_state = pg_atomic_read_u32(&buf->state);
         for (;;) {
-            if (old_buf_state & BM_LOCKED) {
-                old_buf_state = WaitBufHdrUnlocked(buf);
+            buf_state = __sync_add_and_fetch(&buf->state, 1);
+            if (buf_state & BM_LOCKED) {
+                buf_state = __sync_fetch_and_add(&buf->state, -1);
+                WaitBufHdrUnlocked(buf);
+                continue;
             }
 
-            buf_state = old_buf_state;
+            while (BUF_STATE_GET_USAGECOUNT(buf_state) != BM_MAX_USAGE_COUNT) {
+                if (buf_state & BM_LOCKED) {
+                    buf_state = WaitBufHdrUnlocked(buf);
+                    continue;
+                }
 
-            /* increase refcount */
-            buf_state += BUF_REFCOUNT_ONE;
-
-            /* increase usagecount unless already max */
-            if (BUF_STATE_GET_USAGECOUNT(buf_state) != BM_MAX_USAGE_COUNT) {
-                buf_state += BUF_USAGECOUNT_ONE;
+                new_buf_state = buf_state;
+                new_buf_state += BUF_USAGECOUNT_ONE;
+                if (pg_atomic_compare_exchange_u64(&buf->state, &buf_state, new_buf_state)) {
+                    break;
+                }
             }
 
-            if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state, buf_state)) {
-                result = (buf_state & BM_VALID) != 0;
-                break;
-            }
+            result = (buf_state & BM_VALID) != 0;
+            break;
         }
     } else {
         /* If we previously pinned the buffer, it must surely be valid */
         result = true;
     }
+
     ref->refcount++;
     Assert(ref->refcount > 0);
     ResourceOwnerRememberBuffer(t_thrd.utils_cxt.CurrentResourceOwner, b);
@@ -3445,7 +3761,7 @@ void PinBuffer_Locked(volatile BufferDesc *buf)
 {
     Buffer b;
     PrivateRefCountEntry *ref = NULL;
-    uint32 buf_state;
+    uint64 buf_state;
 
     /*
      * As explained, We don't expect any preexisting pins. That allows us to
@@ -3457,9 +3773,10 @@ void PinBuffer_Locked(volatile BufferDesc *buf)
      * Since we hold the buffer spinlock, we can update the buffer state and
      * release the lock in one operation.
      */
-    buf_state = pg_atomic_read_u32(&buf->state);
+    buf_state = pg_atomic_read_u64(&buf->state);
     Assert(buf_state & BM_LOCKED);
-    buf_state += BUF_REFCOUNT_ONE;
+
+    buf_state = __sync_add_and_fetch(&buf->state, 1);
     UnlockBufHdr(buf, buf_state);
 
     b = BufferDescriptorGetBuffer(buf);
@@ -3496,31 +3813,19 @@ void UnpinBuffer(BufferDesc *buf, bool fixOwner)
 
     ref->refcount--;
     if (ref->refcount == 0) {
-        uint32 buf_state;
-        uint32 old_buf_state;
+        uint64 buf_state;
 
         /* I'd better not still hold any locks on the buffer */
         Assert(!LWLockHeldByMe(buf->content_lock));
         Assert(!LWLockHeldByMe(buf->io_in_progress_lock));
-
-        /*
-         * Decrement the shared reference count.
-         *
-         * Since buffer spinlock holder can update status using just write,
-         * it's not safe to use atomic decrement here; thus use a CAS loop.
-         */
-        old_buf_state = pg_atomic_read_u32(&buf->state);
-        for (;;) {
-            if (old_buf_state & BM_LOCKED)
-                old_buf_state = WaitBufHdrUnlocked(buf);
-
-            buf_state = old_buf_state;
-
-            buf_state -= BUF_REFCOUNT_ONE;
-
-            if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state, buf_state)) {
-                break;
+        for(;;) {
+            buf_state = __sync_add_and_fetch(&buf->state, -1);
+            if(buf_state & BM_LOCKED) {
+                buf_state = __sync_add_and_fetch(&buf->state, 1);
+                WaitBufHdrUnlocked(buf);
+                continue;
             }
+            break;
         }
 
         /* Support the function LockBufferForCleanup() */
@@ -3559,7 +3864,7 @@ void UnpinBuffer(BufferDesc *buf, bool fixOwner)
  */
 static void BufferSync(int flags)
 {
-    uint32 buf_state;
+    uint64 buf_state;
     int buf_id;
     int num_to_scan;
     int num_spaces;
@@ -3570,7 +3875,7 @@ static void BufferSync(int flags)
     Oid last_tsid;
     binaryheap *ts_heap = NULL;
     int i;
-    uint32 mask = BM_DIRTY;
+    uint64 mask = BM_DIRTY;
     WritebackContext wb_context;
 
     gstrace_entry(GS_TRC_ID_BufferSync);
@@ -3611,7 +3916,7 @@ static void BufferSync(int flags)
          * SyncOneBuffer.
          */
         pg_memory_barrier();
-        buf_state = pg_atomic_read_u32(&buf_desc->state);
+        buf_state = pg_atomic_read_u64(&buf_desc->state);
         if ((buf_state & mask) == mask) {
             buf_state = LockBufHdr(buf_desc);
             if ((buf_state & mask) == mask) {
@@ -3753,7 +4058,7 @@ static void BufferSync(int flags)
          * write the buffer though we didn't need to.  It doesn't seem worth
          * guarding against this, though.
          */
-        if (pg_atomic_read_u32(&buf_desc->state) & BM_CHECKPOINT_NEEDED) {
+        if (pg_atomic_read_u64(&buf_desc->state) & BM_CHECKPOINT_NEEDED) {
             if (SyncOneBuffer(buf_id, false, &wb_context) & BUF_WRITTEN) {
                 TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(buf_id);
                 u_sess->stat_cxt.BgWriterStats->m_buf_written_checkpoints++;
@@ -4217,7 +4522,7 @@ uint32 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext* wb_c
     BufferDesc *buf_desc = GetBufferDescriptor(buf_id);
     uint32 result = 0;
     BufferTag tag;
-    uint32 buf_state;
+    uint64 buf_state;
 
     ReservePrivateRefCountEntry();
 
@@ -4425,7 +4730,7 @@ void PrintBufferLeakWarning(Buffer buffer)
     int32 loccount;
     char *path = NULL;
     BackendId backend;
-    uint32 buf_state;
+    uint64 buf_state;
 
     Assert(BufferIsValid(buffer));
     if (BufferIsLocal(buffer)) {
@@ -4440,9 +4745,9 @@ void PrintBufferLeakWarning(Buffer buffer)
 
     /* theoretically we should lock the bufhdr here */
     path = relpathbackend(((BufferDesc *)buf)->tag.rnode, backend, ((BufferDesc *)buf)->tag.forkNum);
-    buf_state = pg_atomic_read_u32(&buf->state);
+    buf_state = pg_atomic_read_u64(&buf->state);
     ereport(WARNING, (errmsg("buffer refcount leak: [%03d] "
-                             "(rel=%s, blockNum=%u, flags=0x%x, refcount=%u %d)",
+                             "(rel=%s, blockNum=%u, flags=0x%lx, refcount=%lu %d)",
                              buffer, path, buf->tag.blockNum, buf_state & BUF_FLAG_MASK,
                              BUF_STATE_GET_REFCOUNT(buf_state), loccount)));
     pfree(path);
@@ -4593,7 +4898,7 @@ void BufferGetTag(Buffer buffer, RelFileNode *rnode, ForkNumber *forknum, BlockN
     pgstatCountBlocksWriteTime4SessionLevel(INSTR_TIME_GET_MICROSEC(io_time));  \
 } while (0)
 
-void GetFlushBufferInfo(void *buf, RedoBufferInfo *bufferinfo, uint32 *buf_state, ReadBufferMethod flushmethod)
+void GetFlushBufferInfo(void *buf, RedoBufferInfo *bufferinfo, uint64 *buf_state, ReadBufferMethod flushmethod)
 {
     if (flushmethod == WITH_NORMAL_CACHE || flushmethod == WITH_LOCAL_CACHE) {
         BufferDesc *bufdesc = (BufferDesc *)buf;
@@ -4665,8 +4970,10 @@ void FlushBuffer(void *buf, SMgrRelation reln, ReadBufferMethod flushmethod, boo
     instr_time io_start, io_time;
     Block bufBlock;
     char *bufToWrite = NULL;
-    uint32 buf_state;
-    RedoBufferInfo bufferinfo = {0};
+    uint64 buf_state;
+    RedoBufferInfo bufferinfo;
+    errno_t rc = memset_s(&bufferinfo, sizeof(RedoBufferInfo), 0, sizeof(RedoBufferInfo));
+    securec_check(rc, "\0", "\0");
 
     t_thrd.dms_cxt.buf_in_aio = false;
 
@@ -4968,7 +5275,7 @@ bool BufferIsPermanent(Buffer buffer)
      * old value or the new value, but not random garbage.
      */
     buf_desc = GetBufferDescriptor(buffer - 1);
-    return (pg_atomic_read_u32(&buf_desc->state) & BM_PERMANENT) != 0;
+    return (pg_atomic_read_u64(&buf_desc->state) & BM_PERMANENT) != 0;
 }
 
 /*
@@ -4981,7 +5288,7 @@ XLogRecPtr BufferGetLSNAtomic(Buffer buffer)
     char *page = BufferGetPage(buffer);
     XLogRecPtr lsn;
 
-    uint32 buf_state;
+    uint64 buf_state;
     /* If we don't need locking for correctness, fastpath out. */
     if (BufferIsLocal(buffer)) {
         return PageGetLSN(page);
@@ -5002,7 +5309,7 @@ void DropSegRelNodeSharedBuffer(RelFileNode node, ForkNumber forkNum)
 {
     for (int i = 0; i < SegmentBufferStartID; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
-        uint32 buf_state;
+        uint64 buf_state;
 
         if (buf_desc->extra->seg_fileno != node.relNode || buf_desc->tag.rnode.spcNode != node.spcNode ||
             buf_desc->tag.rnode.dbNode != node.dbNode) {
@@ -5020,7 +5327,7 @@ void DropSegRelNodeSharedBuffer(RelFileNode node, ForkNumber forkNum)
 
     for (int i = SegmentBufferStartID; i < TOTAL_BUFFER_NUM; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
-        uint32 buf_state;
+        uint64 buf_state;
         /*
          * As in DropRelFileNodeBuffers, an unlocked precheck should be safe
          * and saves some cycles.
@@ -5047,7 +5354,7 @@ void RangeForgetBuffer(RelFileNode node, ForkNumber forkNum, BlockNumber firstDe
 {
     for (int i = 0; i < SegmentBufferStartID; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
-        uint32 buf_state;
+        uint64 buf_state;
 
         if (!RelFileNodeEquals(buf_desc->tag.rnode, node))
             continue;
@@ -5067,7 +5374,7 @@ void DropRelFileNodeShareBuffers(RelFileNode node, ForkNumber forkNum, BlockNumb
 
     for (i = 0; i < SegmentBufferStartID; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
-        uint32 buf_state;
+        uint64 buf_state;
         /*
          * We can make this a tad faster by prechecking the buffer tag before
          * we attempt to lock the buffer; this saves a lot of lock
@@ -5172,7 +5479,7 @@ void DropRelFileNodeAllBuffersUsingHash(HTAB *relfilenode_hashtbl)
 
     for (i = 0; i < SegmentBufferStartID; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
-        uint32 buf_state;
+        uint64 buf_state;
         bool found = false;
         bool equal = false;
         bool find_dir = false;
@@ -5224,7 +5531,7 @@ void DropRelFileNodeOneForkAllBuffersUsingHash(HTAB *relfilenode_hashtbl)
     int i;
     for (i = 0; i < SegmentBufferStartID; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
-        uint32 buf_state;
+        uint64 buf_state;
         bool found = false;
         bool equal = false;
         bool find_dir = false;
@@ -5335,7 +5642,7 @@ static FORCE_INLINE void ScanCompareAndInvalidateBuffer(const RelFileNode *rnode
         return;
     }
 
-    uint32 buf_state = LockBufHdr(bufHdr);
+    uint64 buf_state = LockBufHdr(bufHdr);
 
     if (find_dir) {
         equal = RelFileNodeRelEquals(bufHdr->tag.rnode, rnodes[match_idx]);
@@ -5396,7 +5703,7 @@ void DropDatabaseBuffers(Oid dbid)
     
     for (i = 0; i < TOTAL_BUFFER_NUM; i++) {
         BufferDesc *buf_desc = GetBufferDescriptor(i);
-        uint32 buf_state;
+        uint64 buf_state;
         /*
          * As in DropRelFileNodeBuffers, an unlocked precheck should be safe
          * and saves some cycles.
@@ -5477,7 +5784,7 @@ static inline bool flush_buffer_match(BufferDesc *buf_desc, Relation rel, Oid db
  */
 static void flush_wait_page_writer(BufferDesc *buf_desc, Relation rel, Oid db_id)
 {
-    uint32 buf_state;
+    uint64 buf_state;
     for (;;) {
         buf_state = LockBufHdr(buf_desc);
         if (flush_buffer_match(buf_desc, rel, db_id) && dw_buf_valid_aio_finished(buf_desc, buf_state) &&
@@ -5498,7 +5805,7 @@ void flush_all_buffers(Relation rel, Oid db_id, HTAB *hashtbl)
 {
     int i;
     BufferDesc *buf_desc = NULL;
-    uint32 buf_state;
+    uint64 buf_state;
     uint32 size = 0;
     uint32 total = 0;
 
@@ -5688,6 +5995,7 @@ void MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
     buf_desc = GetBufferDescriptor(buffer - 1);
 
     Assert(GetPrivateRefCount(buffer) > 0);
+
     /* here, either share or exclusive lock is OK */
     if (!LWLockHeldByMe(buf_desc->content_lock))
         ereport(PANIC, (errcode(ERRCODE_INVALID_BUFFER),
@@ -5704,11 +6012,16 @@ void MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
      * is only intended to be used in cases where failing to write out the
      * data would be harmless anyway, it doesn't really matter.
      */
-    if ((pg_atomic_read_u32(&buf_desc->state) & (BM_DIRTY | BM_JUST_DIRTIED)) != (BM_DIRTY | BM_JUST_DIRTIED)) {
+    if ((pg_atomic_read_u64(&buf_desc->state) & (BM_DIRTY | BM_JUST_DIRTIED)) != (BM_DIRTY | BM_JUST_DIRTIED)) {
         XLogRecPtr lsn = InvalidXLogRecPtr;
         bool delayChkpt = false;
-        uint32 buf_state;
-        uint32 old_buf_state;
+        uint64 buf_state;
+        uint64 old_buf_state;
+        buf_state = pg_atomic_read_u64(&buf_desc->state);
+        //  temp buf just for old page version, could not write to disk
+        if (IS_EXRTO_READ && (buf_state & BM_IS_TMP_BUF)) {
+            return;
+        }
 
         /*
          * If we need to protect hint bit updates from torn writes, WAL-log a
@@ -5721,8 +6034,8 @@ void MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
          * The incremental checkpoint is protected by the doublewriter, the
          * half-write problem does not occur.
          */
-        if (!ENABLE_INCRE_CKPT && XLogHintBitIsNeeded() &&
-            (pg_atomic_read_u32(&buf_desc->state) & BM_PERMANENT)) {
+        if (unlikely(!ENABLE_INCRE_CKPT && XLogHintBitIsNeeded() &&
+                     (pg_atomic_read_u64(&buf_desc->state) & BM_PERMANENT))) {
             /*
              * If we're in recovery we cannot dirty a page because of a hint.
              * We can set the hint, just not dirty the page as a result so the
@@ -5841,7 +6154,7 @@ void UnlockBuffers(void)
     BufferDesc *buf = t_thrd.storage_cxt.PinCountWaitBuf;
 
     if (buf != NULL) {
-        uint32 buf_state;
+        uint64 buf_state;
         buf_state = LockBufHdr(buf);
         /*
          * Don't complain if flag bit not set; it could have been reset but we
@@ -5905,10 +6218,14 @@ retry:
     if (ENABLE_DMS && mode != BUFFER_LOCK_UNLOCK) {
         LWLockMode lock_mode = (mode == BUFFER_LOCK_SHARE) ? LW_SHARED : LW_EXCLUSIVE;
         Buffer tmp_buffer;
+        dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(buffer - 1);
         ReadBufferMode read_mode = RBM_NORMAL;
-        if (lock_mode == LW_EXCLUSIVE && (GetDmsBufCtrl(buffer - 1)->state & BUF_READ_MODE_ZERO_LOCK)) {
+        if (lock_mode == LW_EXCLUSIVE && (buf_ctrl->state & BUF_READ_MODE_ZERO_LOCK)) {
             read_mode = RBM_ZERO_AND_LOCK;
-            GetDmsBufCtrl(buffer - 1)->state &= ~BUF_READ_MODE_ZERO_LOCK;
+            buf_ctrl->state &= ~BUF_READ_MODE_ZERO_LOCK;
+        }
+        if (buf_ctrl->state & BUF_READ_MODE_ONDEMAND_REALTIME_BUILD) {
+            read_mode = RBM_FOR_ONDEMAND_REALTIME_BUILD;
         }
         bool with_io_in_progress = true;
 
@@ -5927,7 +6244,7 @@ retry:
                     TerminateBufferIO(buf, false, 0);
                 }
             }
-            
+
             LWLockRelease(buf->content_lock);
 
             if (AmDmsReformProcProcess() && dms_reform_failed()) {
@@ -5939,8 +6256,27 @@ retry:
                 g_instance.dms_cxt.SSRecoveryInfo.recovery_trapped_in_page_request = true;
             }
 
+            if ((read_mode == RBM_FOR_ONDEMAND_REALTIME_BUILD) &&
+                !(buf_ctrl->state & BUF_READ_MODE_ONDEMAND_REALTIME_BUILD)) {
+                return;
+            }
+
             dms_retry_times++;
-            pg_usleep(SSGetBufSleepTime(dms_retry_times));
+            long sleep_time = SSGetBufSleepTime(dms_retry_times);
+            if (sleep_time == SS_BUF_MAX_WAIT_TIME && !SS_IN_REFORM) {
+                volatile BufferTag *tag = &buf->tag;
+                int output_backup = t_thrd.postgres_cxt.whereToSendOutput;
+                t_thrd.postgres_cxt.whereToSendOutput = DestNone;
+                ereport(WARNING, (errmodule(MOD_DMS), (errmsg("[SS buf][%u/%u/%u/%d %d-%u] LockBuffer, request buf timeout, "
+                    "buf_id:%d",
+                    tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
+                    tag->forkNum, tag->blockNum, buf->buf_id))));
+                t_thrd.postgres_cxt.whereToSendOutput = output_backup;
+            }
+            if (read_mode == RBM_FOR_ONDEMAND_REALTIME_BUILD) {
+                sleep_time = SS_BUF_WAIT_TIME_IN_ONDEMAND_REALTIME_BUILD;
+            }
+            pg_usleep(sleep_time);
             goto retry;
         }
     }
@@ -6049,7 +6385,18 @@ retry:
             }
 
             dms_retry_times++;
-            pg_usleep(SSGetBufSleepTime(dms_retry_times));
+            long sleep_time = SSGetBufSleepTime(dms_retry_times);
+            if (sleep_time == SS_BUF_MAX_WAIT_TIME && !SS_IN_REFORM) {
+                volatile BufferTag *tag = &buf->tag;
+                int output_backup = t_thrd.postgres_cxt.whereToSendOutput;
+                t_thrd.postgres_cxt.whereToSendOutput = DestNone;
+                ereport(WARNING, (errmodule(MOD_DMS), (errmsg("[SS buf][%u/%u/%u/%d %d-%u] ConditionalLockBuffer， request buf timeout, "
+                    "buf_id:%d",
+                    tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->rnode.bucketNode,
+                    tag->forkNum, tag->blockNum, buf->buf_id))));
+                t_thrd.postgres_cxt.whereToSendOutput = output_backup;
+            }
+            pg_usleep(sleep_time);
             goto retry;
         }
     }
@@ -6097,7 +6444,7 @@ void LockBufferForCleanup(Buffer buffer)
     buf_desc = GetBufferDescriptor(buffer - 1);
 
     for (;;) {
-        uint32 buf_state;
+        uint64 buf_state;
 
         /* Try to acquire lock */
         LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -6161,10 +6508,14 @@ void LockBufferForCleanup(Buffer buffer)
  */
 bool HoldingBufferPinThatDelaysRecovery(void)
 {
-    uint32 bufLen = parallel_recovery::GetStartupBufferPinWaitBufLen();
+    if (IS_EXRTO_READ) {
+        return false;
+    }
     int bufids[MAX_RECOVERY_THREAD_NUM + 1];
+    errno_t rc = memset_s(bufids, sizeof(bufids), -1, sizeof(bufids));
+    securec_check(rc, "\0", "\0");
+    uint32 bufLen = parallel_recovery::GetStartupBufferPinWaitBufLen();
     parallel_recovery::GetStartupBufferPinWaitBufId(bufids, bufLen);
-
     for (uint32 i = 0; i < bufLen; i++) {
 
         /*
@@ -6206,7 +6557,7 @@ bool ConditionalLockUHeapBufferForCleanup(Buffer buffer)
 bool ConditionalLockBufferForCleanup(Buffer buffer)
 {
     BufferDesc *buf_desc = NULL;
-    uint32 buf_state, refcount;
+    uint64 buf_state, refcount;
 
     Assert(BufferIsValid(buffer));
 
@@ -6260,7 +6611,7 @@ bool ConditionalLockBufferForCleanup(Buffer buffer)
 bool IsBufferCleanupOK(Buffer buffer)
 {
     BufferDesc *bufHdr;
-    uint32 buf_state;
+    uint64 buf_state;
 
     Assert(BufferIsValid(buffer));
 
@@ -6315,7 +6666,7 @@ void WaitIO(BufferDesc *buf)
      * AbortBufferIO.
      */
     for (;;) {
-        uint32 buf_state;
+        uint64 buf_state;
 
         /*
          * It may not be necessary to acquire the spinlock to check the flag
@@ -6343,7 +6694,7 @@ void CheckIOState(volatile void *buf_desc)
 {
     BufferDesc *buf = (BufferDesc *)buf_desc;
     for (;;) {
-        uint32 buf_state;
+        uint64 buf_state;
 
         /*
          * It may not be necessary to acquire the spinlock to check the flag
@@ -6384,17 +6735,17 @@ void CheckIOState(volatile void *buf_desc)
  */
 bool StartBufferIO(BufferDesc *buf, bool for_input)
 {
-    uint32 buf_state;
+    uint64 buf_state;
     bool dms_need_flush = false; // used in dms
 
     Assert(!t_thrd.storage_cxt.InProgressBuf);
 
     /* To check the InProgressBuf must be NULL. */
     if (t_thrd.storage_cxt.InProgressBuf) {
-        ereport(PANIC, (errmsg("InProgressBuf not null: id %d flags %u, buf: id %d flags %u",
+        ereport(PANIC, (errmsg("InProgressBuf not null: id %d flags %lu, buf: id %d flags %lu",
                                t_thrd.storage_cxt.InProgressBuf->buf_id,
-                               pg_atomic_read_u32(&t_thrd.storage_cxt.InProgressBuf->state) & BUF_FLAG_MASK,
-                               buf->buf_id, pg_atomic_read_u32(&buf->state) & BUF_FLAG_MASK)));
+                               pg_atomic_read_u64(&t_thrd.storage_cxt.InProgressBuf->state) & BUF_FLAG_MASK,
+                               buf->buf_id, pg_atomic_read_u64(&buf->state) & BUF_FLAG_MASK)));
     }
 
     for (; ;) {
@@ -6444,8 +6795,16 @@ bool StartBufferIO(BufferDesc *buf, bool for_input)
     buf_state |= BM_IO_IN_PROGRESS;
     UnlockBufHdr(buf, buf_state);
 
-    t_thrd.storage_cxt.InProgressBuf = buf;
-    t_thrd.storage_cxt.IsForInput = for_input;
+    /* If we under the pre-read model, we will use customized array instead of InProgressBuf */
+    if (!u_sess->storage_cxt.bulk_io_is_in_progress) {
+        t_thrd.storage_cxt.InProgressBuf = buf;
+        t_thrd.storage_cxt.IsForInput = for_input;
+    } else {
+        /* We will record current buf for Abort at some times */
+        u_sess->storage_cxt.bulk_io_in_progress_buf[u_sess->storage_cxt.bulk_io_in_progress_count] = buf;
+        u_sess->storage_cxt.bulk_io_is_for_input[u_sess->storage_cxt.bulk_io_in_progress_count] = for_input;
+        u_sess->storage_cxt.bulk_io_in_progress_count++;
+    }
 
     return true;
 }
@@ -6472,11 +6831,20 @@ bool StartBufferIO(BufferDesc *buf, bool for_input)
  * releasing the io_in_progress_lock.  ADIO does not use the
  * thread InProgressBuf or forInput
  */
-void TerminateBufferIO(volatile BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
+void TerminateBufferIO(volatile BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits)
 {
-    Assert(buf == t_thrd.storage_cxt.InProgressBuf);
+    /* Parmas check */
+    Assert(u_sess->storage_cxt.bulk_io_is_in_progress || buf == t_thrd.storage_cxt.InProgressBuf);
+    Assert(!u_sess->storage_cxt.bulk_io_is_in_progress || u_sess->storage_cxt.bulk_io_in_progress_count > 0);
+    Assert(!u_sess->storage_cxt.bulk_io_is_in_progress || buf == u_sess->storage_cxt.bulk_io_in_progress_buf[u_sess->storage_cxt.bulk_io_in_progress_count - 1]);
+
     TerminateBufferIO_common((BufferDesc *)buf, clear_dirty, set_flag_bits);
-    t_thrd.storage_cxt.InProgressBuf = NULL;
+    /* When in pre-read, we focus in bulk_io_in_progress_count instead of InProgressBuf */
+    if (!u_sess->storage_cxt.bulk_io_is_in_progress) {
+        t_thrd.storage_cxt.InProgressBuf = NULL;
+    } else {
+        u_sess->storage_cxt.bulk_io_in_progress_count--;
+    }
     LWLockRelease(((BufferDesc *)buf)->io_in_progress_lock);
 }
 
@@ -6500,7 +6868,7 @@ void TerminateBufferIO(volatile BufferDesc *buf, bool clear_dirty, uint32 set_fl
  * The routine acquires the buf header spinlock, and changes the buf->flags.
  * it leaves the buffer without the io_in_progress_lock held.
  */
-void AsyncTerminateBufferIO(void *buffer, bool clear_dirty, uint32 set_flag_bits)
+void AsyncTerminateBufferIO(void *buffer, bool clear_dirty, uint64 set_flag_bits)
 {
     BufferDesc *buf = (BufferDesc *)buffer;
 
@@ -6512,9 +6880,9 @@ void AsyncTerminateBufferIO(void *buffer, bool clear_dirty, uint32 set_flag_bits
  * TerminateBufferIO_common: Common code called by TerminateBufferIO() and
  * AsyncTerminateBufferIO() to set th buffer flags.
  */
-static void TerminateBufferIO_common(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
+static void TerminateBufferIO_common(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits)
 {
-    uint32 buf_state;
+    uint64 buf_state;
 
     buf_state = LockBufHdr(buf);
 
@@ -6593,7 +6961,11 @@ void AbortBufferIO(void)
     BufferDesc *buf = (BufferDesc *)t_thrd.storage_cxt.InProgressBuf;
     bool isForInput = (bool)t_thrd.storage_cxt.IsForInput;
 
-    if (buf != NULL) {
+bulk_read_loop:
+    if (buf && buf->buf_id < 0) {
+        /* If it is in local storage now. It seems not come to here, protect this branch. */
+        u_sess->storage_cxt.bulk_io_in_progress_count--;
+    } else if (buf != NULL) {
         /*
          * For Sync I/O
          * LWLockReleaseAll was already been called, so we're not holding
@@ -6607,6 +6979,17 @@ void AbortBufferIO(void)
     }
 
     AbortSegBufferIO();
+
+    /* If it is in pre-read process, we will loop for many times because of having many blocks. */
+    if (u_sess->storage_cxt.bulk_io_is_in_progress) {
+        if (u_sess->storage_cxt.bulk_io_in_progress_count > 0) {
+            buf = u_sess->storage_cxt.bulk_io_in_progress_buf[u_sess->storage_cxt.bulk_io_in_progress_count - 1];
+            isForInput = u_sess->storage_cxt.bulk_io_is_for_input[u_sess->storage_cxt.bulk_io_in_progress_count - 1];
+            goto bulk_read_loop;
+        }
+        /* u_sess->storage_cxt.bulk_io_in_progress_count is zero means all is over */
+        u_sess->storage_cxt.bulk_io_is_in_progress = false;
+    }
 }
 
 /*
@@ -6668,7 +7051,7 @@ extern void AsyncAbortBufferIOByVacuum(void *buffer)
  */
 void AbortBufferIO_common(BufferDesc *buf, bool isForInput)
 {
-    uint32 buf_state;
+    uint64 buf_state;
 
     buf_state = LockBufHdr(buf);
     Assert(buf_state & BM_IO_IN_PROGRESS);
@@ -6725,16 +7108,16 @@ void shared_buffer_write_error_callback(void *arg)
 /*
  * Lock buffer header - set BM_LOCKED in buffer state.
  */
-uint32 LockBufHdr(BufferDesc *desc)
+uint64 LockBufHdr(BufferDesc *desc)
 {
 #ifndef ENABLE_THREAD_CHECK
     SpinDelayStatus delayStatus = init_spin_delay(desc);
 #endif
-    uint32 old_buf_state;
+    uint64 old_buf_state;
 
     while (true) {
         /* set BM_LOCKED flag */
-        old_buf_state = pg_atomic_fetch_or_u32(&desc->state, BM_LOCKED);
+        old_buf_state = pg_atomic_fetch_or_u64(&desc->state, BM_LOCKED);
         /* if it wasn't set before we're OK */
         if (!(old_buf_state & BM_LOCKED))
             break;
@@ -6748,19 +7131,18 @@ uint32 LockBufHdr(BufferDesc *desc)
 
     /* ENABLE_THREAD_CHECK only, acquire semantic */
     TsAnnotateHappensAfter(&desc->state);
-
     return old_buf_state | BM_LOCKED;
 }
 
 const int MAX_SPINS_RETRY_TIMES = 100;
-bool retryLockBufHdr(BufferDesc *desc, uint32 *buf_state)
+bool retryLockBufHdr(BufferDesc *desc, uint64 *buf_state)
 {
-    uint32 old_buf_state = pg_atomic_read_u32(&desc->state);
-    uint32 retry_times = 0;
+    uint64 old_buf_state = pg_atomic_read_u64(&desc->state);
+    uint64 retry_times = 0;
 
     /* set BM_LOCKED flag */
     for (retry_times = 0; retry_times < MAX_SPINS_RETRY_TIMES; retry_times++) {
-        old_buf_state = pg_atomic_fetch_or_u32(&desc->state, BM_LOCKED);
+        old_buf_state = pg_atomic_fetch_or_u64(&desc->state, BM_LOCKED);
         /* if it wasn't set before we're OK */
         if (!(old_buf_state & BM_LOCKED)) {
             *buf_state = old_buf_state | BM_LOCKED;
@@ -6785,20 +7167,20 @@ bool retryLockBufHdr(BufferDesc *desc, uint32 *buf_state)
  * Obviously the buffer could be locked by the time the value is returned, so
  * this is primarily useful in CAS style loops.
  */
-uint32 WaitBufHdrUnlocked(BufferDesc *buf)
+uint64 WaitBufHdrUnlocked(BufferDesc *buf)
 {
 #ifndef ENABLE_THREAD_CHECK
     SpinDelayStatus delay_status = init_spin_delay(buf);
 #endif
-    uint32 buf_state;
+    uint64 buf_state;
 
-    buf_state = pg_atomic_read_u32(&buf->state);
+    buf_state = pg_atomic_read_u64(&buf->state);
 
     while (buf_state & BM_LOCKED) {
 #ifndef ENABLE_THREAD_CHECK
         perform_spin_delay(&delay_status);
 #endif
-        buf_state = pg_atomic_read_u32(&buf->state);
+        buf_state = pg_atomic_read_u64(&buf->state);
     }
 
 #ifndef ENABLE_THREAD_CHECK
@@ -7230,22 +7612,18 @@ void ForgetBuffer(RelFileNode rnode, ForkNumber forkNum, BlockNumber blockNum)
     SMgrRelation smgr = smgropen(rnode, InvalidBackendId);
     BufferTag    tag;            /* identity of target block */
     uint32       hash;           /* hash value for tag */
-    LWLock*      partitionLock;  /* buffer partition lock for it */
     int          bufId;
     BufferDesc  *bufHdr;
-    uint32       bufState;
+    uint64       bufState;
 
     /* create a tag so we can lookup the buffer */
     INIT_BUFFERTAG(tag, smgr->smgr_rnode.node, forkNum, blockNum);
 
     /* determine its hash code and partition lock ID */
     hash = BufTableHashCode(&tag);
-    partitionLock = BufMappingPartitionLock(hash);
 
     /* see if the block is in the buffer pool */
-    LWLockAcquire(partitionLock, LW_SHARED);
     bufId = BufTableLookup(&tag, hash);
-    LWLockRelease(partitionLock);
 
     /* didn't find it, so nothing to do */
     if (bufId < 0) {
@@ -7256,6 +7634,10 @@ void ForgetBuffer(RelFileNode rnode, ForkNumber forkNum, BlockNumber blockNum)
     bufHdr = GetBufferDescriptor(bufId);
     bufState = LockBufHdr(bufHdr);
 
+    if (!BUFFERTAGS_PTR_EQUAL(&bufHdr->tag, &tag)) {
+        UnlockBufHdr(bufHdr, bufState);
+        return;
+    }
     /*
      * The buffer might been evicted after we released the partition lock and
      * before we acquired the buffer header lock.  If so, the buffer we've
@@ -7340,13 +7722,102 @@ bool IsPageHitBufferPool(RelFileNode& node, ForkNumber forkNum, BlockNumber bloc
 
     INIT_BUFFERTAG(newTag, node, forkNum, blockNum);
     uint32 new_hash = BufTableHashCode(&newTag);
-    LWLock *new_partition_lock = BufMappingPartitionLock(new_hash);
     /* see if the block is in the buffer pool already */
-    (void)LWLockAcquire(new_partition_lock, LW_SHARED);
     bufId = BufTableLookup(&newTag, new_hash);
-    LWLockRelease(new_partition_lock);
-    if (bufId != -1) {
-        return true;
+    if (bufId < 0) {
+        return false;
     }
-    return false;
+
+    BufferDesc* bufHdr = GetBufferDescriptor(bufId);
+    uint64 bufState = LockBufHdr(bufHdr);
+
+    if (!BUFFERTAGS_PTR_EQUAL(&bufHdr->tag, &newTag)) {
+        UnlockBufHdr(bufHdr, bufState);
+        return false;
+    }
+
+    UnlockBufHdr(bufHdr, bufState);
+    return true;
+}
+
+void buffer_in_progress_pop()
+{
+    Assert(t_thrd.storage_cxt.ParentInProgressBuf == NULL);
+    t_thrd.storage_cxt.ParentInProgressBuf = t_thrd.storage_cxt.InProgressBuf;
+    t_thrd.storage_cxt.ParentIsForInput = t_thrd.storage_cxt.IsForInput;
+    t_thrd.storage_cxt.InProgressBuf = NULL;
+}
+
+void buffer_in_progress_push()
+{
+    t_thrd.storage_cxt.InProgressBuf = t_thrd.storage_cxt.ParentInProgressBuf;
+    t_thrd.storage_cxt.IsForInput = t_thrd.storage_cxt.ParentIsForInput;
+    t_thrd.storage_cxt.ParentInProgressBuf = NULL;
+}
+
+void SSTryEliminateBuf(uint64 times)
+{
+    BufferDesc *buf = NULL;
+    uint64 buf_state;
+    LWLock *partition_lock = NULL;
+    BufferTag tag;
+    uint64 flags;
+    uint32 hash;
+
+    buf = SSTryGetBuffer(times, &buf_state);
+    if (buf == NULL) {
+        return;
+    }
+
+    UnlockBufHdr(buf, buf_state);
+    tag = buf->tag;
+    hash = BufTableHashCode(&tag);
+    partition_lock = BufMappingPartitionLock(hash);
+    if (!LWLockAcquire(partition_lock, LW_EXCLUSIVE)) {
+        return;
+    }
+
+    buf_state = LockBufHdr(buf);
+    if (!BUFFERTAGS_EQUAL(buf->tag, tag)) {
+        UnlockBufHdr(buf, buf_state);
+        LWLockRelease(partition_lock);
+        return;
+    }
+
+    if (BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
+        UnlockBufHdr(buf, buf_state);
+        LWLockRelease(partition_lock);
+        return;
+    }
+
+    tag = buf->tag;
+    flags = buf_state & BUF_FLAG_MASK;
+    if (flags & BM_DIRTY) {
+        UnlockBufHdr(buf, buf_state);
+        LWLockRelease(partition_lock);
+        return;
+    }
+
+    if (flags & BM_TAG_VALID) {
+        if (!DmsReleaseOwner(tag, buf->buf_id)) {
+            UnlockBufHdr(buf, buf_state);
+            LWLockRelease(partition_lock);
+            return;
+        }
+    }
+
+    ereport(LOG, (errmodule(MOD_DMS), (errmsg("try eliminate buf, buf tag:[%u/%u/%u/%d %d-%u], buf id:%d",
+                                              tag.rnode.spcNode, tag.rnode.dbNode, tag.rnode.relNode,
+                                              tag.rnode.bucketNode, tag.forkNum, tag.blockNum, buf->buf_id))));
+
+    CLEAR_BUFFERTAG(tag);
+    buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
+    UnlockBufHdr(buf, buf_state);
+
+    if (flags & BM_TAG_VALID) {
+        BufTableDelete(&tag, hash);
+    }
+
+    ereport(LOG, (errmodule(MOD_DMS), (errmsg("try eliminate buf success"))));
+    LWLockRelease(partition_lock);
 }

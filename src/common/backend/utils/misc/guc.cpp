@@ -42,7 +42,9 @@
 #ifdef ENABLE_WHITEBOX
 #include "access/ustore/knl_whitebox_test.h"
 #endif
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 #include "catalog/namespace.h"
 #include "catalog/pgxc_group.h"
 #include "catalog/storage_gtt.h"
@@ -172,8 +174,10 @@
 #include "utils/guc_memory.h"
 #include "utils/guc_network.h"
 #include "utils/guc_resource.h"
+#include "utils/guc_uwal.h"
 #include "utils/mem_snapshot.h"
 #include "nodes/parsenodes_common.h"
+#include "mb/pg_wchar.h"
 
 #ifndef PG_KRB_SRVTAB
 #define PG_KRB_SRVTAB ""
@@ -360,7 +364,6 @@ const char* sync_guc_variable_namelist[] = {"work_mem",
     "enable_codegen_print",
     "codegen_cost_threshold",
     "codegen_strategy",
-    "max_query_retry_times",
     "convert_string_to_digit",
 #ifdef ENABLE_MULTIPLE_NODES
     "agg_redistribute_enhancement",
@@ -441,7 +444,8 @@ const char* sync_guc_variable_namelist[] = {"work_mem",
     "track_stmt_details_size",
     "sql_note",
     "max_error_count",
-    "enable_expr_fusion"
+    "enable_expr_fusion",
+    "heap_bulk_read_size"
     };
 
 static void set_config_sourcefile(const char* name, char* sourcefile, int sourceline);
@@ -498,9 +502,11 @@ static void pg_timezone_abbrev_initialize(void);
 static void assign_tcp_keepalives_idle(int newval, void *extra);
 static void assign_tcp_keepalives_interval(int newval, void *extra);
 static void assign_tcp_keepalives_count(int newval, void *extra);
+static void assign_tcp_user_timeout(int newval, void *extra);
 static const char* show_tcp_keepalives_idle(void);
 static const char* show_tcp_keepalives_interval(void);
 static const char* show_tcp_keepalives_count(void);
+static const char* show_tcp_user_timeout(void);
 static bool check_effective_io_concurrency(int* newval, void** extra, GucSource source);
 static void assign_effective_io_concurrency(int newval, void* extra);
 static void assign_pgstat_temp_directory(const char* newval, void* extra);
@@ -851,7 +857,7 @@ static const struct config_enum_entry sync_config_strategy_options[] = {
 #endif
 
 static const struct config_enum_entry cluster_run_mode_options[] = {
-    {"cluster_primary", RUN_MODE_PRIMARY, false}, 
+    {"cluster_primary", RUN_MODE_PRIMARY, false},
     {"cluster_standby", RUN_MODE_STANDBY, false},
     {NULL, 0, false}};
 
@@ -1676,7 +1682,11 @@ static void InitConfigureNamesBool()
             &u_sess->attr.attr_common.enable_bbox_dump,
             true,
             NULL,
+#ifdef ENABLE_BBOX
             assign_bbox_coredump,
+#else
+            NULL,
+#endif /* ENABLE_BBOX */
             NULL},
         {{"enable_default_index_deduplication",
             PGC_POSTMASTER,
@@ -1878,7 +1888,7 @@ static void InitConfigureNamesBool()
             NULL,
             NULL,
             NULL,
-            NULL
+            false
         },
         {{"enable_iud_fusion",
             PGC_USERSET,
@@ -1891,7 +1901,7 @@ static void InitConfigureNamesBool()
             NULL,
             NULL,
             NULL,
-            NULL
+            false
         },
 #endif
         {{"enable_expr_fusion",
@@ -1905,7 +1915,7 @@ static void InitConfigureNamesBool()
             NULL,
             NULL,
             NULL,
-            NULL
+            false
         },
         {{"ts_adaptive_threads",
             PGC_SIGHUP, 
@@ -1944,6 +1954,7 @@ static void InitConfigureNamesBool()
             NULL,
             NULL
         },
+#ifndef ENABLE_FINANCE_MODE
         {{"enable_ustore",
             PGC_POSTMASTER,
             NODE_SINGLENODE,
@@ -1957,6 +1968,21 @@ static void InitConfigureNamesBool()
             NULL,
             false
         },
+#else
+        {{"enable_ustore",
+            PGC_INTERNAL,
+            NODE_SINGLENODE,
+            QUERY_TUNING_METHOD,
+            gettext_noop("Enable ustore storage engine"),
+            NULL},
+            &g_instance.attr.attr_storage.enable_ustore,
+            false,
+            NULL,
+            NULL,
+            NULL,
+            false
+        },
+#endif
         {{"enable_gtt_concurrent_truncate",
             PGC_SIGHUP,
             NODE_SINGLENODE,
@@ -2014,6 +2040,31 @@ static void InitConfigureNamesBool()
             NULL,
             },
             &g_instance.attr.attr_common.light_comm,
+            false,
+            NULL,
+            NULL,
+            NULL
+        },
+        {{"enable_nls",
+            PGC_USERSET,
+            NODE_ALL,
+            UNGROUPED,
+            gettext_noop("enable native language support"),
+            NULL},
+            &u_sess->attr.attr_common.enable_nls,
+            false,
+            NULL,
+            NULL,
+            NULL
+        },
+        {{"enable_proc_coverage",
+            PGC_SUSET,
+            NODE_ALL,
+            INSTRUMENTS_OPTIONS,
+            gettext_noop("Enable procedure coverage"),
+            NULL,
+            },
+            &u_sess->attr.attr_common.enable_proc_coverage,
             false,
             NULL,
             NULL,
@@ -2182,7 +2233,7 @@ static void InitConfigureNamesInt()
             NULL},
         {{"max_query_retry_times",
             PGC_USERSET,
-            NODE_ALL,
+            NODE_DISTRIBUTE,
             CLIENT_CONN_STATEMENT,
             gettext_noop("Sets the maximum sql retry times."),
             gettext_noop("A value of 0 turns off the retry."),
@@ -2456,6 +2507,21 @@ static void InitConfigureNamesInt()
             NULL,
             NULL},
 
+        {{"log_max_size",
+            PGC_SIGHUP,
+            NODE_SINGLENODE,
+            LOGGING_WHERE,
+            gettext_noop("Automatic log file elimination will occur after N kilobytes."),
+            NULL,
+            GUC_UNIT_KB},
+            &u_sess->attr.attr_common.LogMaxSize,
+            0,
+            0,
+            INT_MAX,
+            NULL,
+            NULL,
+            NULL},
+
         {{"max_function_args",
             PGC_INTERNAL,
             NODE_ALL,
@@ -2542,8 +2608,8 @@ static void InitConfigureNamesInt()
             0,
             3600000,
             NULL,
-            assign_tcp_keepalives_count,
-            show_tcp_keepalives_count},
+            assign_tcp_user_timeout,
+            show_tcp_user_timeout},
         {{"gin_fuzzy_search_limit",
             PGC_USERSET,
             NODE_ALL,
@@ -3032,6 +3098,19 @@ static void InitConfigureNamesInt()
             NULL,
             NULL,
             NULL},
+        {{"time_record_level",
+            PGC_USERSET,
+            NODE_SINGLENODE,
+            STATS_COLLECTOR,
+            gettext_noop("Set time record level."),
+            NULL},
+            &u_sess->attr.attr_common.time_record_level,
+            0,
+            0,
+            10,
+            NULL,
+            NULL,
+            NULL},
         /* End-of-list marker */
         {{NULL,
             (GucContext)0,
@@ -3361,7 +3440,7 @@ static void InitConfigureNamesString()
             NULL,
             NULL},
             
-         {{"thread_pool_stream_attr",
+        {{"thread_pool_stream_attr",
             PGC_POSTMASTER,
             NODE_ALL,
             CLIENT_CONN,
@@ -3703,9 +3782,15 @@ static void InitConfigureNamesString()
             NULL},
             &u_sess->attr.attr_common.bbox_dump_path,
             "",
+#ifdef ENABLE_BBOX
             check_bbox_corepath,
             assign_bbox_corepath,
             show_bbox_dump_path},
+#else
+            NULL,
+            NULL,
+            NULL},
+#endif /* ENABLE_BBOX */
 
         {{"alarm_component",
             PGC_POSTMASTER,
@@ -3969,9 +4054,15 @@ static void InitConfigureNamesString()
             GUC_LIST_INPUT},
             &g_instance.attr.attr_common.bbox_blacklist_items,
             "",
+#ifdef ENABLE_BBOX
             check_bbox_blacklist,
             assign_bbox_blacklist,
             show_bbox_blacklist},
+#else
+            NULL,
+            NULL,
+            NULL},        
+#endif /* ENABLE_BBOX */
 
         {{"track_stmt_stat_level",
             PGC_USERSET,
@@ -4397,7 +4488,7 @@ static void InitConfigureNamesEnum()
             NULL,
             NULL},
         {{"instr_unique_sql_track_type",
-            PGC_INTERNAL,
+            PGC_USERSET,
             NODE_ALL,
             INSTRUMENTS_OPTIONS,
             gettext_noop("unique sql track type"),
@@ -4405,18 +4496,6 @@ static void InitConfigureNamesEnum()
             &u_sess->attr.attr_common.unique_sql_track_type,
             UNIQUE_SQL_TRACK_TOP,
             unique_sql_track_option,
-            NULL,
-            NULL,
-            NULL},
-        {{"cluster_run_mode",
-            PGC_POSTMASTER,
-            NODE_SINGLENODE,
-            PRESET_OPTIONS,
-            gettext_noop("Sets the type of shared storage cluster."),
-            NULL},
-            &g_instance.attr.attr_common.cluster_run_mode,
-            RUN_MODE_PRIMARY,
-            cluster_run_mode_options,
             NULL,
             NULL,
             NULL},
@@ -4477,7 +4556,7 @@ static void ShowAllGUCConfig(const char* likename, DestReceiver* dest);
 static char* _ShowOption(struct config_generic* record, bool use_units, bool is_show);
 static bool validate_option_array_item(const char* name, const char* value, bool skipIfNoPermissions);
 #ifndef ENABLE_MULTIPLE_NODES
-static void replace_config_value(char** optlines, char* name, char* value, config_type vartype);
+static void replace_config_value(char** optlines, char* name, char* value, config_type vartype, ConfFileLock* filelock);
 #endif
 
 /*
@@ -4785,6 +4864,7 @@ static void InitSingleNodeUnsupportGuc()
     u_sess->attr.attr_common.transaction_sync_timeout = 600;
     u_sess->attr.attr_storage.default_index_kind = DEFAULT_INDEX_KIND_GLOBAL;
     u_sess->attr.attr_sql.application_type = NOT_PERFECT_SHARDING_TYPE;
+    u_sess->attr.attr_common.max_query_retry_times = 0;
     /* for Double Guc Variables */
     u_sess->attr.attr_sql.stream_multiple = DEFAULT_STREAM_MULTIPLE;
     u_sess->attr.attr_sql.max_cn_temp_file_size = 5 * 1024 * 1024;
@@ -6664,14 +6744,15 @@ bool parse_int(const char* value, int* result, int flags, const char** hintmsg)
 
 /*
  * Try to parse value as an 64-bit integer.  The accepted format is
- * decimal number.
+ * decimal number, octal, or hexadecimal formats, optionally followed by
+ * a unit name if "flags" indicates a unit is allowed.
  *
  * If the string parses okay, return true, else false.
  * If okay and result is not NULL, return the value in *result.
  * If not okay and hintmsg is not NULL, *hintmsg is set to a suitable
  *	HINT message, or NULL if no hint provided.
  */
-bool parse_int64(const char* value, int64* result, const char** hintmsg)
+bool parse_int64(const char *value, int64 *result, int flags, const char **hintmsg)
 {
     int64 val;
     char* endptr = NULL;
@@ -6694,7 +6775,7 @@ bool parse_int64(const char* value, int64* result, const char** hintmsg)
     val = strtol(value, &endptr, 10);
 #endif
 
-    if (endptr == value || *endptr != '\0') {
+    if (endptr == value) {
         return false; /* no HINT for integer syntax error */
     }
 
@@ -6702,6 +6783,38 @@ bool parse_int64(const char* value, int64* result, const char** hintmsg)
         if (hintmsg != NULL) {
             *hintmsg = gettext_noop("Value exceeds 64-bit integer range.");
         }
+        return false;
+    }
+
+    /* allow whitespace between integer and unit */
+    while (isspace((unsigned char)*endptr))
+        endptr++;
+
+    /* Handle possible unit conversion before check integer overflow */
+    if (*endptr != '\0') {
+        /*
+         * Note: the multiple-switch coding technique here is a bit tedious,
+         * but seems necessary to avoid intermediate-value overflows.
+         */
+        if (flags & GUC_UNIT_MEMORY) {
+            val = (int64)MemoryUnitConvert(&endptr, val, flags, hintmsg);
+        } else if (flags & GUC_UNIT_TIME) {
+            val = (int64)TimeUnitConvert(&endptr, val, flags, hintmsg);
+        }
+
+        /* allow whitespace after unit */
+        while (isspace((unsigned char)*endptr))
+            endptr++;
+
+        if (*endptr != '\0')
+            return false; /* appropriate hint, if any, already set */
+    }
+
+    /* Check for integer overflow */
+    if (val != (int64)val) {
+        if (hintmsg != nullptr)
+            *hintmsg = gettext_noop("Value exceeds integer range.");
+
         return false;
     }
 
@@ -7262,7 +7375,7 @@ static bool validate_conf_int64(struct config_generic *record, const char *name,
     int64* newval = (newvalue == NULL ? &tmpnewval : (int64*)newvalue);
     const char* hintmsg = NULL;
 
-    if (!parse_int64(value, newval, &hintmsg)) {
+    if (!parse_int64(value, newval, conf->gen.flags, &hintmsg)) {
         ereport(elevel,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("parameter \"%s\" requires a numeric value", name)));
@@ -8303,6 +8416,9 @@ static void set_config_sourcefile(const char* name, char* sourcefile, int source
  */
 void SetConfigOption(const char* name, const char* value, GucContext context, GucSource source)
 {
+    if (strcmp(name, "client_encoding") == 0 && pg_char_to_encoding(value) == PG_GB18030_2022) {
+        value = "gb18030";
+    }
     (void)set_config_option(name, value, context, source, GUC_ACTION_SET, true, 0);
 }
 
@@ -8559,7 +8675,7 @@ static char* flatten_set_variable_args(const char* name, List* args)
  * parameter to be updated is new then it is appended to the list of
  * parameters.
  */
-static void replace_config_value(char** optlines, char* name, char* value, config_type vartype)
+static void replace_config_value(char** optlines, char* name, char* value, config_type vartype, ConfFileLock* filelock)
 {
     Assert(optlines != NULL);
 
@@ -8578,6 +8694,11 @@ static void replace_config_value(char** optlines, char* name, char* value, confi
             rc = snprintf_s(newline, MAX_PARAM_LEN, MAX_PARAM_LEN - 1, "%s = %s\n", name, value);
             break;
         case PGC_STRING:
+            if (strlen(name) + strlen(value) + 6 >= MAX_PARAM_LEN) {
+                pfree(newline);
+                release_file_lock(filelock);
+                ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("the length of GUC string type value exceed 1024.")));
+            }
             rc = snprintf_s(newline, MAX_PARAM_LEN, MAX_PARAM_LEN - 1, "%s = '%s'\n", name, value);
             break;
     }
@@ -8881,7 +9002,7 @@ void AlterSystemSetConfigFile(AlterSystemStmt * altersysstmt)
      * exists OR add it as a new cofiguration parameter in the file.
      * and we should leave postgresql.conf.bak like gs_guc.
      */
-    replace_config_value(opt_lines, name, value, record->vartype);
+    replace_config_value(opt_lines, name, value, record->vartype, &filelock);
     WriteAlterSystemSetGucFile(ConfTmpFileName, opt_lines, &filelock);
     opt_lines = read_guc_file(ConfTmpFileName);
     WriteAlterSystemSetGucFile(ConfTmpBakFileName, opt_lines, &filelock);
@@ -11954,6 +12075,21 @@ static const char* show_tcp_keepalives_count(void)
     static char nbuf[maxBufLen];
 
     errno_t rc = snprintf_s(nbuf, maxBufLen, maxBufLen - 1, "%d", pq_getkeepalivescount(u_sess->proc_cxt.MyProcPort));
+    securec_check_ss(rc, "\0", "\0");
+    return nbuf;
+}
+
+static void assign_tcp_user_timeout(int newval, void *extra)
+{
+    (void) pq_settcpusertimeout(newval, u_sess->proc_cxt.MyProcPort);
+}
+
+static const char* show_tcp_user_timeout(void)
+{
+    const int maxBufLen = 16;
+    static char nbuf[maxBufLen];
+
+    errno_t rc = snprintf_s(nbuf, maxBufLen, maxBufLen - 1, "%d", pq_gettcpusertimeout(u_sess->proc_cxt.MyProcPort));
     securec_check_ss(rc, "\0", "\0");
     return nbuf;
 }

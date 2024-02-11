@@ -81,7 +81,6 @@
 #endif   /* ENABLE_MULTIPLE_NODES */
 
 #define MAX_NUMA_NODE 16
-#define BACKEND_TYPE_CMAGENT 0x0020
 
 extern THR_LOCAL uint32 *g_workingVersionNum;
 
@@ -275,6 +274,7 @@ void InitProcGlobal(void)
 #endif
     g_instance.proc_base->freeProcs = NULL;
     g_instance.proc_base->externalFreeProcs = NULL;
+    g_instance.proc_base->dmsFreeProcs = NULL;
     g_instance.proc_base->autovacFreeProcs = NULL;
     g_instance.proc_base->pgjobfreeProcs = NULL;
     g_instance.proc_base->cmAgentFreeProcs = NULL;
@@ -425,13 +425,21 @@ void InitProcGlobal(void)
             procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->pgjobfreeProcs;
             g_instance.proc_base->pgjobfreeProcs = procs[i];
         } else if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS +
-                   g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS + \
-                   NUM_DMS_CALLBACK_PROCS) {
+                   g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS) {
             /* PGPROC for external thread, add to externalFreeProcs list */
             procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->externalFreeProcs;
             g_instance.proc_base->externalFreeProcs = procs[i];
-            if (!pg_atomic_read_u32(&g_instance.dms_cxt.dmsProcSid)) {
-                pg_atomic_write_u32(&g_instance.dms_cxt.dmsProcSid, (uint32)(i + NUM_DCF_CALLBACK_PROCS));
+        } else if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS +
+                   g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS + \
+                   NUM_DMS_CALLBACK_PROCS) {
+            procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->dmsFreeProcs;
+            g_instance.proc_base->dmsFreeProcs = procs[i];
+            if (g_instance.dms_cxt.SSFakeSessionCxt.session_start == 0) {
+                g_instance.dms_cxt.SSFakeSessionCxt.session_start = i;
+                size_t size = NUM_DMS_CALLBACK_PROCS * sizeof(bool);
+                g_instance.dms_cxt.SSFakeSessionCxt.fake_sessions = 
+                    (bool*)CACHELINEALIGN(palloc0(size + PG_CACHE_LINE_SIZE));
+                g_instance.dms_cxt.SSFakeSessionCxt.fake_session_cnt = NUM_DMS_CALLBACK_PROCS;
             }
         } else if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS +
                    g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS + NUM_CMAGENT_PROCS + \
@@ -628,8 +636,10 @@ static void GetProcFromFreeList()
         t_thrd.proc = g_instance.proc_base->pgjobfreeProcs;
     } else if (IsBgWorkerProcess()) {
         t_thrd.proc = g_instance.proc_base->bgworkerFreeProcs;
-    } else if (t_thrd.dcf_cxt.is_dcf_thread || t_thrd.role == DMS_WORKER) {
+    } else if (t_thrd.dcf_cxt.is_dcf_thread) {
         t_thrd.proc = g_instance.proc_base->externalFreeProcs;
+    } else if (t_thrd.role == DMS_WORKER) {
+        t_thrd.proc = g_instance.proc_base->dmsFreeProcs;
     } else if (u_sess->libpq_cxt.IsConnFromCmAgent) {
         t_thrd.proc = GetFreeCMAgentProc();
     } else {
@@ -745,8 +755,10 @@ void InitProcess(void)
             g_instance.proc_base->pgjobfreeProcs = (PGPROC*)t_thrd.proc->links.next;
         } else if (IsBgWorkerProcess()) {
             g_instance.proc_base->bgworkerFreeProcs = (PGPROC*)t_thrd.proc->links.next;
-        } else if (t_thrd.dcf_cxt.is_dcf_thread || t_thrd.role == DMS_WORKER) {
+        } else if (t_thrd.dcf_cxt.is_dcf_thread) {
             g_instance.proc_base->externalFreeProcs = (PGPROC*)t_thrd.proc->links.next;
+        } else if (t_thrd.role == DMS_WORKER) {
+            g_instance.proc_base->dmsFreeProcs = (PGPROC*)t_thrd.proc->links.next;
         } else if (u_sess->libpq_cxt.IsConnFromCmAgent) {
             g_instance.proc_base->cmAgentFreeProcs = (PGPROC *)t_thrd.proc->links.next;
         } else {
@@ -843,6 +855,9 @@ void InitProcess(void)
     t_thrd.pgxact->xmin = InvalidTransactionId;
     t_thrd.proc->snapXmax = InvalidTransactionId;
     t_thrd.proc->snapCSN = InvalidCommitSeqNo;
+    t_thrd.proc->exrto_read_lsn = 0;
+    t_thrd.proc->exrto_min = 0;
+    t_thrd.proc->exrto_gen_snap_time = 0;
     t_thrd.pgxact->csn_min = InvalidCommitSeqNo;
     t_thrd.pgxact->csn_dr = InvalidCommitSeqNo;
     t_thrd.pgxact->prepare_xid = InvalidTransactionId;
@@ -905,6 +920,9 @@ void InitProcess(void)
     /* Initialize fields for group XID clearing. */
     t_thrd.proc->procArrayGroupMember = false;
     t_thrd.proc->procArrayGroupMemberXid = InvalidTransactionId;
+    t_thrd.proc->procArrayGroupSubXactNXids = InvalidTransactionId;
+    t_thrd.proc->procArrayGroupSubXactXids = NULL;
+    t_thrd.proc->procArrayGroupSubXactLatestXid = InvalidTransactionId;
     pg_atomic_init_u32(&t_thrd.proc->procArrayGroupNext, INVALID_PGPROCNO);
 
     /* Initialize fields for group snapshot getting. */
@@ -975,7 +993,6 @@ void InitProcess(void)
      * g_instance.proc_base->cmAgentFreeProcs if proc_ext happend.
      */
     if (u_sess->libpq_cxt.IsConnFromCmAgent) {
-        t_thrd.bn->backend_type = BACKEND_TYPE_CMAGENT;
         CheckCMAReservedProc();
     }
 
@@ -1106,6 +1123,10 @@ void InitAuxiliaryProcess(void)
     t_thrd.pgxact->xmin = InvalidTransactionId;
     t_thrd.proc->snapXmax = InvalidTransactionId;
     t_thrd.proc->snapCSN = InvalidCommitSeqNo;
+    t_thrd.proc->exrto_read_lsn = 0;
+    t_thrd.proc->exrto_min = 0;
+    t_thrd.proc->exrto_gen_snap_time = 0;
+    t_thrd.proc->exrto_reload_cache = true;
     t_thrd.pgxact->csn_min = InvalidCommitSeqNo;
     t_thrd.pgxact->csn_dr = InvalidCommitSeqNo;
     t_thrd.proc->backendId = InvalidBackendId;
@@ -1357,9 +1378,12 @@ static void ProcPutBackToFreeList()
     } else if (IsJobSchedulerProcess() || IsJobWorkerProcess()) {
         t_thrd.proc->links.next = (SHM_QUEUE*)g_instance.proc_base->pgjobfreeProcs;
         g_instance.proc_base->pgjobfreeProcs = t_thrd.proc;
-    } else if (t_thrd.dcf_cxt.is_dcf_thread || t_thrd.role == DMS_WORKER) {
+    } else if (t_thrd.dcf_cxt.is_dcf_thread) {
         t_thrd.proc->links.next = (SHM_QUEUE *)g_instance.proc_base->externalFreeProcs;
         g_instance.proc_base->externalFreeProcs = t_thrd.proc;
+    } else if (t_thrd.role == DMS_WORKER) {
+        t_thrd.proc->links.next = (SHM_QUEUE *)g_instance.proc_base->dmsFreeProcs;
+        g_instance.proc_base->dmsFreeProcs = t_thrd.proc;
     } else if (u_sess->libpq_cxt.IsConnFromCmAgent) {
         t_thrd.proc->links.next = (SHM_QUEUE*)g_instance.proc_base->cmAgentFreeProcs;
         g_instance.proc_base->cmAgentFreeProcs = t_thrd.proc;
@@ -2086,6 +2110,10 @@ int ProcSleep(LOCALLOCK* locallock, LockMethod lockMethodTable, bool allow_con_u
                     ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
                         errmsg("could not obtain lock on row in relation,waitSec = %d", waitSec)));
                 } else {
+                    StringInfoData callStack;
+                    initStringInfo(&callStack);
+                    get_stack_according_to_tid(t_thrd.storage_cxt.conflicting_lock_thread_id, &callStack);
+                    FreeStringInfo(&callStack);
                     ereport(ERROR, (errcode(ERRCODE_LOCK_WAIT_TIMEOUT),
                                 (errmsg("Lock wait timeout: thread %lu on node %s waiting for %s on %s after %ld.%03d ms",
                                         t_thrd.proc_cxt.MyProcPid, g_instance.attr.attr_common.PGXCNodeName, modename, buf.data, msecs,
@@ -2601,7 +2629,7 @@ bool enable_session_sig_alarm(int delayms)
     struct itimerval timeval;
     errno_t rc = EOK;
 
-    /* Session timer only work when connect form app, not work for inner conncection. */
+    /* Session timer only work when connect from app, not work for inner conncection. */
     if (!IsConnFromApp() || IS_THREAD_POOL_STREAM) {
         return true;
     }
@@ -2648,7 +2676,7 @@ bool enable_idle_in_transaction_session_sig_alarm(int delayms)
     struct itimerval timeval;
     errno_t rc = EOK;
 
-    /* Session timer only work when connect form app, not work for inner conncection. */
+    /* Session timer only work when connect from app, not work for inner conncection. */
     if (!IsConnFromApp() || IS_THREAD_POOL_STREAM) {
         return true;
     }

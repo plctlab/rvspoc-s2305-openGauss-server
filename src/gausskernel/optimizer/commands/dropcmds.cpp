@@ -90,6 +90,7 @@ static void DropExtensionInListIsSupported(List* objname)
         "db_c_parser",
         "db_pg_parser",
         "hdfs_fdw",
+        "age",
 #endif
     };
     int len = lengthof(supportList);
@@ -363,11 +364,12 @@ static void does_not_exist_skipping(ObjectType objtype, List* objname, List* obj
             else
                 ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), (errmsg("unknown type: %d",(int)ptype->type))));
  
-            if (!schema_does_not_exist_skipping(typ->names, &msg, &name)) {
+            List *typeNames = list_copy(typ->names);
+            if (!schema_does_not_exist_skipping(typeNames, &msg, &name)) {
                 msg = gettext_noop("type \"%s\" does not exist");
                 name = TypeNameToString(typ);
             }
-            
+            list_free_ext(typeNames);
         }  break;
         case OBJECT_COLLATION:
             msg = gettext_noop("collation \"%s\" does not exist");

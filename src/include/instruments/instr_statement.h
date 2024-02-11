@@ -162,7 +162,7 @@ struct StatementDetail {
 #define STATEMENT_DETAIL_TYPE_PRETTY "pretty"
 
 #define Anum_statement_history_finish_time 12
-
+#define FLUSH_USLEEP_INTERVAL 100000
 /* entry for full/slow sql stat */
 typedef struct StatementStatContext {
     void *next;             /* next item if in free or suspend list */
@@ -177,6 +177,7 @@ typedef struct StatementStatContext {
     uint64 unique_query_id;     /* from knl_u_unique_sql_context's unique_sql_id */
     uint64 debug_query_id;      /* from knl_session_context's debug_query_id */
     uint32 unique_sql_cn_id;    /* from knl_session_context's unique_sql_cn_id */
+    uint64 parent_query_id;
     char trace_id[MAX_TRACE_ID_SIZE]; /* from knl_session_context's trace_id */
     char* query;                /* from PgBackendStatus's st_activity
                                     or knl_u_unique_sql_context's curr_single_unique_sql */

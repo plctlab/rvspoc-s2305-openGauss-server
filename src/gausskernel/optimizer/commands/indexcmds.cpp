@@ -73,6 +73,10 @@
 
 #include "securec.h"
 
+#ifdef USE_SPQ
+#include "access/spq_btbuild.h"
+#endif
+
 /* non-export function prototypes */
 void CheckPredicate(Expr* predicate);
 Oid GetIndexOpClass(List* opclass, Oid attrType, const char* accessMethodName, Oid accessMethodId);
@@ -420,6 +424,9 @@ static List *ExtractSubPartitionIdf(IndexStmt* stmt, List *subPartitionOidList, 
                 (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
                 errmsg("Cannot match subpartitions when create subpartition indexes.")));
     }
+
+    /* the element stmt->partClause point has been freed */
+    stmt->partClause = (Node*)partitionIndexdef;
 
     /* Count sum of subpartitions */
     foreach(lc1, backupIdxdef) {
@@ -814,6 +821,7 @@ ObjectAddress DefineIndex(Oid relationId, IndexStmt* stmt, Oid indexRelationId, 
             (errcode(ERRCODE_DUPLICATE_TABLE),
                 errmsg("relation \"%s\" already exists, skipping", stmt->idxname)));
         heap_close(rel, NoLock);
+        SetUserIdAndSecContext(root_save_userid, root_save_sec_context);
         return address;
     }
 
@@ -2020,7 +2028,13 @@ ObjectAddress DefineIndex(Oid relationId, IndexStmt* stmt, Oid indexRelationId, 
      * Index can now be marked valid -- update its pg_index entry
      */
     index_set_state_flags(indexRelationId, INDEX_CREATE_SET_VALID);
-
+#ifdef USE_SPQ
+    Relation indexRelation;
+    indexRelation = index_open(indexRelationId, RowExclusiveLock);
+    if (enable_spq_btbuild(indexRelation))
+        spq_btbuild_update_pg_class(rel, indexRelation);
+    index_close(indexRelation, NoLock);
+#endif
     /*
      * The pg_index update will cause backends (including this one) to update
      * relcache entries for the index itself, but we should also send a
@@ -2073,7 +2087,8 @@ static bool columnIsExist(Relation rel, const Form_pg_attribute attTup, const Li
                 HeapTuple tuple;
                 Value* colValue = (Value*)linitial(ielem->collation);
                 char* colName = colValue->val.str;
-                Oid colId = CollationGetCollid(colName);
+                /* ielem->collation is a Value list with schema */
+                Oid colId = get_collation_oid(ielem->collation, true);
                 Oid attColId = InvalidOid;
 
                 if (0 == colId) {
@@ -5400,11 +5415,12 @@ static void CheckIndexParamsNumber(IndexStmt* stmt) {
 
 static bool CheckIdxParamsOwnPartKey(Relation rel, const List* indexParams)
 {
-    if (!PartExprKeyIsNull(rel, NULL)) {
+    if (!PartExprKeyIsNull(rel)) {
         return false;
     }
-    int2vector* partKey = ((RangePartitionMap*)rel->partMap)->partitionKey;
-    for (int i = 0; i < partKey->dim1; i++) {
+    int2vector* partKey = PartitionMapGetPartKeyArray(rel->partMap);
+    int partKeyNum = PartitionMapGetPartKeyNum(rel->partMap);
+    for (int i = 0; i < partKeyNum; i++) {
         int2 attNum = partKey->values[i];
         Form_pg_attribute attTup = &rel->rd_att->attrs[attNum - 1];
         if (!columnIsExist(rel, attTup, indexParams)) {

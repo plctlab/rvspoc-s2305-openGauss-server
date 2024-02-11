@@ -762,7 +762,7 @@ bool check_client_encoding(char** newval, void** extra, GucSource source)
 
     /* Look up the encoding by name */
     encoding = pg_valid_client_encoding(*newval);
-    if (encoding < 0) {
+    if (encoding < 0 || encoding == PG_GB18030_2022) {
         return false;
     }
 
@@ -874,7 +874,7 @@ bool check_collation_connection(char** newval, void** extra, GucSource source)
     }
 
     Oid collid = get_collation_oid_with_lower_name(*newval, PG_INVALID_ENCODING);
-    if (!OidIsValid(collid)) {
+    if (!COLLATION_IN_B_FORMAT(collid)) {
         return false;
     }
 

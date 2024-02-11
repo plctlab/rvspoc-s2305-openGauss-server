@@ -17,6 +17,7 @@
 #include "thread.h"
 #include "common/fe_memutils.h"
 #include "storage/file/fio_device.h"
+#include "logger.h"
 
 static void *pgBackupValidateFiles(void *arg);
 static void do_validate_instance(void);
@@ -43,6 +44,48 @@ typedef struct
      */
     int            ret;
 } validate_files_arg;
+
+/* Progress Counter */
+static int g_inregularFiles = 0;
+static int g_doneFiles = 0;
+static int g_totalFiles = 0;
+static volatile bool g_progressFlag = false;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void *ProgressReportValidate(void *arg)
+{
+    if (g_totalFiles == 0) {
+        return nullptr;
+    }
+    char progressBar[53];
+    int percent;
+    do {
+        /* progress report */
+        percent = (int)(g_doneFiles * 100 / g_totalFiles);
+        GenerateProgressBar(percent, progressBar);
+        fprintf(stdout, "Progress: %s %d%% (%d/%d, done_files/total_files). validate file \r",
+            progressBar, percent, g_doneFiles, g_totalFiles);
+        pthread_mutex_lock(&g_mutex);
+        timespec timeout;
+        timeval now;
+        gettimeofday(&now, nullptr);
+        timeout.tv_sec = now.tv_sec + 1;
+        timeout.tv_nsec = 0;
+        int ret = pthread_cond_timedwait(&g_cond, &g_mutex, &timeout);
+        pthread_mutex_unlock(&g_mutex);
+        if (ret == ETIMEDOUT) {
+            continue;
+        } else {
+            break;
+        }
+    } while (((g_doneFiles + g_inregularFiles) < g_totalFiles) && !g_progressFlag);
+    percent = 100;
+    GenerateProgressBar(percent, progressBar);
+    fprintf(stdout, "Progress: %s %d%% (%d/%d, done_files/total_files). validate file \n",
+        progressBar, percent, g_totalFiles, g_totalFiles);
+    return nullptr;
+}
 
 bool pre_check_backup(pgBackup *backup)
 {
@@ -138,6 +181,7 @@ pgBackupValidate(pgBackup *backup, pgRestoreParams *params)
     join_path_components(dss_path, backup->root_dir, DSSDATA_DIR);
     join_path_components(external_prefix, backup->root_dir, EXTERNAL_DIR);
     files = get_backup_filelist(backup, false);
+    g_totalFiles = parray_num(files);
 
     if (!files)
     {
@@ -148,7 +192,7 @@ pgBackupValidate(pgBackup *backup, pgRestoreParams *params)
     }
 
     /* setup threads */
-    for (i = 0; (size_t)i < parray_num(files); i++)
+    for (i = 0; i < g_totalFiles; i++)
     {
         pgFile       *file = (pgFile *) parray_get(files, i);
         pg_atomic_clear_flag(&file->lock);
@@ -164,6 +208,10 @@ pgBackupValidate(pgBackup *backup, pgRestoreParams *params)
     if (threads_args == NULL) {
         elog(ERROR, "Out of memory");
     }
+    
+    elog(INFO, "Begin validate file");
+    pthread_t progressThread;
+    pthread_create(&progressThread, nullptr, ProgressReportValidate, nullptr);
 
     /* Validate files */
     thread_interrupted = false;
@@ -203,6 +251,13 @@ pgBackupValidate(pgBackup *backup, pgRestoreParams *params)
 
     pfree(threads);
     pfree(threads_args);
+
+    g_progressFlag = true;
+    pthread_mutex_lock(&g_mutex);
+    pthread_cond_signal(&g_cond);
+    pthread_mutex_unlock(&g_mutex);
+    pthread_join(progressThread, nullptr);
+    elog(INFO, "Finish validate file. ");
 
     /* cleanup */
     parray_walk(files, pgFileFree);
@@ -292,9 +347,6 @@ void check_crc(pgFile *file, char *file_fullpath, validate_files_arg *arguments)
          * check page headers, checksums (if enabled)
          * and compute checksum of the file
          */
-        if (IsDssMode()) {
-            return;
-        }
         if (!validate_file_pages(file, file_fullpath, arguments->stop_lsn,
                               arguments->checksum_version,
                               arguments->backup_version,
@@ -315,7 +367,7 @@ pgBackupValidateFiles(void *arg)
     int            i;
     validate_files_arg *arguments = (validate_files_arg *)arg;
     int            num_files = parray_num(arguments->files);
-
+    int inregularFilesLocal = 0;
     for (i = 0; i < num_files; i++)
     {
         struct stat st;
@@ -326,15 +378,19 @@ pgBackupValidateFiles(void *arg)
             elog(ERROR, "Interrupted during validate");
 
         /* Validate only regular files */
-        if (!S_ISREG(file->mode))
+        if (!S_ISREG(file->mode)) {
+            inregularFilesLocal++;
             continue;
+        }
+            
 
         if (!pg_atomic_test_set_flag(&file->lock))
             continue;
-
+        
+        pg_atomic_add_fetch_u32((volatile uint32*) &g_doneFiles, 1);
         if (progress)
-            elog(INFO, "Progress: (%d/%d). Validate file \"%s\"",
-                 i + 1, num_files, file->rel_path);
+            elog_file(INFO, "Progress: (%d/%d). Validate file \"%s\"",
+                i + 1, num_files, file->rel_path);
 
         /*
          * Skip files which has no data, because they
@@ -393,6 +449,7 @@ pgBackupValidateFiles(void *arg)
 
         check_crc(file, file_fullpath, arguments);        
     }
+    pg_atomic_write_u32((volatile uint32*) &g_inregularFiles, inregularFilesLocal);
 
     /* Data files validation is successful */
     arguments->ret = 0;

@@ -123,6 +123,12 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
                  * First time through: build hash table for inner relation.
                  */
                 Assert(hashtable == NULL);
+#ifdef USE_SPQ
+                if (IS_SPQ_RUNNING && node->prefetch_inner) {
+                    node->hj_FirstOuterTupleSlot = NULL;
+                    goto CREATE_HASH_TABLE;
+                }
+#endif
                 /*
                  * If the outer relation is completely empty, and it's not
                  * right/full join, we can quit without building the hash
@@ -176,7 +182,12 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
                         node->hj_OuterNotEmpty = true;
                 } else
                     node->hj_FirstOuterTupleSlot = NULL;
-
+#ifdef USE_SPQ
+CREATE_HASH_TABLE:
+                bool keepNulls = (IS_SPQ_RUNNING) ?
+                    (HJ_FILL_INNER(node) || hashNode->hs_keepnull):
+                    (HJ_FILL_INNER(node) || node->js.nulleqqual != NIL);
+#endif
                 /*
                  * create the hash table, sometimes we should keep nulls
                  */
@@ -184,17 +195,24 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
                     /* enable_memory_limit */
                     oldcxt = MemoryContextSwitchTo(hashNode->ps.nodeContext);
                 }
-
+#ifdef USE_SPQ
+                hashtable = ExecHashTableCreate((Hash*)hashNode->ps.plan, node->hj_HashOperators,
+                    keepNulls, node->hj_hashCollations);
+#else
                 hashtable = ExecHashTableCreate((Hash*)hashNode->ps.plan, node->hj_HashOperators,
                     HJ_FILL_INNER(node) || node->js.nulleqqual != NIL, node->hj_hashCollations);
-                    
+#endif                    
                 if (oldcxt) {
                     /* enable_memory_limit */
                     MemoryContextSwitchTo(oldcxt);
                 }
                 
                 node->hj_HashTable = hashtable;
-
+#ifdef USE_SPQ
+                if (IS_SPQ_RUNNING) {
+                    hashNode->hs_quit_if_hashkeys_null = (node->js.jointype == JOIN_LASJ_NOTIN);
+                }
+#endif
                 /*
                  * execute the Hash node, to build the hash table
                  */
@@ -210,7 +228,10 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
                 EARLY_FREE_LOG(elog(LOG, "Early Free: Hash Table for HashJoin"
                     " is built at node %d, memory used %d MB.",
                     (node->js.ps.plan)->plan_node_id, getSessionMemoryUsageMB()));
-
+#ifdef USE_SPQ
+                if (IS_SPQ_RUNNING && node->js.jointype == JOIN_LASJ_NOTIN && hashNode->hs_hashkeys_null)
+                    return NULL;
+#endif
                 /*
                  * If the inner relation is completely empty, and we're not
                  * doing a left outer join, we can quit without scanning the
@@ -229,7 +250,11 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
 
                     return NULL;
                 }
-
+#ifdef USE_SPQ
+            if (IS_SPQ_RUNNING) {
+                node->hj_InnerEmpty = (hashtable->totalTuples == 0);
+            }
+#endif
                 /*
                  * need to remember whether nbatch has increased since we
                  * began scanning the outer relation
@@ -303,6 +328,14 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
 
                 /* fall through */
             case HJ_SCAN_BUCKET:
+#ifdef USE_SPQ
+                if (IS_SPQ_RUNNING && node->js.jointype == JOIN_LASJ_NOTIN && !node->hj_InnerEmpty &&
+                    IsJoinExprNull(node->hj_OuterHashKeys, econtext)) {
+                    node->hj_MatchedOuter = true;
+                    node->hj_JoinState = HJ_NEED_NEW_OUTER;
+                    continue;
+                }
+#endif
                 /*
                  * Scan the selected hash bucket for matches to current outer
                  */
@@ -346,7 +379,12 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
                         HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(node->hj_CurTuple));
 
                         /* Anti join: we never return a matched tuple */
+#ifdef USE_SPQ
+                        if (jointype == JOIN_ANTI || jointype == JOIN_LEFT_ANTI_FULL ||
+                            (IS_SPQ_RUNNING && jointype == JOIN_LASJ_NOTIN)) {
+#else
                         if (jointype == JOIN_ANTI || jointype == JOIN_LEFT_ANTI_FULL) {
+#endif
                             node->hj_JoinState = HJ_NEED_NEW_OUTER;
                             continue;
                         }
@@ -566,6 +604,22 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
         hjstate->hashclauses = (List*)ExecInitExprByRecursion((Expr*)node->hashclauses, (PlanState*)hjstate);
     }
 
+#ifdef USE_SPQ
+    if (IS_SPQ_RUNNING) {
+        if (JOIN_LASJ_NOTIN == node->join.jointype && node->hashqualclauses != nullptr) {
+            hjstate->hj_nonequijoin = true;
+        } else {
+            hjstate->hj_nonequijoin = false;
+        }
+
+        hjstate->prefetch_inner = node->join.prefetch_inner;
+
+        if (node->join.is_set_op_join) {
+            hjstate->hj_nonequijoin = true;
+        }
+    }
+#endif
+
     /*
      * initialize child nodes
      *
@@ -578,6 +632,12 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
 
     outerPlanState(hjstate) = ExecInitNode(outerNode, estate, eflags);
     innerPlanState(hjstate) = ExecInitNode((Plan*)hashNode, estate, eflags);
+
+#ifdef USE_SPQ
+    if (IS_SPQ_RUNNING) {
+        ((HashState *)innerPlanState(hjstate))->hs_keepnull = hjstate->hj_nonequijoin;
+    }
+#endif
 
     /*
      * tuple table initialization
@@ -596,6 +656,9 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
         case JOIN_LEFT:
         case JOIN_ANTI:
         case JOIN_LEFT_ANTI_FULL:
+#ifdef USE_SPQ
+        case JOIN_LASJ_NOTIN:
+#endif
             hjstate->hj_NullInnerTupleSlot = ExecInitNullTupleSlot(estate, ExecGetResultType(innerPlanState(hjstate)));
             break;
         case JOIN_RIGHT:
@@ -768,12 +831,26 @@ static TupleTableSlot* ExecHashJoinOuterGetTuple(PlanState* outerNode, HashJoinS
             ExprContext* econtext = hjstate->js.ps.ps_ExprContext;
 
             econtext->ecxt_outertuple = slot;
+#ifdef USE_SPQ
+            bool hashkeys_null = false;
+            bool keep_nulls = (IS_SPQ_RUNNING) ?
+                              (HJ_FILL_OUTER(hjstate) || hjstate->hj_nonequijoin) :
+                              (HJ_FILL_OUTER(hjstate) || hjstate->js.nulleqqual != NIL);
+            if (ExecHashGetHashValue(hashtable,
+                                    econtext,
+                                    hjstate->hj_OuterHashKeys,
+                                    true,	/* outer tuple */
+                                    keep_nulls,
+                                    hashvalue,
+                                    &hashkeys_null)) {
+#else
             if (ExecHashGetHashValue(hashtable,
                                     econtext,
                                     hjstate->hj_OuterHashKeys,
                                     true,                                                    /* outer tuple */
                                     HJ_FILL_OUTER(hjstate) || hjstate->js.nulleqqual != NIL, /* compute null ? */
                                     hashvalue)) {
+#endif
                 /* remember outer relation is not empty for possible rescan */
                 hjstate->hj_OuterNotEmpty = true;
 

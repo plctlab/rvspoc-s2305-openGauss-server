@@ -534,7 +534,7 @@ void move_extent_flush_buffer(XLogMoveExtent *xlog_data)
 
             BufferDesc *buf_desc = BufferGetBufferDescriptor(buffer);
             if (buf_desc->extra->seg_blockno == old_seg_blockno) {
-                uint32 buf_state = LockBufHdr(buf_desc);
+                uint64 buf_state = LockBufHdr(buf_desc);
                 if (buf_state & BM_DIRTY) {
                     /* spin-lock should be released before IO */
                     UnlockBufHdr(buf_desc, buf_state);
@@ -581,14 +581,17 @@ static void redo_atomic_xlog(XLogReaderState *record)
         bool will_init = record->blocks[i].flags & BKPBLOCK_WILL_INIT;
         XLogRedoAction redo_action;
         if (will_init) {
-            XLogInitBufferForRedo(record, i, &redo_buf);
+            redo_action = SSCheckInitPageXLog(record, i, &redo_buf);
+            if (redo_action == BLK_NEEDS_REDO) {
+                XLogInitBufferForRedo(record, i, &redo_buf);
             /*
              * If tablespace is dropped, XLogInitBufferForRedo will return an invalid buffer.
              * We do not make a directoy in the place where the tablespace symlink would be like
              * heap-disk storage, otherwise space metadata block (like MapHead block) may be
              * inconsistent.
              */
-            redo_action = BufferIsValid(redo_buf.buf) ? BLK_NEEDS_REDO : BLK_NOTFOUND;
+                redo_action = BufferIsValid(redo_buf.buf) ? BLK_NEEDS_REDO : BLK_NOTFOUND;
+            }
         } else {
             redo_action = XLogReadBufferForRedo(record, i, &redo_buf);
         }
@@ -661,6 +664,9 @@ static void redo_seghead_extend(XLogReaderState *record)
         SegUnlockReleaseBuffer(redo_buf.buf);
     }
 
+    if (SSCheckInitPageXLogSimple(record, 1, &redo_buf) == BLK_DONE) {
+        return;
+    }
     XLogInitBufferForRedo(record, 1, &redo_buf);
     if (BufferIsValid(redo_buf.buf)) {
         memset_s(redo_buf.pageinfo.page, BLCKSZ, 0, BLCKSZ);
@@ -691,6 +697,9 @@ static void redo_create_extent_group(XLogReaderState *record)
 static void redo_init_map_page(XLogReaderState *record)
 {
     RedoBufferInfo redo_buf;
+    if (SSCheckInitPageXLogSimple(record, 0, &redo_buf) == BLK_DONE) {
+        return;
+    }
     XLogInitBufferForRedo(record, 0, &redo_buf);
     BlockNumber first_page = *(BlockNumber *)XLogRecGetData(record);
 
@@ -703,6 +712,9 @@ static void redo_init_map_page(XLogReaderState *record)
 static void redo_init_inverse_point_page(XLogReaderState *record)
 {
     RedoBufferInfo redo_buf;
+    if (SSCheckInitPageXLogSimple(record, 0, &redo_buf) == BLK_DONE) {
+        return;
+    }
     XLogInitBufferForRedo(record, 0, &redo_buf);
     SegPageInit(redo_buf.pageinfo.page, BLCKSZ);
     PageSetLSN(redo_buf.pageinfo.page, redo_buf.lsn);
@@ -780,20 +792,25 @@ void seg_redo_new_page_copy_and_flush(BufferTag *tag, char *data, XLogRecPtr lsn
         update_max_page_flush_lsn(lsn, t_thrd.proc_cxt.MyProcPid, false);
     }
 
-    bool flush_old_file = false;
-    uint32 pos = seg_dw_single_flush_without_buffer(*tag, (Block)page, &flush_old_file);
-    t_thrd.proc->dw_pos = pos;
-    t_thrd.proc->flush_new_dw = !flush_old_file;
-
-    SegSpace *spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false);
-    SegmentCheck(spc != NULL);
-    seg_physical_write(spc, tag->rnode, tag->forkNum, tag->blockNum, page, true);
-    if (flush_old_file) {
-        g_instance.dw_single_cxt.recovery_buf.single_flush_state[pos] = true;
+    if (dw_enabled() && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 0) {
+        bool flush_old_file = false;
+        uint16 pos = seg_dw_single_flush_without_buffer(*tag, (Block)page, &flush_old_file);
+        t_thrd.proc->dw_pos = pos;
+        t_thrd.proc->flush_new_dw = !flush_old_file;
+        SegSpace *spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false);
+        SegmentCheck(spc != NULL);
+        seg_physical_write(spc, tag->rnode, tag->forkNum, tag->blockNum, page, true);
+        if (flush_old_file) {
+            g_instance.dw_single_cxt.recovery_buf.single_flush_state[pos] = true;
+        } else {
+            g_instance.dw_single_cxt.single_flush_state[pos] = true;
+        }
+        t_thrd.proc->dw_pos = -1;
     } else {
-        g_instance.dw_single_cxt.single_flush_state[pos] = true;
+        SegSpace *spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false);
+        SegmentCheck(spc != NULL);
+        seg_physical_write(spc, tag->rnode, tag->forkNum, tag->blockNum, page, true);
     }
-    t_thrd.proc->dw_pos = -1;
 }
 
 

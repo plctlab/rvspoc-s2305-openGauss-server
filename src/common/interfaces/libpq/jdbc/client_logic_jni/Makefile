@@ -28,14 +28,15 @@ driver_error.cpp \
 jni_string_convertor.cpp \
 jni_util.cpp \
 jni_logger.cpp \
-org_postgresql_jdbc_ClientLogicImpl.cpp
+org_postgresql_jdbc_ClientLogicImpl.cpp\
+org_opengauss_jdbc_ClientLogicImpl.cpp
 
 OBJS = $(CPP_SRCS:.cpp=.o)
 
 all: libgauss_cl_jni.so
 
+# Makefile.shlib has declare target: libgauss_cl_jni.so
 libgauss_cl_jni.so: $(OBJS)
-	$(CC) -fPIC -shared $(CPPFLAGS) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
 install: all installdirs
 	$(INSTALL_DATA) libgauss_cl_jni.so$(X) '$(DESTDIR)$(bindir)/../lib/libgauss_cl_jni.so$(X)'

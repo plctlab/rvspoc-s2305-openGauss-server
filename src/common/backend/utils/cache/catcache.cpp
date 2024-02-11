@@ -1509,6 +1509,7 @@ HeapTuple GetPgAttributeAttrTuple(TupleDesc tupleDesc, const Form_pg_attribute a
     values[Anum_pg_attribute_attinhcount - 1] = Int32GetDatum(attr->attinhcount);
     values[Anum_pg_attribute_attcollation - 1] = ObjectIdGetDatum(attr->attcollation);
     values[Anum_pg_attribute_attkvtype - 1] = Int8GetDatum(attr->attkvtype);
+    values[Anum_pg_attribute_attdroppedname - 1] = NameGetDatum(&(attr->attdroppedname));
 
     /* start out with empty permissions and empty options */
     isnull[Anum_pg_attribute_attacl - 1] = true;
@@ -1697,7 +1698,18 @@ static HeapTuple SearchCatCacheMiss(
     if (ct == NULL) {
         if (IsBootstrapProcessingMode())
             return NULL;
+#ifdef USE_SPQ
+        if ((cache->id == ATTNUM && DatumGetInt16(arguments[1]) == RootSelfItemPointerAttributeNumber) ||
+            (cache->id == ATTNAME && (strcmp(DatumGetCString(arguments[1]), "_root_ctid") == 0))) {
+            ct = CatalogCacheCreateEntry(cache, NULL, arguments, hashValue, hashIndex, false);
 
+            /* immediately set the refcount to 1 */
+            ResourceOwnerEnlargeCatCacheRefs(t_thrd.utils_cxt.CurrentResourceOwner);
+            ct->refcount++;
+            ResourceOwnerRememberCatCacheRef(t_thrd.utils_cxt.CurrentResourceOwner, &ct->tuple);
+        } else
+#endif
+        {
         ct = CatalogCacheCreateEntry(cache, NULL, arguments, hashValue, hashIndex, true);
 
         CACHE4_elog(DEBUG2,
@@ -1713,6 +1725,7 @@ static HeapTuple SearchCatCacheMiss(
          */
 
         return NULL;
+        }
     }
 
     CACHE4_elog(DEBUG2,
@@ -2886,10 +2899,26 @@ static CatCTup* CatalogCacheCreateEntry(
     MemoryContext oldcxt;
 
     /* negative entries have no tuple associated */
+#ifdef USE_SPQ
+    if (ntp || !negative) {
+#else
     if (ntp) {
+#endif
         int i;
         errno_t rc;
-
+#ifdef USE_SPQ
+        if (!ntp) {
+            Form_pg_attribute tmp_attribute;
+            Relation relation;
+            int attno = DatumGetInt16(arguments[1]);
+            Assert(attno > FirstLowInvalidHeapAttributeNumber && attno < 0);
+            tmp_attribute = SystemAttributeDefinition(attno, false, false, false);
+            relation = heap_open(cache->cc_reloid, AccessShareLock);;
+            dtp = heaptuple_from_pg_attribute(relation, tmp_attribute);
+            heap_close(relation, AccessShareLock);
+        } else
+#endif
+        {
         Assert(!negative);
 
         /*
@@ -2903,6 +2932,7 @@ static CatCTup* CatalogCacheCreateEntry(
             dtp = toast_flatten_tuple(ntp, cache->cc_tupdesc);
         else
             dtp = ntp;
+        }
 
         /* Allocate memory for CatCTup and the cached tuple in one go */
         oldcxt = MemoryContextSwitchTo(u_sess->cache_mem_cxt);
@@ -2924,7 +2954,11 @@ static CatCTup* CatalogCacheCreateEntry(
         securec_check(rc, "", "");
         MemoryContextSwitchTo(oldcxt);
 
+#ifdef USE_SPQ
+        if ((ntp && dtp != ntp) || !ntp)
+#else
         if (dtp != ntp)
+#endif
             heap_freetuple_ext(dtp);
 
         /* extract keys - they'll point into the tuple if not by-value */

@@ -59,6 +59,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/gs_package.h"
 #include "catalog/pg_trigger.h"
+#include "catalog/pg_type_fn.h"
 #include "commands/defrem.h"
 #include "commands/trigger.h"
 #ifdef ENABLE_MULTIPLE_NODES
@@ -248,6 +249,7 @@ static void ParseUpdateMultiSet(List *set_target_list, SelectStmt *stmt, core_yy
 static char *GetTargetFuncArgTypeName(char *typeString, TypeName* t);
 static char *FormatFuncArgType(core_yyscan_t yyscanner, char *argsString, List* parameters);
 static char *ParseFunctionArgSrc(core_yyscan_t yyscanner);
+static char *ParseFuncHeadSrc(core_yyscan_t yyscanner, bool isFunction = true);
 static void parameter_check_execute_direct(const char* query);
 static Node *make_node_from_scanbuf(int start_pos, int end_pos, core_yyscan_t yyscanner);
 static int64 SequenceStrGetInt64(const char *str);
@@ -370,7 +372,7 @@ static void setDelimiterName(core_yyscan_t yyscanner, char*input, VariableSetStm
 		DropForeignServerStmt DropUserMappingStmt ExplainStmt ExecDirectStmt FetchStmt
 		GetDiagStmt GrantStmt GrantRoleStmt GrantDbStmt IndexStmt InsertStmt ListenStmt LoadStmt
 		LockStmt NotifyStmt ExplainableStmt PreparableStmt
-		CreateFunctionStmt CreateEventStmt CreateProcedureStmt CreatePackageStmt CreatePackageBodyStmt  AlterFunctionStmt AlterProcedureStmt ReindexStmt RemoveAggrStmt
+		CreateFunctionStmt CreateEventStmt CreateProcedureStmt CreatePackageStmt CreatePackageBodyStmt  AlterFunctionStmt CompileStmt AlterProcedureStmt ReindexStmt RemoveAggrStmt
 		RemoveFuncStmt RemoveOperStmt RemovePackageStmt RenameStmt RevokeStmt RevokeRoleStmt RevokeDbStmt
 		RuleActionStmt RuleActionStmtOrEmpty RuleStmt
 		SecLabelStmt SelectStmt TimeCapsuleStmt TransactionStmt TruncateStmt CallFuncStmt
@@ -434,7 +436,7 @@ static void setDelimiterName(core_yyscan_t yyscanner, char*input, VariableSetStm
 				start_opt preserve_opt rename_opt status_opt comments_opt action_opt
 				end_opt definer_name_opt
 
-%type <ival>	opt_lock lock_type cast_context opt_wait
+%type <ival>	opt_lock lock_type cast_context opt_wait compile_pkg_opt
 %type <ival>	vacuum_option_list vacuum_option_elem opt_verify_options
 %type <boolean>	opt_check opt_force opt_or_replace
 				opt_grant_grant_option opt_grant_admin_option
@@ -474,7 +476,7 @@ static void setDelimiterName(core_yyscan_t yyscanner, char*input, VariableSetStm
 				opt_collation
 
 %type <range>	qualified_name insert_target OptConstrFromTable opt_index_name insert_partition_clause update_delete_partition_clause
-				qualified_trigger_name
+				qualified_trigger_name qualified_name_for_delete
 
 %type <str>		all_Op MathOp
 
@@ -633,8 +635,8 @@ static void setDelimiterName(core_yyscan_t yyscanner, char*input, VariableSetStm
 %type <ielem>	index_elem constraint_elem
 %type <node>	table_ref
 %type <jexpr>	joined_table
-%type <range>	relation_expr
-%type <range>	relation_expr_opt_alias delete_relation_expr_opt_alias
+%type <range>	relation_expr relation_expr_for_delete relation_expr_common
+%type <range>	relation_expr_opt_alias delete_relation_expr_opt_alias relation_expr_opt_alias_for_delete
 %type <target>	target_el single_set_clause set_target insert_column_item connect_by_root_expr
 %type <node>	tablesample_clause timecapsule_clause opt_timecapsule_clause opt_repeatable_clause end_expr start_expr
 
@@ -864,7 +866,7 @@ static void setDelimiterName(core_yyscan_t yyscanner, char*input, VariableSetStm
 	CACHE CALL CALLED CANCELABLE CASCADE CASCADED CASE CAST CATALOG_P CATALOG_NAME CHAIN CHANGE CHAR_P
 	CHARACTER CHARACTERISTICS CHARACTERSET CHARSET CHECK CHECKPOINT CLASS CLASS_ORIGIN CLEAN CLIENT CLIENT_MASTER_KEY CLIENT_MASTER_KEYS CLOB CLOSE
 	CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMN_ENCRYPTION_KEY COLUMN_ENCRYPTION_KEYS COLUMN_NAME COLUMNS COMMENT COMMENTS COMMIT
-	COMMITTED COMPACT COMPATIBLE_ILLEGAL_CHARS COMPLETE COMPLETION COMPRESS CONCURRENTLY CONDITION CONFIGURATION CONNECTION CONSISTENT CONSTANT CONSTRAINT CONSTRAINT_CATALOG CONSTRAINT_NAME CONSTRAINT_SCHEMA CONSTRAINTS
+	COMMITTED COMPACT COMPATIBLE_ILLEGAL_CHARS COMPILE COMPLETE COMPLETION COMPRESS CONCURRENTLY CONDITION CONFIGURATION CONNECTION CONSISTENT CONSTANT CONSTRAINT CONSTRAINT_CATALOG CONSTRAINT_NAME CONSTRAINT_SCHEMA CONSTRAINTS
 	CONTENT_P CONTINUE_P CONTVIEW CONVERSION_P CONVERT_P CONNECT COORDINATOR COORDINATORS COPY COST CREATE
 	CROSS CSN CSV CUBE CURRENT_P
 	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA
@@ -931,7 +933,7 @@ static void setDelimiterName(core_yyscan_t yyscanner, char*input, VariableSetStm
 
 	SAMPLE SAVEPOINT SCHEDULE SCHEMA SCHEMA_NAME SCROLL SEARCH SECOND_P SECURITY SELECT SEPARATOR_P SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHIPPABLE SHOW SHUTDOWN SIBLINGS
-	SIMILAR SIMPLE SIZE SKIP SLAVE SLICE SMALLDATETIME SMALLDATETIME_FORMAT_P SMALLINT SNAPSHOT SOME SOURCE_P SPACE SPILL SPLIT STABLE STACKED_P STANDALONE_P START STARTS STARTWITH
+	SIMILAR SIMPLE SIZE SKIP SLAVE SLICE SMALLDATETIME SMALLDATETIME_FORMAT_P SMALLINT SNAPSHOT SOME SOURCE_P SPACE SPECIFICATION SPILL SPLIT STABLE STACKED_P STANDALONE_P START STARTS STARTWITH
 	STATEMENT STATEMENT_ID STATISTICS STDIN STDOUT STORAGE STORE_P STORED STRATIFY STREAM STRICT_P STRIP_P SUBCLASS_ORIGIN SUBPARTITION SUBPARTITIONS SUBSCRIPTION SUBSTRING
 	SYMMETRIC SYNONYM SYSDATE SYSID SYSTEM_P SYS_REFCURSOR STARTING SQL_P
 
@@ -1199,6 +1201,7 @@ stmt :
 			| ClosePortalStmt
 			| ClusterStmt
 			| CommentStmt
+			| CompileStmt
 			| ConstraintsSetStmt
 			| CopyStmt
 			| CreateAsStmt
@@ -3025,6 +3028,7 @@ opt_boolean_or_string:
 			 * is the same, so we don't need to distinguish them here.
 			 */
 			| ColId_or_Sconst						{ $$ = $1; }
+			| BINARY								{ $$ = "binary";}
 		;
 
 /* Timezone values can be:
@@ -7655,7 +7659,7 @@ master_key_elem:
             // len is not filled on purpose ??
             $$ = (Node*) n;
         }
-        | KEY_PATH '=' ColId
+        | KEY_PATH '=' ColId_or_Sconst
         {
             ClientLogicGlobalParam *n = makeNode (ClientLogicGlobalParam);
             n->key = ClientLogicGlobalProperty::CMK_KEY_PATH;
@@ -8779,11 +8783,12 @@ key_action:
 
 OptInherit: INHERITS '(' qualified_name_list ')'
 			{
-        		const char* message = "CREATE TABLE ... INHERITS is not yet supported.";
-    			InsertErrorMessage(message, u_sess->plsql_cxt.plpgsql_yylloc);
-				ereport(errstate,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("CREATE TABLE ... INHERITS is not yet supported.")));
+				if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+					const char* message = "inherits is not support in B-format database, it conflicts with multi-relation update";
+					InsertErrorMessage(message, u_sess->plsql_cxt.plpgsql_yylloc);
+					ereport(errstate, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("inherits is not support in B-format database, it conflicts with multi-relation update")));
+				}
 				$$ = $3;
 			}
 			| /*EMPTY*/								{ $$ = NIL; }
@@ -9861,6 +9866,34 @@ CreateSeqStmt:
 
 					n->sequence = $5;
 					n->options = $6;
+					n->missing_ok = false;
+					n->ownerId = InvalidOid;
+/* PGXC_BEGIN */
+					n->is_serial = false;
+/* PGXC_END */
+					n->uuid = 0;
+					n->canCreateTempSeq = false;
+					$$ = (Node *)n;
+				}
+			| CREATE OptTemp opt_large_seq SEQUENCE IF_P NOT EXISTS qualified_name OptSeqOptList
+				{
+					CreateSeqStmt *n = makeNode(CreateSeqStmt);
+					$8->relpersistence = $2;
+					n->is_large = $3;
+#ifdef ENABLE_MULTIPLE_NODES
+					if (n->is_large) {
+        				const char* message = "large sequence is not supported.";
+    					InsertErrorMessage(message, u_sess->plsql_cxt.plpgsql_yylloc);
+						ereport(ERROR,
+							(errmodule(MOD_PARSER),
+								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("large sequence is not supported.")));
+					}
+#endif
+
+					n->sequence = $8;
+					n->options = $9;
+					n->missing_ok = true;
 					n->ownerId = InvalidOid;
 /* PGXC_BEGIN */
 					n->is_serial = false;
@@ -11814,7 +11847,7 @@ CreateTrigStmt:
 					{
 						ereport(errstate,
 								(errcode(ERRCODE_SYNTAX_ERROR),
-							 	errmsg("syntax error.")));
+							 	errmsg("or replace is not supported here."), parser_errposition(@2)));
 					}
 					if ($3 != NULL)
 					{
@@ -11886,8 +11919,7 @@ CreateTrigStmt:
 					{
 						ereport(errstate,
 								(errcode(ERRCODE_SYNTAX_ERROR),
-								errmsg("syntax error.")));
-					}
+							 	errmsg("or replace is not supported here."), parser_errposition(@2)));					}
 					if (u_sess->attr.attr_sql.sql_compatibility != B_FORMAT)
 					{
 						ereport(errstate,
@@ -11930,7 +11962,7 @@ CreateTrigStmt:
 					{
 						ereport(errstate,
 								(errcode(ERRCODE_SYNTAX_ERROR),
-								errmsg("syntax error.")));
+							 	errmsg("or replace is not supported here."), parser_errposition(@2)));
 					}
 					if (u_sess->attr.attr_sql.sql_compatibility != B_FORMAT)
 					{
@@ -12424,14 +12456,34 @@ DefineStmt:
 
 					/* can't use qualified_name, sigh */
 					n->typevar = makeRangeVarFromAnyName($3, @3, yyscanner);
+					n->replace = false;
 					n->coldeflist = $6;
+					$$ = (Node *)n;
+				}
+			| CREATE OR REPLACE TYPE_P any_name as_is '(' OptTableFuncElementList ')'
+				{
+					CompositeTypeStmt *n = makeNode(CompositeTypeStmt);
+
+					/* can't use qualified_name, sigh */
+					n->typevar = makeRangeVarFromAnyName($5, @5, yyscanner);
+					n->replace = true;
+					n->coldeflist = $8;
 					$$ = (Node *)n;
 				}
 			| CREATE TYPE_P any_name as_is TABLE OF func_type
 				{
 					TableOfTypeStmt *n = makeNode(TableOfTypeStmt);
+					n->replace = false;
 					n->typname = $3;
 					n->reftypname = $7;
+					$$ = (Node *)n;
+				}
+			| CREATE OR REPLACE TYPE_P any_name as_is TABLE OF func_type
+				{
+					TableOfTypeStmt *n = makeNode(TableOfTypeStmt);
+					n->replace = true;
+					n->typname = $5;
+					n->reftypname = $9;
 					$$ = (Node *)n;
 				}
 			| CREATE TYPE_P any_name as_is ENUM_P '(' opt_enum_val_list ')'
@@ -14972,6 +15024,7 @@ CreateFunctionStmt:
 			CREATE opt_or_replace definer_user FUNCTION func_name_opt_arg proc_args
 			RETURNS func_return createfunc_opt_list opt_definition
 				{
+					set_function_style_pg();
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->isOraStyle = false;
 					n->isPrivate = false;
@@ -14991,6 +15044,7 @@ CreateFunctionStmt:
 			| CREATE opt_or_replace definer_user FUNCTION func_name_opt_arg proc_args
 			  RETURNS TABLE '(' table_func_column_list ')' createfunc_opt_list opt_definition
 				{
+					set_function_style_pg();
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->isOraStyle = false;
 					n->isPrivate = false;
@@ -15011,6 +15065,7 @@ CreateFunctionStmt:
 			| CREATE opt_or_replace definer_user FUNCTION func_name_opt_arg proc_args
 			  createfunc_opt_list opt_definition
 				{
+					set_function_style_pg();
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->isOraStyle = false;
 					n->isPrivate = false;
@@ -15033,6 +15088,10 @@ CreateFunctionStmt:
 				  u_sess->parser_cxt.eaten_begin = false;
 				  pg_yyget_extra(yyscanner)->core_yy_extra.include_ora_comment = true;
                   u_sess->parser_cxt.isCreateFuncOrProc = true;
+				  if (set_is_create_plsql_type()) {
+					set_create_plsql_type_start();
+					set_function_style_a();
+				  }
 			  } subprogram_body
 				{
 					int rc = 0;
@@ -15052,6 +15111,9 @@ CreateFunctionStmt:
 					n->funcname = $5;
 					n->parameters = $6;
 					n->inputHeaderSrc = FormatFuncArgType(yyscanner, funSource->headerSrc, n->parameters);
+					if (enable_plpgsql_gsdependency_guc()) {
+						n->funcHeadSrc = ParseFuncHeadSrc(yyscanner);
+					}
 					n->returnType = $8;
 					n->options = $9;
 					n->options = lappend(n->options, makeDefElem("as",
@@ -15908,6 +15970,10 @@ CreateProcedureStmt:
 				u_sess->parser_cxt.eaten_begin = false;
 				pg_yyget_extra(yyscanner)->core_yy_extra.include_ora_comment = true;
                 u_sess->parser_cxt.isCreateFuncOrProc = true;
+				if (set_is_create_plsql_type()) {
+					set_create_plsql_type_start();
+					set_function_style_a();
+				}
 			} subprogram_body
 				{
                                         int rc = 0;
@@ -15930,6 +15996,9 @@ CreateProcedureStmt:
 					n->funcname = $5;
 					n->parameters = $6;
 					n->inputHeaderSrc = FormatFuncArgType(yyscanner, funSource->headerSrc, n->parameters);
+					if (enable_plpgsql_gsdependency_guc()) {
+						n->funcHeadSrc = ParseFuncHeadSrc(yyscanner, false);
+					}
 					n->returnType = NULL;
 					n->isProcedure = true;
 					if (0 == count)
@@ -15951,9 +16020,11 @@ CreateProcedureStmt:
 		;
 
 CreatePackageStmt:
-			CREATE opt_or_replace PACKAGE pkg_name invoker_rights as_is {pg_yyget_extra(yyscanner)->core_yy_extra.include_ora_comment = true;}
+			CREATE opt_or_replace PACKAGE pkg_name invoker_rights as_is {pg_yyget_extra(yyscanner)->core_yy_extra.include_ora_comment = true;set_function_style_a();}
 				{
-                    u_sess->plsql_cxt.package_as_line = GetLineNumber(t_thrd.postgres_cxt.debug_query_string, @6);
+                    set_create_plsql_type_start();
+					u_sess->plsql_cxt.need_create_depend = true;
+					u_sess->plsql_cxt.package_as_line = GetLineNumber(t_thrd.postgres_cxt.debug_query_string, @6);
                     CreatePackageStmt *n = makeNode(CreatePackageStmt);
 					char *pkgNameBegin = NULL;
 					char *pkgNameEnd = NULL;
@@ -16031,6 +16102,7 @@ CreatePackageStmt:
                             } else {
 								parser_yyerror("package spec is not ended correctly");
 							}
+							u_sess->plsql_cxt.isCreatePkg = false;
                         }
                         tok = YYLEX;
                     }
@@ -16239,7 +16311,8 @@ pkg_body_subprogram: {
 						} else if (block_level == 0 && tok != ';') {
 							in_procedure = false;
 						}
-                        if (tok == ';')
+                        if (tok == ';' || 
+							(u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && pre_tok == ';' && tok == IDENT && in_procedure))
                         {
                             block_level = block_level - 1;
                             if (block_level == 0)
@@ -16368,8 +16441,10 @@ pkg_body_subprogram: {
             }
             ;
 CreatePackageBodyStmt:
-			CREATE opt_or_replace PACKAGE BODY_P pkg_name as_is {pg_yyget_extra(yyscanner)->core_yy_extra.include_ora_comment = true;} pkg_body_subprogram
+			CREATE opt_or_replace PACKAGE BODY_P pkg_name as_is {pg_yyget_extra(yyscanner)->core_yy_extra.include_ora_comment = true;set_function_style_a();} pkg_body_subprogram
 				{
+					set_create_plsql_type_start();
+					u_sess->plsql_cxt.need_create_depend = true;
 					char *pkgNameBegin = NULL;
 					char *pkgNameEnd = NULL;
                     char *pkgName = NULL;
@@ -16563,13 +16638,20 @@ param_name:	type_function_name
 func_return:
 			func_type
 				{
+					if (enable_plpgsql_gsdependency_guc()) {
+						pg_yyget_extra(yyscanner)->core_yy_extra.return_pos_end = yylloc;
+					}
 					/* We can catch over-specified results here if we want to,
 					 * but for now better to silently swallow typmod, etc.
 					 * - thomas 2000-03-22
 					 */
 					$$ = $1;
 				}
-			| func_type DETERMINISTIC
+			| func_type {
+				if (enable_plpgsql_gsdependency_guc()) {
+					pg_yyget_extra(yyscanner)->core_yy_extra.return_pos_end = yylloc;
+				}
+			} DETERMINISTIC
 				{
 					$$ = $1;
 				}
@@ -16862,6 +16944,11 @@ subprogram_body: 	{
 							&& tok != WHILE_P
 							&& tok != REPEAT)
 						{
+							if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && blocklevel == 1 && pre_tok == ';')
+							{
+								proc_e = yylloc;
+								break;
+							}
 							tok = END_P;
 							continue;
 						}
@@ -17070,6 +17157,69 @@ opt_restrict:
 			| /* EMPTY */
 		;
 
+compile_pkg_opt:
+			BODY_P		{$$ = COMPILE_PKG_BODY;}
+			| PACKAGE 	{$$ = COMPILE_PACKAGE;}
+			| SPECIFICATION {$$ = COMPILE_PKG_SPECIFICATION;}
+			| /* EMPTY */	{$$ = COMPILE_PACKAGE;}
+			;
+CompileStmt:
+			ALTER PROCEDURE function_with_argtypes COMPILE
+			{
+				u_sess->plsql_cxt.during_compile = true;
+				CompileStmt *n = makeNode(CompileStmt);
+				if (enable_plpgsql_gsdependency_guc()) {
+					n->objName = ((FuncWithArgs*)$3)->funcname;
+					n->funcArgs = ((FuncWithArgs*)$3)->funcargs;
+					n->compileItem = COMPILE_PROCEDURE;
+				}
+				$$ = (Node*)n;
+			}
+			| ALTER PROCEDURE func_name_opt_arg COMPILE
+			{
+				u_sess->plsql_cxt.during_compile = true;
+				CompileStmt *n = makeNode(CompileStmt);
+				if (enable_plpgsql_gsdependency_guc()) {
+					n->objName = $3;
+					n->funcArgs = NULL;
+					n->compileItem = COMPILE_PROCEDURE;
+				}
+				$$ = (Node*)n;
+			}
+			| ALTER FUNCTION function_with_argtypes COMPILE
+			{
+				u_sess->plsql_cxt.during_compile = true;
+				CompileStmt *n = makeNode(CompileStmt);
+				if (enable_plpgsql_gsdependency_guc()) {
+					n->objName = ((FuncWithArgs*)$3)->funcname;
+					n->funcArgs = ((FuncWithArgs*)$3)->funcargs;
+					n->compileItem = COMPILE_FUNCTION;
+				}
+				$$ = (Node*)n;
+			}
+			| ALTER FUNCTION func_name_opt_arg COMPILE
+			{
+				u_sess->plsql_cxt.during_compile = true;
+				CompileStmt *n = makeNode(CompileStmt);
+				if (enable_plpgsql_gsdependency_guc()) {
+					n->objName = $3;
+					n->funcArgs = NULL;
+					n->compileItem = COMPILE_FUNCTION;
+				}
+				$$ = (Node*)n;
+			}
+			| ALTER PACKAGE pkg_name COMPILE compile_pkg_opt
+			{
+				u_sess->plsql_cxt.during_compile = true;
+				CompileStmt *n = makeNode(CompileStmt);
+				if (enable_plpgsql_gsdependency_guc()) {
+					n->objName = $3;
+					n->funcArgs = NULL;
+					n->compileItem = (CompileEntry)$5;
+				}
+				$$ = (Node*)n;
+			}
+			;
 
 /*****************************************************************************
  *
@@ -17667,23 +17817,25 @@ RenameStmt: ALTER AGGREGATE func_name aggr_args RENAME TO name
 					n->missing_ok = true;
 					$$ = (Node *)n;
 				}
-			| ALTER TABLE relation_expr RENAME TO name
+			| ALTER TABLE relation_expr RENAME TO qualified_name
 				{
 					RenameStmt *n = makeNode(RenameStmt);
 					n->renameType = OBJECT_TABLE;
 					n->relation = $3;
 					n->subname = NULL;
-					n->newname = $6;
+					n->newname = $6->relname;
+					n->newschema = $6->schemaname;
 					n->missing_ok = false;
 					$$ = (Node *)n;
 				}
-			| ALTER TABLE IF_P EXISTS relation_expr RENAME TO name
+			| ALTER TABLE IF_P EXISTS relation_expr RENAME TO qualified_name
 				{
 					RenameStmt *n = makeNode(RenameStmt);
 					n->renameType = OBJECT_TABLE;
 					n->relation = $5;
 					n->subname = NULL;
-					n->newname = $8;
+					n->newname = $8->relname;
+					n->newschema = $8->schemaname;
 					n->missing_ok = true;
 					$$ = (Node *)n;
 				}
@@ -18853,6 +19005,16 @@ AlterSubscriptionStmt:
 					n->subname = $3;
 					n->options = list_make1(makeDefElem("enabled",
 											(Node *)makeInteger(TRUE)));
+					$$ = (Node *)n;
+				}
+			| ALTER SUBSCRIPTION name DISABLE_P
+				{
+					AlterSubscriptionStmt *n =
+						makeNode(AlterSubscriptionStmt);
+					n->refresh = false;
+					n->subname = $3;
+					n->options = list_make1(makeDefElem("enabled",
+											(Node *)makeInteger(FALSE)));
 					$$ = (Node *)n;
 				}		;
 
@@ -21684,7 +21846,6 @@ policy_label_name:
 
 opt_add_resources_to_label:
         ADD_P resources_to_label_list { $$ = $2; }
-        | /* EMPTY */ { $$ = NULL; }
         ;
 
 resources_to_label_list:
@@ -24627,7 +24788,14 @@ relation_expr:
 					$$->inhOpt = INH_DEFAULT;
 					$$->alias = NULL;
 				}
-			| qualified_name '*'
+			| relation_expr_common
+				{
+					$$ = $1;
+				}
+		;
+
+relation_expr_common:
+			 qualified_name '*'
 				{
 					/* inheritance query */
 					$$ = $1;
@@ -24650,6 +24818,26 @@ relation_expr:
 				}
 		;
 
+/* used for multi delete stmt, to support writing table's name forms like t.* or schema.t.* */
+relation_expr_for_delete:
+			qualified_name_for_delete OptSnapshotVersion
+				{
+					/* default inheritance */
+					$$ = $1;
+					if ($2 != NULL)
+					{
+						char *snapshot_name = (char *)palloc0(strlen($1->relname) + 1 + strlen($2) + 1);
+						sprintf(snapshot_name, "%s%c%s", $1->relname, DB4AI_SNAPSHOT_VERSION_DELIMITER, $2);
+						$$->relname = snapshot_name;
+					}
+					$$->inhOpt = INH_DEFAULT;
+					$$->alias = NULL;
+				}
+			| relation_expr_common
+				{
+					$$ = $1;
+				}
+		;
 
 relation_expr_list:
 			relation_expr							{ $$ = list_make1($1); }
@@ -24657,7 +24845,7 @@ relation_expr_list:
 		;
 
 delete_relation_expr_opt_alias:
-    relation_expr_opt_alias                 %prec UMINUS
+    relation_expr_opt_alias_for_delete                 %prec UMINUS
         {
             /*
              * When sql_compatibility is B, name in PARTITION(name) can be
@@ -24672,7 +24860,7 @@ delete_relation_expr_opt_alias:
             }
             $$ = $1;
         }
-    | relation_expr PARTITION '(' name ',' name_list ')'
+    | relation_expr_for_delete PARTITION '(' name ',' name_list ')'
         {
 #ifdef ENABLE_MULTIPLE_NODES
         const char* message = "partition syntax is not yet supported";
@@ -24688,7 +24876,7 @@ delete_relation_expr_opt_alias:
             $1->partitionNameList = lcons(makeString($4), $6);
             $$ = $1;
         }
-    | relation_expr ColId PARTITION '(' name_list ')'
+    | relation_expr_for_delete ColId PARTITION '(' name_list ')'
         {
 #ifdef ENABLE_MULTIPLE_NODES
         const char* message = "partition syntax is not yet supported";
@@ -24707,7 +24895,7 @@ delete_relation_expr_opt_alias:
             $1->partitionNameList = $5;
             $$ = $1;
         }
-    | relation_expr AS ColId PARTITION '(' name_list ')'
+    | relation_expr_for_delete AS ColId PARTITION '(' name_list ')'
         {
 #ifdef ENABLE_MULTIPLE_NODES
         const char* message = "partition syntax is not yet supported";
@@ -24781,6 +24969,66 @@ relation_expr_opt_alias: relation_expr					%prec UMINUS
 					$$ = $1;
 				}
 			| relation_expr update_delete_partition_clause AS ColId
+				{
+					if ($2 != NULL) {
+						$1->partitionname = $2->partitionname;
+						$1->ispartition = $2->ispartition;
+						$1->partitionKeyValuesList = $2->partitionKeyValuesList;
+						$1->subpartitionname = $2->subpartitionname;
+						$1->issubpartition = $2->issubpartition;
+					}
+					Alias *alias = makeNode(Alias);
+					alias->aliasname = $4;
+					$1->alias = alias;
+					$$ = $1;
+				}
+		;
+
+/* used for multi delete stmt */
+relation_expr_opt_alias_for_delete: relation_expr_for_delete					%prec UMINUS
+				{
+					$$ = $1;
+				}
+			| relation_expr_for_delete ColId
+				{
+					Alias *alias = makeNode(Alias);
+					alias->aliasname = $2;
+					$1->alias = alias;
+					$$ = $1;
+				}
+			| relation_expr_for_delete AS ColId
+				{
+					Alias *alias = makeNode(Alias);
+					alias->aliasname = $3;
+					$1->alias = alias;
+					$$ = $1;
+				}
+			| relation_expr_for_delete  update_delete_partition_clause 			%prec UMINUS
+				{
+					if ($2 != NULL) {
+						$1->partitionname = $2->partitionname;
+						$1->ispartition = $2->ispartition;
+						$1->partitionKeyValuesList = $2->partitionKeyValuesList;
+						$1->subpartitionname = $2->subpartitionname;
+						$1->issubpartition = $2->issubpartition;
+					}
+					$$ = $1;
+				}
+			| relation_expr_for_delete update_delete_partition_clause ColId
+				{
+					if ($2 != NULL) {
+						$1->partitionname = $2->partitionname;
+						$1->ispartition = $2->ispartition;
+						$1->partitionKeyValuesList = $2->partitionKeyValuesList;
+						$1->subpartitionname = $2->subpartitionname;
+						$1->issubpartition = $2->issubpartition;
+					}
+					Alias *alias = makeNode(Alias);
+					alias->aliasname = $3;
+					$1->alias = alias;
+					$$ = $1;
+				}
+			| relation_expr_for_delete update_delete_partition_clause AS ColId
 				{
 					if ($2 != NULL) {
 						$1->partitionname = $2->partitionname;
@@ -25555,6 +25803,7 @@ opt_evtime_unit:
 				$$ = list_make1(makeIntConst(INTERVAL_MASK(YEAR) |
 												 INTERVAL_MASK(MONTH), @1));
 			}
+			;
 
 opt_interval:
 			YEAR_P
@@ -25810,6 +26059,7 @@ a_expr:		c_expr									{ $$ = $1; }
 							errmsg("@var_name := expr is not yet supported in distributed database.")));
 #endif
 					if (DB_IS_CMPT(B_FORMAT) && (u_sess->attr.attr_common.enable_set_variable_b_format || ENABLE_SET_VARIABLES)) {
+						u_sess->parser_cxt.has_equal_uservar = true;
 						UserSetElem *n = makeNode(UserSetElem);
 						n->name = list_make1((Node *)$1);
 						n->val = (Expr *)$3;
@@ -28518,6 +28768,60 @@ qualified_name:
 				}
 		;
 
+/*
+ * used for multi delete stmt, to support writing table's name forms like t.* or schema.t.*
+ * when modify qualified_name, please check whether need to sync modifications here.
+ */
+qualified_name_for_delete:
+			ColId
+				{
+					$$ = makeRangeVar(NULL, $1, @1);
+				}
+			| ColId indirection
+				{
+					$$ = makeRangeVar(NULL, NULL, @1);
+					const char* message = "improper qualified name (too many dotted names)";
+					switch (list_length($2))
+					{
+						case 1:
+							if (IsA(linitial($2), A_Star)) {
+								$$->catalogname = NULL;
+								$$->schemaname = NULL;
+								$$->relname = $1;
+							} else {
+								check_qualified_name($2, yyscanner);
+								$$->catalogname = NULL;
+								$$->schemaname = $1;
+								$$->relname = strVal(linitial($2));
+							}
+							break;
+						case 2:
+							if (IsA(lsecond($2), A_Star)) {
+								$$->catalogname = NULL;
+								$$->schemaname = $1;
+								if (!(IsA(linitial($2), String))) {
+									parser_yyerror("syntax error");
+								}
+								$$->relname = strVal(linitial($2));
+							} else {
+								check_qualified_name($2, yyscanner);
+								$$->catalogname = $1;
+								$$->schemaname = strVal(linitial($2));
+								$$->relname = strVal(lsecond($2));
+							}
+							break;
+						default:
+    						InsertErrorMessage(message, u_sess->plsql_cxt.plpgsql_yylloc);
+							ereport(errstate,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("improper qualified name (too many dotted names): %s",
+											NameListToString(lcons(makeString($1), $2))),
+									 parser_errposition(@1)));
+							break;
+					}
+				}
+		;
+
 name_list:	name
 					{ $$ = list_make1(makeString($1)); }
 			| name_list ',' name
@@ -28746,14 +29050,36 @@ SignedIconst: Iconst								{ $$ = $1; }
 
 /* Column identifier --- names that can be column, table, etc names.
  */
-ColId:		IDENT									{ $$ = $1; }
+ColId:		IDENT
+				{ 
+					if (u_sess->attr.attr_sql.enable_ignore_case_in_dquotes 
+					    && (pg_yyget_extra(yyscanner))->core_yy_extra.ident_quoted)
+					{
+						$$ = pg_strtolower(pstrdup($1));
+					}
+					else
+					{
+						$$ = $1;
+					}
+				}
 			| unreserved_keyword					{ $$ = pstrdup($1); }
 			| col_name_keyword						{ $$ = pstrdup($1); }
 		;
 
 /* Type/function identifier --- names that can be type or function names.
  */
-type_function_name:	IDENT							{ $$ = $1; }
+type_function_name:	IDENT
+				{
+					if (u_sess->attr.attr_sql.enable_ignore_case_in_dquotes
+					    && (pg_yyget_extra(yyscanner))->core_yy_extra.ident_quoted)
+					{
+						$$ = pg_strtolower(pstrdup($1));
+					}
+					else
+					{
+						$$ = $1;
+					}
+				}
 			| unreserved_keyword					{ $$ = pstrdup($1); }
 			| type_func_name_keyword				{ $$ = pstrdup($1); }
 		;
@@ -28761,7 +29087,18 @@ type_function_name:	IDENT							{ $$ = $1; }
 /* Column label --- allowed labels in "AS" clauses.
  * This presently includes *all* Postgres keywords.
  */
-ColLabel:	IDENT									{ $$ = $1; }
+ColLabel:	IDENT
+				{
+					if (u_sess->attr.attr_sql.enable_ignore_case_in_dquotes
+					    && (pg_yyget_extra(yyscanner))->core_yy_extra.ident_quoted)
+					{
+						$$ = pg_strtolower(pstrdup($1));
+					}
+					else
+					{
+						$$ = $1;
+					}
+				}
 			| unreserved_keyword					{ $$ = pstrdup($1); }
 			| col_name_keyword						{ $$ = pstrdup($1); }
 			| type_func_name_keyword				{ $$ = pstrdup($1); }
@@ -28904,6 +29241,7 @@ unreserved_keyword:
 			| COMMITTED
 			| COMPATIBLE_ILLEGAL_CHARS
 			| COMPLETE
+			| COMPILE
 			| COMPLETION
 			| COMPRESS
 			| CONDITION
@@ -29245,6 +29583,7 @@ unreserved_keyword:
 			| SNAPSHOT
 			| SOURCE_P
 			| SPACE
+			| SPECIFICATION
 			| SPILL
 			| SPLIT
 			| SQL_P
@@ -29731,7 +30070,7 @@ makeStringConst(char *str, int location)
 
 	if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT)
 	{
-		if (NULL == str || 0 == strlen(str))
+		if (NULL == str || (0 == strlen(str) && !ACCEPT_EMPTY_STR))
 		{
 			n->val.type = T_Null;
 			n->val.val.str = str;
@@ -31320,7 +31659,12 @@ static char *GetTargetFuncArgTypeName(char *typeString, TypeName* t)
 	{
 		Type typtup;
 		Oid toid;
-		typtup = LookupTypeName(NULL, t, NULL, false);
+		TypeDependExtend* dependExtend = NULL;
+		if (enable_plpgsql_gsdependency()) {
+			InstanceTypeNameDependExtend(&dependExtend);
+		}
+		typtup = LookupTypeName(NULL, t, NULL, false, dependExtend);
+		pfree_ext(dependExtend);
 		if (typtup)
 		{
 			toid = typeTypeId(typtup);
@@ -31384,9 +31728,10 @@ static char *FormatFuncArgType(core_yyscan_t yyscanner, char *argsString, List* 
 	pfree(argsString);
 	proc_header_len = proc_header_len;
 
-	yyextra->core_yy_extra.func_param_begin = 0;
-	yyextra->core_yy_extra.func_param_end = 0;
-
+	if (!enable_plpgsql_gsdependency_guc()) {
+		yyextra->core_yy_extra.func_param_begin = 0;
+		yyextra->core_yy_extra.func_param_end = 0;
+	} 
 	return buf.data;
 }
 
@@ -31417,6 +31762,32 @@ static char *ParseFunctionArgSrc(core_yyscan_t yyscanner)
 	yyextra->core_yy_extra.include_ora_comment = false;
 
 	return proc_header_str;
+}
+
+static char *ParseFuncHeadSrc(core_yyscan_t yyscanner, bool is_function)
+{
+	base_yy_extra_type *yyextra = pg_yyget_extra(yyscanner);
+	int proc_header_src_end = 0;
+	char *proc_header_info = NULL;
+	if (is_function) {
+		proc_header_src_end = yyextra->core_yy_extra.return_pos_end - 1;
+	} else {
+		proc_header_src_end = yyextra->core_yy_extra.func_param_end + 1;
+	}
+	if (proc_header_src_end == 1) {
+		return proc_header_info;
+	}
+	yyextra->core_yy_extra.return_pos_end = 0;
+	yyextra->core_yy_extra.func_param_begin = 0;
+	yyextra->core_yy_extra.func_param_end = 0;
+	if (proc_header_src_end > 0) {
+		proc_header_info = (char*)palloc0(proc_header_src_end + 1);
+		errno_t rc = EOK;
+		rc = strncpy_s(proc_header_info, (proc_header_src_end + 1), yyextra->core_yy_extra.scanbuf, proc_header_src_end);
+		securec_check(rc, "\0", "\0");
+		proc_header_info[proc_header_src_end] = '\0';
+	}
+	return proc_header_info;
 }
 
 static void parameter_check_execute_direct(const char* query)
@@ -31742,11 +32113,15 @@ static void CheckPartitionExpr(Node* expr, int* colCount)
 	if (expr == NULL)
 		ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("The expr can't be NULL")));
 	if (expr->type == T_A_Expr) {
-		char* name = strVal(linitial(((A_Expr*)expr)->name));
+		A_Expr* a_expr = (A_Expr*)expr;
+		if (a_expr->name == NULL) {
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("The expr is not supported for Partition Expr")));
+		}
+		char* name = strVal(linitial(a_expr->name));
 		if (strcmp(name, "+") != 0 && strcmp(name, "-") != 0 && strcmp(name, "*") != 0)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("The %s operator is not supported for Partition Expr", name)));
-		CheckPartitionExpr(((A_Expr*)expr)->lexpr, colCount);
-		CheckPartitionExpr(((A_Expr*)expr)->rexpr, colCount);
+		CheckPartitionExpr(a_expr->lexpr, colCount);
+		CheckPartitionExpr(a_expr->rexpr, colCount);
 	} else if (expr->type == T_FuncCall) {
 		char* validFuncName[MAX_SUPPORTED_FUNC_FOR_PART_EXPR] = {"abs","ceiling","datediff","day","dayofmonth","dayofweek","dayofyear","extract","floor","hour",
 		"microsecond","minute","mod","month","quarter","second","time_to_sec","to_days","to_seconds","unix_timestamp","weekday","year","yearweek","date_part","div"};

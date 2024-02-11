@@ -432,6 +432,10 @@ typedef FormData_pg_proc *Form_pg_proc;
 #define GROUPCONCATFUNCOID 4097
 #define CURSORTOXMLOID 2925
 #define CURSORTOXMLSCHEMAOID 2928
+#define UNDEFINEDINPUT 5704
+#define UNDEFINEDOUTPUT 5707
+#define UNDEFINEDSEND 5709
+#define UNDEFINEDRECV 5710
 
 /*
  * Symbolic values for prokind column
@@ -470,6 +474,11 @@ typedef FormData_pg_proc *Form_pg_proc;
 #define PROARGMODE_INOUT    'b'
 #define PROARGMODE_VARIADIC 'v'
 #define PROARGMODE_TABLE    't'
+
+#ifdef USE_SPQ
+#define PRODATAACCESS_NONE  'n'
+#define PRODATAACCESS_ANY   'a'
+#endif
 
 #define PROC_LIB_PATH           "$libdir/"
 #define PORC_PLUGIN_LIB_PATH    "$libdir/pg_plugin/"

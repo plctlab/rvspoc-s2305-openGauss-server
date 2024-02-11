@@ -95,6 +95,7 @@ install:
 	$(MAKE) -C contrib/hstore $@
 	$(MAKE) -C contrib/dblink $@
 	$(MAKE) -C contrib/ndpplugin $@
+	@if test -d contrib/spq_plugin; then $(MAKE) -C contrib/spq_plugin $@; fi
 	@if test -d contrib/dolphin; then $(MAKE) -C contrib/dolphin $@; fi
 	+@echo "openGauss installation complete."
 endif
@@ -110,7 +111,7 @@ install-world:
 # build src/ before contrib/
 install-world-contrib-recurse: install-world-src-recurse
 
-$(call recurse,installdirs uninstall coverage,doc src config)
+$(call recurse,installdirs uninstall coverage init-po update-po,doc src config)
 
 $(call recurse,distprep,doc src config contrib)
 

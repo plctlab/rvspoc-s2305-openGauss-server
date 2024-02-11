@@ -24,6 +24,7 @@
 #include "lib/stringinfo.h"
 #endif
 #include "utils/sortsupport.h"
+#include "catalog/pg_index.h"
 
 /*
  *		Defined in adt/
@@ -279,6 +280,7 @@ extern Datum int4setle(PG_FUNCTION_ARGS);
 extern Datum int4setge(PG_FUNCTION_ARGS);
 extern Datum findinset(PG_FUNCTION_ARGS);
 extern Datum btint8sortsupport(PG_FUNCTION_ARGS);
+extern void check_duplicate_value_by_collation(List* vals, Oid collation, char type);
 
 /* int.c */
 extern Datum int2in(PG_FUNCTION_ARGS);
@@ -855,6 +857,7 @@ extern char* format_operator(Oid operator_oid);
 extern char *format_procedure_qualified(Oid procedure_oid);
 extern char *format_operator_qualified(Oid operator_oid);
 extern void format_procedure_parts(Oid procedure_oid, List **objnames, List **objargs);
+extern char * format_procedure_no_visible(Oid procedure_oid);
 
 /* rowtypes.c */
 extern Datum record_in(PG_FUNCTION_ARGS);
@@ -889,6 +892,10 @@ extern char* pg_get_triggerdef_string(Oid trigid);
 extern Datum pg_get_constraintdef(PG_FUNCTION_ARGS);
 extern Datum pg_get_constraintdef_ext(PG_FUNCTION_ARGS);
 extern char* pg_get_constraintdef_string(Oid constraintId);
+extern char* pg_get_constraintdef_part_string(Oid constraintId);
+extern char *pg_get_partkeydef_string(Relation relation);
+extern void pg_get_indexdef_partitions(Oid indexrelid, Form_pg_index idxrec, bool showTblSpc, 
+                        StringInfoData *buf, bool dumpSchemaOnly, bool showPartitionLocal, bool showSubPartitionLocal);
 extern Datum pg_get_expr(PG_FUNCTION_ARGS);
 extern Datum pg_get_expr_ext(PG_FUNCTION_ARGS);
 extern Datum pg_get_userbyid(PG_FUNCTION_ARGS);
@@ -907,11 +914,12 @@ extern void get_query_def(Query* query, StringInfo buf, List* parentnamespace, T
     bool qrw_phase = false, bool viewdef = false, bool is_fqs = false);
 extern char* deparse_create_sequence(Node* stmt, bool owned_by_none = false);
 extern char* deparse_alter_sequence(Node* stmt, bool owned_by_none = false);
-
 #ifdef PGXC
 extern void get_hint_string(HintState* hstate, StringInfo buf);
 extern void deparse_query(Query* query, StringInfo buf, List* parentnamespace, bool finalise_aggs, bool sortgroup_colno,
     void* parserArg = NULL, bool qrw_phase = false, bool is_fqs = false);
+typedef void (*deparse_query_func)(Query* query, StringInfo buf, List* parentnamespace, bool finalise_aggs,
+    bool sortgroup_colno, void* parserArg, bool qrw_phase, bool is_fqs);
 extern void deparse_targetlist(Query* query, List* targetList, StringInfo buf);
 #endif
 extern List* deparse_context_for(const char* aliasname, Oid relid);
@@ -1099,6 +1107,11 @@ extern Datum unknownin(PG_FUNCTION_ARGS);
 extern Datum unknownout(PG_FUNCTION_ARGS);
 extern Datum unknownrecv(PG_FUNCTION_ARGS);
 extern Datum unknownsend(PG_FUNCTION_ARGS);
+
+extern Datum undefinedin(PG_FUNCTION_ARGS);
+extern Datum undefinedout(PG_FUNCTION_ARGS);
+extern Datum undefinedrecv(PG_FUNCTION_ARGS);
+extern Datum undefinedsend(PG_FUNCTION_ARGS);
 
 extern Datum pg_column_size(PG_FUNCTION_ARGS);
 extern Datum datalength(PG_FUNCTION_ARGS);
@@ -1346,6 +1359,7 @@ extern Datum int1_numeric(PG_FUNCTION_ARGS);
 extern Datum numeric_int1(PG_FUNCTION_ARGS);
 extern Datum float8_numeric(PG_FUNCTION_ARGS);
 extern Datum float8_interval(PG_FUNCTION_ARGS);
+extern Datum float8_to_interval(PG_FUNCTION_ARGS);
 extern Datum numeric_float8(PG_FUNCTION_ARGS);
 extern Datum numeric_float8_no_overflow(PG_FUNCTION_ARGS);
 extern Datum float4_numeric(PG_FUNCTION_ARGS);
@@ -1397,9 +1411,13 @@ extern Datum width_bucket_numeric(PG_FUNCTION_ARGS);
 extern Datum hash_numeric(PG_FUNCTION_ARGS);
 extern Datum numtodsinterval(PG_FUNCTION_ARGS);
 extern Datum numeric_interval(PG_FUNCTION_ARGS);
+extern Datum numeric_to_interval(PG_FUNCTION_ARGS);
 extern Datum int1_interval(PG_FUNCTION_ARGS);
 extern Datum int2_interval(PG_FUNCTION_ARGS);
 extern Datum int4_interval(PG_FUNCTION_ARGS);
+extern Datum int1_to_interval(PG_FUNCTION_ARGS);
+extern Datum int2_to_interval(PG_FUNCTION_ARGS);
+extern Datum int4_to_interval(PG_FUNCTION_ARGS);
 
 /* ri_triggers.c */
 extern Datum RI_FKey_check_ins(PG_FUNCTION_ARGS);
@@ -1787,6 +1805,11 @@ extern Datum gs_stat_wal_entrytable(PG_FUNCTION_ARGS);
 extern Datum gs_walwriter_flush_position(PG_FUNCTION_ARGS);
 extern Datum gs_walwriter_flush_stat(PG_FUNCTION_ARGS);
 
+/* wal sender, receiver, recvwriter stat */
+extern Datum gs_stat_walsender(PG_FUNCTION_ARGS);
+extern Datum gs_stat_walreceiver(PG_FUNCTION_ARGS);
+extern Datum gs_stat_walrecvwriter(PG_FUNCTION_ARGS);
+
 /* Ledger */
 extern Datum get_dn_hist_relhash(PG_FUNCTION_ARGS);
 extern Datum ledger_hist_check(PG_FUNCTION_ARGS);
@@ -1829,6 +1852,7 @@ extern Datum pg_show_replication_origin_status(PG_FUNCTION_ARGS);
 extern Datum btequalimage(PG_FUNCTION_ARGS);
 /* varlena.cpp */
 extern Datum btvarstrequalimage(PG_FUNCTION_ARGS);
+extern Datum text_interval(PG_FUNCTION_ARGS);
 
 /* pg_publication.cpp */
 extern Datum pg_get_publication_tables(PG_FUNCTION_ARGS);
@@ -1851,12 +1875,16 @@ extern Datum compress_buffer_stat_info(PG_FUNCTION_ARGS);
 extern Datum compress_ratio_info(PG_FUNCTION_ARGS);
 extern Datum compress_statistic_info(PG_FUNCTION_ARGS);
 extern Datum pg_read_binary_file_blocks(PG_FUNCTION_ARGS);
+extern Datum dss_io_stat(PG_FUNCTION_ARGS);
+extern Datum get_ondemand_recovery_status(PG_FUNCTION_ARGS);
 
+/* plhandler.cpp */
+extern Datum generate_procoverage_report(PG_FUNCTION_ARGS);
 #else
 #endif
 extern char *pg_ultostr(char *str, uint32 value);
 extern char *pg_ultostr_zeropad(char *str, uint32 value, int32 minwidth);
-
+extern char *printTypmod(const char *typname, int32 typmod, Oid typmodout);
 /* float.cpp */
 extern int float8_cmp_internal(float8 a, float8 b);
 

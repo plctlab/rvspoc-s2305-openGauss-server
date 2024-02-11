@@ -49,6 +49,7 @@
 #include "postmaster/pagerepair.h"
 #include "storage/cfs/cfs_converter.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
+#include "ddes/dms/ss_reform_common.h"
 
 /*
  * During XLOG replay, we may see XLOG records for incremental updates of
@@ -513,7 +514,7 @@ static void CollectInvalidPagesStates(uint32 *nstates_ptr, InvalidPagesState ***
 /* Complain about any remaining invalid-page entries */
 void XLogCheckInvalidPages(void)
 {
-    if (SS_ONDEMAND_BUILD_DONE && !SS_ONDEMAND_RECOVERY_DONE) {
+    if (SS_ONDEMAND_BUILD_DONE && !SS_ONDEMAND_REDO_DONE) {
         return;
     }
 
@@ -1161,6 +1162,17 @@ Buffer XLogReadBufferExtendedForHeapDisk(const RelFileNode &rnode, ForkNumber fo
                 LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
             }
             ReleaseBuffer(buffer);
+            if (ENABLE_DMS && IsExtremeRedo() && SSPrimaryRestartScenario()) {
+                /* page is empty on disk, but has xlog
+                 * in extreme recovery we read buffer with RBM_NORMAL(S) instead of RBM_ZERO_AND_LOCK(X) or other.
+                 * we will load empty page from disk with RBM_NORMAL, it is fine.
+                 * later we will use RBM_ZERO_AND_LOCK. so no need to log_invalid_page.
+                 */
+                if ((IsDefaultExtremeRtoMode() && SS_IN_REFORM) ||
+                    (IsOndemandExtremeRtoMode() && SS_IN_ONDEMAND_RECOVERY)) {
+                    return InvalidBuffer;
+                }
+            }
             RepairFileKey key;
             key.relfilenode = rnode;
             key.forknum = forknum;
@@ -1222,7 +1234,15 @@ Buffer XLogReadBufferExtendedForSegpage(const RelFileNode &rnode, ForkNumber for
 
     if (BufferIsValid(buffer)) {
         Page page = BufferGetPage(buffer);
-        if (mode == RBM_NORMAL) {
+        /*
+         * We check not SS_IN_ONDEMAND_RECOVERY for these reasons:
+         * 1. DMS mode (shared storage) do not support page repair.
+         * 2. In standby failover, some pages meet replay request which
+         *    are in standby shared memorys, but there DRC are lost in
+         *    last primary node. So use LockBuffer in XLogReadBufferExtendedForSegpage
+         *    will read from DISK and cover these newest pages.
+         */
+        if (mode == RBM_NORMAL && !SS_IN_ONDEMAND_RECOVERY) {
             bool buffer_is_locked = false;
             if (ENABLE_DMS && (GetDmsBufCtrl(buffer - 1)->lock_mode == DMS_LOCK_NULL)) {
                 buffer_is_locked = true;
@@ -1235,6 +1255,13 @@ Buffer XLogReadBufferExtendedForSegpage(const RelFileNode &rnode, ForkNumber for
                     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
                 }
                 SegReleaseBuffer(buffer);
+                if (ENABLE_DMS && IsExtremeRedo() && SSPrimaryRestartScenario()) {
+                    // reason same as simliar location in XLogReadBufferExtendedForHeapDisk
+                    if ((IsDefaultExtremeRtoMode() && SS_IN_REFORM) ||
+                        (IsOndemandExtremeRtoMode() && SS_IN_ONDEMAND_RECOVERY)) {
+                        return InvalidBuffer;
+                    }
+                }
                 RepairFileKey key;
                 key.relfilenode = rnode;
                 key.forknum = forknum;
@@ -1380,6 +1407,13 @@ void XlogDropRowReation(RelFileNode rnode)
     rbnode.node = rnode;
     rbnode.backend = InvalidBackendId;
     smgrclosenode(rbnode);
+    if (IS_EXRTO_READ) {
+        RelFileNodeBackend standbyReadRnode;
+        standbyReadRnode.node = rnode;
+        standbyReadRnode.node.spcNode = EXRTO_BLOCK_INFO_SPACE_OID;
+        standbyReadRnode.backend = InvalidBackendId;
+        smgrclosenode(standbyReadRnode);
+    }
 }
 
 void XLogForgetDDLRedo(XLogRecParseState *redoblockstate)
@@ -1437,6 +1471,10 @@ void XLogDropSpaceShrink(XLogRecParseState *redoblockstate)
  */
 void XLogDropRelation(const RelFileNode &rnode, ForkNumber forknum)
 {
+    if (AmErosRecyclerProcess()) {
+        return;
+    }
+
     forget_invalid_pages(rnode, forknum, 0, false);
 
     /* clear relfilenode match entry of recovery thread hashtbl */
@@ -1513,6 +1551,10 @@ void XLogDropDatabase(Oid dbid)
     smgrcloseall();
 
     forget_invalid_pages_batch(InvalidOid, dbid);
+
+    if (AmErosRecyclerProcess()) {
+        return;
+    }
 
     /* clear dbNode match entry of recovery thread hashtbl */
     if (IsExtremeRedo()) {
@@ -1650,7 +1692,7 @@ static void XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
                 (void)close(t_thrd.xlog_cxt.sendFile);
                 t_thrd.xlog_cxt.sendFile = -1;
                 ereport(ERROR, (errcode_for_file_access(),
-                                errmsg("could not seek in log segment %s to offset %u: %m", path, startoff)));
+                                errmsg("could not seek in log segment %s to offset %u: %s", path, startoff, TRANSLATE_ERRNO)));
             }
             t_thrd.xlog_cxt.sendOff = startoff;
         }
@@ -1954,4 +1996,3 @@ XLogRecParseState *multixact_redo_parse_to_block(XLogReaderState *record, uint32
     }
     return recordstatehead;
 }
-

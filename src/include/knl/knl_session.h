@@ -68,6 +68,9 @@
 #include "storage/lock/lock.h"
 #include "utils/elog.h"
 #include "tcop/dest.h"
+#include "og_record_time.h"
+
+#define TSRANK_WEIGHTS_LEN    4
 
 typedef void (*pg_on_exit_callback)(int code, Datum arg);
 
@@ -81,6 +84,9 @@ typedef struct knl_session_attr {
     knl_session_attr_memory attr_memory;
     knl_session_attr_resource attr_resource;
     knl_session_attr_common attr_common;
+#ifdef USE_SPQ
+    knl_session_attr_spq attr_spq;
+#endif
 } knl_session_attr;
 
 typedef struct knl_u_stream_context {
@@ -304,6 +310,8 @@ typedef struct knl_u_analyze_context {
     struct StringInfoData* autoanalyze_timeinfo;
 
     struct BufferAccessStrategyData* vac_strategy;
+
+    char* DeclareCursorName;
 } knl_u_analyze_context;
 
 #define PATH_SEED_FACTOR_LEN 3
@@ -447,6 +455,9 @@ typedef struct knl_u_parser_context {
     void* stmt;
 
     bool has_hintwarning;
+    bool in_userset;
+    bool has_set_uservar;
+    bool has_equal_uservar;
 } knl_u_parser_context;
 
 typedef struct knl_u_trigger_context {
@@ -682,6 +693,9 @@ typedef struct knl_u_utils_context {
 	
     HTAB* set_user_params_htab;
     DestReceiver* spi_printtupDR;
+
+    /* var in tsrank.cpp */
+    float tsrankWs[TSRANK_WEIGHTS_LEN];
 } knl_u_utils_context;
 
 typedef struct knl_u_security_context {
@@ -975,6 +989,8 @@ typedef struct knl_u_plancache_context {
      * The keys for this hash table are the arguments to PREPARE and EXECUTE
      * (statement names); the entries are PreparedStatement structs.
      */
+    pthread_mutex_t pstmt_htbl_lock;
+
     HTAB* prepared_queries;
 
     HTAB* stmt_lightproxy_htab; /* mapping statement name and lightproxy obj, only for gpc */
@@ -1558,6 +1574,21 @@ typedef struct PLpgSQL_compile_context {
     MemoryContext compile_cxt;
 } PLpgSQL_compile_context;
 
+typedef enum CreatePlsqlType {
+    CREATE_PLSQL_TYPE_START = 0,
+    CREATE_PLSQL_TYPE_NOT_CHECK_NSPOID = 1,
+    CREATE_PLSQL_TYPE_RECORD_DEPENDENCE = 2,
+    CREATE_PLSQL_TYPE_RECOMPILE = 3,
+    CREATE_PLSQL_TYPE_END = 4
+} CreatePlsqlType;
+
+typedef enum FunctionStyleType {
+    FUNCTION_STYLE_TYPE_NONE = 0,
+    FUNCTION_STYLE_TYPE_PG = 1,
+    FUNCTION_STYLE_TYPE_A = 2,
+    FUNCTION_STYLE_TYPE_REFRESH_HEAD = 3
+} FunctionStyleType;
+
 typedef struct knl_u_plpgsql_context {
     bool inited;
 
@@ -1667,6 +1698,34 @@ typedef struct knl_u_plpgsql_context {
     bool pragma_autonomous; /* save autonomous flag */
     char* debug_query_string;
     bool is_insert_gs_source; /* is doing insert gs_source? */
+    List* CursorRecordTypeList;  /*Save the type recorded during the cursor definition*/
+
+    // gs depend
+    bool compile_has_warning_info;
+    bool expr_can_have_out_func;
+    bool currCompilingObjStatus;
+    bool need_create_depend;
+    bool during_compile;
+    bool is_pkg_compile;
+    bool isCreatePkg;
+    bool isCreatePkgFunction;
+    bool has_invalid_pkg;
+    bool has_invalid_func;
+    bool has_error;
+    bool is_exec_autonomous;
+    bool in_package_function_compile;
+    bool is_alter_compile_stmt;
+    CreatePlsqlType createPlsqlType;
+    FunctionStyleType functionStyleType;
+    List* pkg_var_info;
+    List* func_compiled_list;
+    List* needRebuildViews;
+    List* usindDependObjOids;
+    Oid curr_object_nspoid;
+    Oid currRefreshPkgOid;
+    MemoryContext depend_mem_cxt; /* temp context for build_gs_depend*/
+    int compile_check_node_level;
+    int real_func_num;
 } knl_u_plpgsql_context;
 
 //this is used to define functions in package
@@ -1752,6 +1811,8 @@ typedef struct knl_u_stat_context {
     bool isTopLevelPlSql;
     int64* localTimeInfoArray;
     uint64* localNetInfo;
+    // use to record all use time in multi thread.
+    void* og_record_stat;
 
     MemoryContext pgStatLocalContext;
     MemoryContext pgStatCollectThdStatusContext;
@@ -1845,6 +1906,9 @@ typedef struct knl_u_storage_context {
     /* md.cpp */
     MemoryContext MdCxt; /* context for all md.c allocations */
 
+    /* exrto_file.cpp */
+    MemoryContext exrto_standby_read_file_cxt;
+
     /* sync.cpp */
     MemoryContext pendingOpsCxt;
     struct HTAB *pendingOps;
@@ -1884,6 +1948,32 @@ typedef struct knl_u_storage_context {
     MemoryContext LocalBufferContext;
     List *partition_dml_oids; /* list of partitioned table's oid which is on dml operations */
     List *partition_ddl_oids; /* list of partitioned table's oid which is on ddl operations */
+
+    /* Max value of pre-read parms, they are used for reseting buffers */
+    int max_heap_bulk_read_size;
+    int max_vacuum_bulk_read_size;
+
+    /* Whether in pre-read process */
+    bool bulk_io_is_in_progress;
+    /* Numbers of pre-read blocks */
+    int bulk_io_in_progress_count;
+    /* Buffers for record BufferDesc*/
+    struct BufferDesc** bulk_io_in_progress_buf;
+    /* Buffers for read from disk */
+    char* bulk_buf_read;
+    /* Buffers for read from disk by vacuum*/
+    char* bulk_buf_vacuum;
+    /* Flags array for whether is input */
+    bool *bulk_io_is_for_input;
+    /* Already numbers of pre-read blocks */
+    int bulk_io_count;
+    /* Error numbers of pre-read blocks */
+    int bulk_io_error_count;
+    /* pre-read watch params */
+    bool is_in_pre_read;
+    int bulk_read_max;
+    int bulk_read_min;
+    int bulk_read_count;
 } knl_u_storage_context;
 
 
@@ -2101,7 +2191,7 @@ typedef struct knl_u_unique_sql_context {
     uint64 unique_sql_id;
     Oid unique_sql_user_id;
     uint32 unique_sql_cn_id;
-
+    uint64 parent_unique_sql_id;
     /*
      * storing unique sql start time,
      * in PortalRun method, we will update unique sql elapse time,
@@ -2201,6 +2291,10 @@ typedef struct knl_u_unique_sql_context {
  
     /* child statements in open cursor case, need always generate unique sql id */
     bool force_generate_unique_sql;
+    /* when record all plsql to statement_history, we need to cache the value for opening a cursor */
+    bool skip_sql_in_open = false;
+    bool is_open_cursor = false;
+    bool need_record_in_dynexecplsql = false;
 #ifndef ENABLE_MULTIPLE_NODES
     char* unique_sql_text;
 #endif
@@ -2647,6 +2741,78 @@ typedef struct knl_u_mot_context {
 } knl_u_mot_context;
 #endif
 
+#ifdef USE_SPQ
+namespace spqdxl {
+    class CDXLMemoryManager;
+    class CDXLTokens;
+    class CParseHandlerFactory;
+}
+
+namespace spqos {
+    class CMemoryPool;
+    class CMemoryPoolManager;
+    class CWorkerPoolManager;
+    template <class T, class K>class CCache;
+    class CCacheFactory;
+    class CMessageRepository;
+}
+
+namespace spqmd {
+    class IMDCacheObject;
+}
+
+namespace spqopt {
+    class CMDKey;
+    class CXformFactory;
+}
+
+typedef struct SpqDirectReadEntry {
+    Oid rel_id;
+    BlockNumber nums;
+    List *spq_seq_scan_node_list;
+} SpqDirectReadEntry;
+
+typedef struct knl_u_spq_context {
+    /* dxl information */
+    spqdxl::CDXLMemoryManager* dxl_memory_manager;
+    spqos::CMemoryPool* pmpXerces;
+    spqos::CMemoryPool* pmpDXL;
+    uintptr_t m_ulpInitDXL;
+    uintptr_t m_ulpShutdownDXL;
+    void *m_pstrmap;
+    void *m_pxmlszmap;
+    void *m_token_parse_handler_func_map;
+    spqos::CMemoryPool* m_mp;
+    spqdxl::CDXLMemoryManager* m_dxl_memory_manager;
+    /* memory pool manager */
+    spqos::CMemoryPoolManager* m_memory_pool_mgr;
+    /* worker pool manager */
+    spqos::CWorkerPoolManager* m_worker_pool_manager;
+    /* mdcache */
+    spqos::CCache<spqmd::IMDCacheObject *, spqopt::CMDKey *> *m_pcache;
+    bool mdcache_invalidation_counter_registered;
+    int64 mdcache_invalidation_counter;
+    int64 last_mdcache_invalidation_counter;
+    /* cache factory */
+    spqos::CCacheFactory* m_factory;
+    spqos::CMessageRepository *m_repository;
+    /* CXformFactory */
+    spqos::CMemoryPool* m_xform_mp;
+    spqopt::CXformFactory* m_pxff;
+    uint64 m_ullCacheQuota;
+    int spq_node_all_configs_size;
+    int spq_node_configs_size;
+    MemoryContext spq_worker_context;
+    MemoryContext s_tupSerMemCtxt;
+    int32 spq_max_tuple_chunk_size;
+    bool spq_opt_initialized;
+    List *remoteQuerys;
+    List *adp_connections;
+    struct SnapshotData* snapshot;
+    List *direct_read_map;
+} knl_u_spq_context;
+#endif
+
 typedef struct knl_u_gtt_context {
     bool gtt_cleaner_exit_registered;
     HTAB* gtt_storage_local_hash;
@@ -2753,6 +2919,12 @@ typedef struct knl_u_hook_context {
     void *pluginSpiReciverParamHook;
     void *pluginSpiExecuteMultiResHook;
     void *pluginMultiResExceptionHook;
+    void *getTypeZeroValueHook;
+    void *deparseQueryHook;
+    void *checkSqlFnRetvalHook;
+    void *typeTransfer;
+    void *forTsdbHook;
+    void *pluginPlannerHook;
 } knl_u_hook_context;
 
 typedef struct knl_u_libsw_context {
@@ -2818,6 +2990,8 @@ typedef struct knl_session_context {
     MemoryContextGroup* mcxt_group;
     /* temp_mem_cxt is a context which will be reset when the session attach to a thread */
     MemoryContext temp_mem_cxt;
+    /* pre_read_mem_cxt is a context which will be used in pre-read process */
+    MemoryContext pre_read_mem_cxt;
     int session_ctr_index;
     uint64 session_id;
     GlobalSessionId globalSessionId;
@@ -2897,6 +3071,10 @@ typedef struct knl_session_context {
     knl_u_mot_context mot_cxt;
 #endif
 
+#ifdef USE_SPQ
+    knl_u_spq_context spq_cxt;
+#endif
+
     /* instrumentation */
     knl_u_unique_sql_context unique_sql_cxt;
     knl_u_user_login_context user_login_cxt;
@@ -2969,6 +3147,18 @@ extern void free_session_context(knl_session_context* session);
 extern void use_fake_session();
 extern bool stp_set_commit_rollback_err_msg(stp_xact_err_type type);
 extern bool enable_out_param_override();
+extern bool enable_plpgsql_gsdependency_guc();
+extern bool enable_plpgsql_gsdependency();
+extern bool enable_plpgsql_undefined();
+extern bool enable_plpgsql_undefined_not_check_nspoid();
+extern void set_create_plsql_type_not_check_nsp_oid();
+extern void set_create_plsql_type_start();
+extern void set_create_plsql_type_end();
+extern void set_create_plsql_type(CreatePlsqlType type);
+extern void set_function_style_none();
+extern void set_function_style_a();
+extern void set_function_style_pg();
+extern bool set_is_create_plsql_type();
 
 extern THR_LOCAL knl_session_context* u_sess;
 

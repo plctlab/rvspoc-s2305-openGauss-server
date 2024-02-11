@@ -540,7 +540,7 @@ logfile_getname(const char *format, time_t timestamp)
 #ifdef WIN32
     if (pg_strftime(filename + len, MAXPGPATH - len, format, tm) <= 0)
 #else
-    if (strftime(filename + len, MAXPGPATH - len, format, tm) <= 0)
+    if (strftime(filename + len, MAXPGPATH - len, format, tm) == 0)
 #endif
         elog_stderr(ERROR, "strftime(%s) failed: %s", format, strerror(errno));
 
@@ -723,6 +723,25 @@ static void open_rotationfile(char *control,
     }
 
     fclose(control_file);
+}
+
+void GenerateProgressBar(int percent, char* progressBar)
+{
+    if (percent > 100) {
+        percent = 100;
+    }
+
+    int barWidth = 50;
+    int filledWidth = (percent * barWidth) / 100;
+
+    progressBar[0] = '[';
+
+    for (int i = 1; i <= barWidth; i++) {
+        progressBar[i] = (i <= filledWidth) ? '=' : ' ';
+    }
+
+    progressBar[barWidth + 1] = ']';
+    progressBar[barWidth + 2] = '\0';
 }
 
 /*

@@ -65,10 +65,16 @@ static void printLocalBroadCastBatch(VectorBatch *batch, DestReceiver *self);
 static void printRedistributeBatch(VectorBatch *batch, DestReceiver *self);
 static void printLocalRedistributeBatch(VectorBatch *batch, DestReceiver *self);
 static void printLocalRoundRobinBatch(VectorBatch *batch, DestReceiver *self);
+#ifdef USE_SPQ
+static void printRoundRobinTuple(TupleTableSlot *tuple, DestReceiver *self);
+static void printRoundRobinBatch(VectorBatch *batch, DestReceiver *self);
+static void printDMLTuple(TupleTableSlot *tuple, DestReceiver *self);
+#endif
 static void printHybridBatch(VectorBatch *batch, DestReceiver *self);
 static void finalizeLocalStream(DestReceiver *self);
 
 inline void AddCheckInfo(StringInfo buf);
+inline MemoryContext changeToTmpContext(DestReceiver *self);
 
 /* ----------------------------------------------------------------
  *		printtup / debugtup support
@@ -116,7 +122,17 @@ DestReceiver *createStreamDestReceiver(CommandDest dest)
         case DestTupleHybrid:
             self->pub.receiveSlot = printHybridTuple;
             break;
-
+#ifdef USE_SPQ
+        case DestTupleDML:
+            self->pub.receiveSlot = printDMLTuple;
+            break;
+        case DestTupleRoundRobin:
+            self->pub.receiveSlot = printRoundRobinTuple;
+            break;
+        case DestBatchRoundRobin:
+            self->pub.sendBatch = printRoundRobinBatch;
+            break;
+#endif
         case DestBatchBroadCast:
             self->pub.sendBatch = printBroadCastBatchCompress;
             break;
@@ -233,6 +249,33 @@ static void printLocalRoundRobinTuple(TupleTableSlot *tuple, DestReceiver *self)
     rec->arg->localRoundRobinStream(tuple);
 }
 
+#ifdef USE_SPQ
+/*
+ * @Description: Send a tuple by roundrobin
+ *
+ * @param[IN] tuple: tuple to send.
+ * @param[IN] dest: dest receiver.
+ * @return void
+ */
+static void printRoundRobinTuple(TupleTableSlot *tuple, DestReceiver *self)
+{
+    streamReceiver *rec = (streamReceiver *)self;
+    rec->arg->roundRobinStream(tuple, self);
+}
+
+/*
+ * @Description: Send a tuple to write node
+ *
+ * @param[IN] tuple: tuple to send.
+ * @param[IN] dest: dest receiver.
+ * @return void
+ */
+static void printDMLTuple(TupleTableSlot *tuple, DestReceiver *self)
+{
+    streamReceiver *rec = (streamReceiver *)self;
+    rec->arg->dmlStream(tuple, self);
+}
+#endif
 /*
  * @Description: Send a tuple in hybrid ways, some data with special values
  *               shoule be sent in special way.
@@ -312,6 +355,20 @@ static void printLocalRoundRobinBatch(VectorBatch *batch, DestReceiver *self)
     rec->arg->localRoundRobinStream(batch);
 }
 
+/*
+ * @Description: Send a batch by roundrobin
+ *
+ * @param[IN] batch: batch to send.
+ * @param[IN] dest: dest receiver.
+ * @return void
+ */
+#ifdef USE_SPQ
+static void printRoundRobinBatch(VectorBatch *batch, DestReceiver *self)
+{
+    streamReceiver *rec = (streamReceiver *)self;
+    rec->arg->roundRobinStream(batch);
+}
+#endif
 /*
  * @Description: Send a batch in hybrid ways, some data with special values
  *               shoule be sent in special way.
@@ -445,6 +502,79 @@ void SetRemoteDestReceiverParams(DestReceiver *self, Portal portal)
             myState->pub.receiveSlot = printtup_20;
     }
 }
+
+#ifdef USE_SPQ
+void assembleSpqStreamMessage(TupleTableSlot *slot, DestReceiver *self, StringInfo buf)
+{
+    TupleDesc typeinfo = slot->tts_tupleDescriptor;
+    DR_printtup *myState = (DR_printtup *)self;
+    int natts = typeinfo->natts;
+    MinimalTuple tuple;
+    int i;
+
+    StreamTimeSerilizeStart(t_thrd.pgxc_cxt.GlobalNetInstr);
+
+    Assert(buf->len == 0);
+    /*
+     * Prepare a DataRow message
+     */
+    buf->cursor = 'D';
+    if (slot->tts_mintuple) {
+        tuple = slot->tts_mintuple;
+    } else {
+        /* Make sure the tuple is fully deconstructed */
+        tableam_tslot_getallattrs(slot);
+
+        MemoryContext old_context = changeToTmpContext(self);
+
+        tuple = heap_form_minimal_tuple(typeinfo, slot->tts_values, slot->tts_isnull, nullptr);
+
+        (void)MemoryContextSwitchTo(old_context);
+    }
+    pq_sendbytes(buf, (char*)tuple, tuple->t_len);
+
+    StreamTimeSerilizeEnd(t_thrd.pgxc_cxt.GlobalNetInstr);
+}
+void spq_printtupRemoteTuple(TupleTableSlot *slot, DestReceiver *self)
+{
+    TupleDesc typeinfo = slot->tts_tupleDescriptor;
+    DR_printtup *myState = (DR_printtup *)self;
+    StringInfo buf = &myState->buf;
+    MinimalTuple tuple;
+    int natts = typeinfo->natts;
+
+    StreamTimeSerilizeStart(t_thrd.pgxc_cxt.GlobalNetInstr);
+
+    MemoryContext old_context = changeToTmpContext(self);
+    /*
+         * Prepare a DataRow message
+     */
+    pq_beginmessage_reuse(buf, 'D');
+    if (slot->tts_mintuple) {
+        tuple = slot->tts_mintuple;
+    } else {
+        /* Make sure the tuple is fully deconstructed */
+        tableam_tslot_getallattrs(slot);
+        tuple = heap_form_minimal_tuple(typeinfo, slot->tts_values, slot->tts_isnull, nullptr);
+    }
+    pq_sendbytes(buf, (char*)tuple, tuple->t_len);
+
+    (void)MemoryContextSwitchTo(old_context);
+    StreamTimeSerilizeEnd(t_thrd.pgxc_cxt.GlobalNetInstr);
+
+    AddCheckInfo(buf);
+    pq_endmessage_reuse(buf);
+}
+
+void SetRemoteDestTupleReceiverParams(DestReceiver *self)
+{
+    DR_printtup *myState = (DR_printtup *)self;
+    Assert(myState->pub.mydest == DestRemote);
+    Assert(myState->pub.receiveSlot == printtupStream);
+
+    myState->pub.receiveSlot = spq_printtupRemoteTuple;
+}
+#endif
 
 static void printtup_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
@@ -599,7 +729,7 @@ static void SendRowDescriptionCols_3(StringInfo buf, TupleDesc typeinfo, List *t
          * This preserves from OID inconsistencies as architecture is shared nothing.
          */
         /* Description: unified cn/dn cn/client  tupledesc data format under normal type. */
-        if (IsConnFromCoord() && atttypid >= FirstBootstrapObjectId) {
+        if ((IsConnFromCoord() || IS_SPQ_EXECUTOR) && atttypid >= FirstBootstrapObjectId) {
             char *typenameVar = "";
             typenameVar = get_typename_with_namespace(atttypid);
             pq_writestring(buf, typenameVar);
@@ -650,7 +780,7 @@ static void SendRowDescriptionCols_2(StringInfo buf, TupleDesc typeinfo, List *t
          * This preserves from OID inconsistencies as architecture is shared nothing.
          */
         /* Description: unified cn/dn cn/client  tupledesc data format under normal type. */
-        if (IsConnFromCoord() && atttypid >= FirstBootstrapObjectId) {
+        if ((IsConnFromCoord() || IS_SPQ_EXECUTOR) && atttypid >= FirstBootstrapObjectId) {
             char *typenameVar = "";
             typenameVar = get_typename_with_namespace(atttypid);
             pq_sendstring(buf, typenameVar);
@@ -827,6 +957,11 @@ inline MemoryContext changeToTmpContext(DestReceiver *self)
 
 void assembleStreamMessage(TupleTableSlot *slot, DestReceiver *self, StringInfo buf)
 {
+#ifdef USE_SPQ
+    if (IS_SPQ_RUNNING) {
+        return assembleSpqStreamMessage(slot, self, buf);
+    }
+#endif
     TupleDesc typeinfo = slot->tts_tupleDescriptor;
     DR_printtup *myState = (DR_printtup *)self;
     int natts = typeinfo->natts;
@@ -1487,7 +1622,7 @@ inline void AddCheckInfo(StringInfo buf)
     bool is_check_added = false;
 
     /* add check info  for datanode and coordinator */
-    if (IsConnFromCoord()) {
+    if (IS_SPQ_EXECUTOR || IsConnFromCoord()) {
 #ifdef USE_ASSERT_CHECKING
         initStringInfo(&buf_check);
         AddCheckMessage(&buf_check, buf, false);

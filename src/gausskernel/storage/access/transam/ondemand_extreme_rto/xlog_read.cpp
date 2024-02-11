@@ -23,6 +23,7 @@
 
 #include "access/ondemand_extreme_rto/spsc_blocking_queue.h"
 #include "access/ondemand_extreme_rto/dispatcher.h"
+#include "access/ondemand_extreme_rto/xlog_read.h"
 #include "access/multi_redo_api.h"
 #include "access/xlog.h"
 #include "ddes/dms/ss_reform_common.h"
@@ -30,6 +31,7 @@
 #include "replication/dcf_replication.h"
 #include "replication/shared_storage_walreceiver.h"
 #include "storage/ipc.h"
+#include "storage/file/fio_device.h"
 
 namespace ondemand_extreme_rto {
 static bool DoEarlyExit()
@@ -251,14 +253,7 @@ int ParallelXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, 
     xlogreader->readBuf = g_dispatcher->rtoXlogBufState.readBuf;
 
     for (;;) {
-        uint32 readSource = pg_atomic_read_u32(&(g_recordbuffer->readSource));
-        if (readSource & XLOG_FROM_STREAM) {
-            readLen = ParallelXLogReadWorkBufRead(xlogreader, targetPagePtr, reqLen, targetRecPtr, readTLI);
-        } else {
-            readLen = SSXLogPageRead(xlogreader, targetPagePtr, reqLen, targetRecPtr, xlogreader->readBuf,
-                                     readTLI, NULL);
-        }
-
+        readLen = SSXLogPageRead(xlogreader, targetPagePtr, reqLen, targetRecPtr, xlogreader->readBuf, readTLI, NULL);
         if (readLen > 0 || t_thrd.xlog_cxt.recoveryTriggered || !t_thrd.xlog_cxt.StandbyMode || DoEarlyExit()) {
             return readLen;
         }
@@ -605,6 +600,7 @@ err:
 XLogRecord *XLogParallelReadNextRecord(XLogReaderState *xlogreader)
 {
     XLogRecord *record = NULL;
+    int retry = 0;
 
     /* This is the first try to read this page. */
     t_thrd.xlog_cxt.failedSources = 0;
@@ -623,7 +619,7 @@ XLogRecord *XLogParallelReadNextRecord(XLogReaderState *xlogreader)
              * In StandbyMode that only happens if we have been triggered, so
              * we shouldn't loop anymore in that case.
              */
-            if (errormsg != NULL)
+            if (errormsg != NULL && ++retry > 3)
                 ereport(emode_for_corrupt_record(LOG, t_thrd.xlog_cxt.EndRecPtr),
                         (errmsg_internal("%s", errormsg) /* already translated */));
         }
@@ -664,44 +660,124 @@ XLogRecord *XLogParallelReadNextRecord(XLogReaderState *xlogreader)
             /* No valid record available from this source */
             t_thrd.xlog_cxt.failedSources |= t_thrd.xlog_cxt.readSource;
 
-            if (t_thrd.xlog_cxt.readFile >= 0) {
-                close(t_thrd.xlog_cxt.readFile);
-                t_thrd.xlog_cxt.readFile = -1;
+            /* In ondemand realtime build mode, loop back to retry. Otherwise, give up. */
+            if (SS_ONDEMAND_REALTIME_BUILD_NORMAL) {
+                xlogreader->preReadStartPtr = InvalidXlogPreReadStartPtr;
+                retry = 0;
+            } else if (SS_ONDEMAND_REALTIME_BUILD_SHUTDOWN){
+                // directly exit when ondemand_realtime_build_status = BUILD_TO_DISABLED, do not send endMark to dispatcher.
+                xlogreader->preReadStartPtr = InvalidXlogPreReadStartPtr;
+                retry = 0;
+                RedoInterruptCallBack();
             }
 
-            /*
-             * If archive recovery was requested, but we were still doing
-             * crash recovery, switch to archive recovery and retry using the
-             * offline archive. We have now replayed all the valid WAL in
-             * pg_xlog, so we are presumably now consistent.
-             *
-             * We require that there's at least some valid WAL present in
-             * pg_xlog, however (!fetch_ckpt). We could recover using the WAL
-             * from the archive, even if pg_xlog is completely empty, but we'd
-             * have no idea how far we'd have to replay to reach consistency.
-             * So err on the safe side and give up.
-             */
-            if (!t_thrd.xlog_cxt.InArchiveRecovery && t_thrd.xlog_cxt.ArchiveRecoveryRequested) {
-                t_thrd.xlog_cxt.InArchiveRecovery = true;
-                if (t_thrd.xlog_cxt.StandbyModeRequested)
-                    t_thrd.xlog_cxt.StandbyMode = true;
-                /* construct a minrecoverypoint, update LSN */
-                UpdateMinrecoveryInAchive();
-                /*
-                 * Before we retry, reset lastSourceFailed and currentSource
-                 * so that we will check the archive next.
-                 */
-                t_thrd.xlog_cxt.failedSources = 0;
+            if (retry <= 3) {
                 continue;
-            }
-
-            /* In standby mode, loop back to retry. Otherwise, give up. */
-            if (t_thrd.xlog_cxt.StandbyMode && !t_thrd.xlog_cxt.recoveryTriggered && !DoEarlyExit())
-                continue;
-            else
+            } else {
+                if (t_thrd.xlog_cxt.readFile >= 0) {
+                    close(t_thrd.xlog_cxt.readFile);
+                    t_thrd.xlog_cxt.readFile = -1;
+                }
                 return NULL;
+            }
         }
     }
 }
 
 }  // namespace ondemand_extreme_rto
+
+typedef struct XLogPageReadPrivate {
+    const char *datadir;
+    TimeLineID tli;
+} XLogPageReadPrivate;
+
+void InitXLogFileId(XLogRecPtr targetPagePtr, TimeLineID timeLine, XLogFileId* id)
+{
+    XLByteToSeg(targetPagePtr, id->segno);
+    id->tli = timeLine;
+}
+
+/* XLogreader callback function, to read a WAL page */
+int SimpleXLogPageReadInFdCache(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen, XLogRecPtr targetRecPtr,
+                                char *readBuf, TimeLineID *pageTLI, char* xlog_path)
+{
+    XLogPageReadPrivate *readprivate = (XLogPageReadPrivate *)xlogreader->private_data;
+    uint32 targetPageOff;
+    int ss_c = 0;
+    char xlogfpath[MAXPGPATH];
+    XLogFileId xlogfileid;
+    XLogFileIdCacheEntry *entry;
+    int xlogreadfd = -1;
+    bool found = false;
+
+    InitXLogFileId(targetPagePtr, readprivate->tli, &xlogfileid);
+
+    (void)LWLockAcquire(OndemandXLogFileHandleLock, LW_SHARED);
+    entry = (XLogFileIdCacheEntry *)hash_search(t_thrd.storage_cxt.ondemandXLogFileIdCache,
+                                                (void *)&xlogfileid, HASH_FIND, &found);
+    if (found) {
+        xlogreadfd = entry->fd;
+    }
+    LWLockRelease(OndemandXLogFileHandleLock);
+
+    if (xlogreadfd == -1) {
+        Assert(!found);
+
+        (void)LWLockAcquire(OndemandXLogFileHandleLock, LW_EXCLUSIVE);
+        entry = (XLogFileIdCacheEntry *)hash_search(t_thrd.storage_cxt.ondemandXLogFileIdCache,
+                                                    (void *)&xlogfileid, HASH_ENTER, &found);
+        if (entry == NULL) {
+            report_invalid_record(xlogreader,
+                                  "SimpleXLogPageReadInFdCache could not create xlogfile handle entry \"%s\": %s\n",
+                                  xlogfpath, strerror(errno));
+            LWLockRelease(OndemandXLogFileHandleLock);
+            return -1;
+        }
+
+        if (!found) {
+            ss_c = snprintf_s(xlogfpath, MAXPGPATH, MAXPGPATH - 1, "%s/%08X%08X%08X", xlog_path, readprivate->tli,
+                          (uint32)((xlogfileid.segno) / XLogSegmentsPerXLogId),
+                          (uint32)((xlogfileid.segno) % XLogSegmentsPerXLogId));
+            securec_check_ss(ss_c, "", "");
+            entry->fd = open(xlogfpath, O_RDONLY | PG_BINARY, 0);
+            if (entry->fd < 0) {
+                report_invalid_record(xlogreader, "SimpleXLogPageReadInFdCache could not open file \"%s\": %s\n",
+                                      xlogfpath, strerror(errno));
+                LWLockRelease(OndemandXLogFileHandleLock);
+                return -1;
+            }
+        }
+        xlogreadfd = entry->fd;
+        LWLockRelease(OndemandXLogFileHandleLock);
+    }
+
+    /*
+     * At this point, we have the right segment open.
+     */
+    Assert(xlogreadfd != -1);
+
+    targetPageOff = targetPagePtr % XLogSegSize;
+    /* Read the requested page */
+    if (pread(xlogreadfd, readBuf, XLOG_BLCKSZ, (off_t)targetPageOff) != XLOG_BLCKSZ) {
+        report_invalid_record(xlogreader, "SimpleXLogPageReadInFdCache could not pread from file \"%s\": %s\n",
+                              xlogfpath, strerror(errno));
+        return -1;
+    }
+    *pageTLI = readprivate->tli;
+    return XLOG_BLCKSZ;
+}
+
+void CloseAllXlogFileInFdCache(void)
+{
+    HASH_SEQ_STATUS status;
+    XLogFileIdCacheEntry *entry = NULL;
+    hash_seq_init(&status, t_thrd.storage_cxt.ondemandXLogFileIdCache);
+
+    while ((entry = (XLogFileIdCacheEntry *)hash_seq_search(&status)) != NULL) {
+        close(entry->fd);
+        if (hash_search(t_thrd.storage_cxt.ondemandXLogFileIdCache, (void *)&entry->id, HASH_REMOVE, NULL) == NULL) {
+            ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("[On-demand] xlogfile handle cache hash table corrupted")));
+        }
+    }
+    return;
+}

@@ -27,6 +27,10 @@
 #define PSORT_RESERVE_COLUMN	"tid"
 #define CHCHK_PSORT_RESERVE_COLUMN(attname)		(strcmp(PSORT_RESERVE_COLUMN, (attname)) == 0)
 
+#ifdef USE_SPQ
+extern HeapTuple heaptuple_from_pg_attribute(Relation pg_attribute_rel, Form_pg_attribute new_attribute);
+#endif
+
 typedef struct RawColumnDefault {
     AttrNumber attnum;         /* attribute to attach default to */
     Node      *raw_default;    /* default value (untransformed parse tree) */
@@ -67,7 +71,7 @@ typedef struct SliceConstInfo {
     char* sliceName;
     int sliceNum;
     List* sliceBoundary;
-    Const* sliceBoundaryValue[RANGE_PARTKEYMAXNUM];
+    Const* sliceBoundaryValue[MAX_RANGE_PARTKEY_NUMS];
 } SliceConstInfo;
 
 extern Relation heap_create(const char *relname,
@@ -135,7 +139,8 @@ extern Oid heap_create_with_catalog(const char *relname,
 						 List* ceLst = NULL,
 						 StorageType storage_type = HEAP_DISK,
 						 LOCKMODE partLockMode = AccessExclusiveLock,
-                         ObjectAddress *typaddress= NULL);
+                         ObjectAddress *typaddress= NULL,
+                         List* depend_extend = NIL);
 
 extern void heap_create_init_fork(Relation rel);
 
@@ -174,9 +179,9 @@ extern void addNewPartitionTuple(Relation pg_part_desc, Partition new_part_desc,
 
 extern void heap_truncate_one_part(Relation rel , Oid partOid);
 extern Oid getPartitionIdFromTuple(Relation rel, void *tuple, EState* estate, TupleTableSlot* slot, int *partitionno, bool isDDL = false, bool canIgnore = false);
-extern Oid heapTupleGetPartitionId(Relation rel, void *tuple, int *partitionno, bool isDDL = false,
+extern Oid heapTupleGetPartitionOid(Relation rel, void *tuple, int *partitionno, bool isDDL = false,
     bool canIgnore = false, bool partExprKeyIsNull = true);
-extern Oid heapTupleGetSubPartitionId(Relation rel, void *tuple);
+extern Oid heapTupleGetSubPartitionOid(Relation rel, void *tuple);
 extern void heap_truncate(List *relids);
 extern void heap_truncate_one_rel(Relation rel);
 extern void heap_truncate_check_FKs(List *relations, bool tempTables);
@@ -261,4 +266,5 @@ extern int GetIndexKeyAttsByTuple(Relation relation, HeapTuple indexTuple);
 extern bool GetIndexVisibleStateByTuple(HeapTuple indexTuple);
 
 extern void AddOrDropUidsAttr(Oid relOid, bool oldRelHasUids, bool newRelHasUids);
+extern char* heap_serialize_row_attr(Oid rel_oid, bool* depend_undefined);
 #endif   /* HEAP_H */

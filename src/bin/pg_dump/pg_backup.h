@@ -67,6 +67,7 @@ struct Archive {
     int verbose;
     char* remoteVersionStr; /* server's version string */
     int remoteVersion;      /* same in numeric form */
+    int workingVersionNum;  /* working_version_num value */
 
     int minRemoteVersion; /* allowable range */
     int maxRemoteVersion;
@@ -146,7 +147,9 @@ typedef struct _restoreOptions {
     bool targetV1;
     bool targetV5;
     int number_of_jobs;
-
+#if defined(USE_ASSERT_CHECKING) || defined(FASTCHECK)
+    bool disable_progress;
+#endif
     bool* idWanted; /* array showing which dump IDs to emit */
 } RestoreOptions;
 

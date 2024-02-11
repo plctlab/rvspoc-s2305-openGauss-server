@@ -63,6 +63,8 @@ typedef struct knl_session_attr_sql {
     bool enable_indexonlyscan;
     bool enable_bitmapscan;
     bool force_bitmapand;
+    bool enable_union_all_subquery_orderby;
+    bool transform_to_numeric_operators;
     bool enable_parallel_ddl;
     bool enable_tidscan;
     bool enable_sort;
@@ -244,6 +246,7 @@ typedef struct knl_session_attr_sql {
     char* db4ai_snapshot_mode;
     char* db4ai_snapshot_version_delimiter;
     char* db4ai_snapshot_version_separator;
+    bool  enable_ignore_case_in_dquotes;
     int pldebugger_timeout;
     bool partition_page_estimation;
     bool enable_opfusion_reuse;

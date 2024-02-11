@@ -232,6 +232,7 @@ typedef struct RelationData {
     void* rd_amcache;          /* available for use by index AM */
     Oid* rd_indcollation;      /* OIDs of index collations */
     Buffer rd_rootcache;       /* for root caching */
+    bool rd_ind_partition_all_usable;
 
     /*
      * foreign-table support
@@ -411,6 +412,10 @@ typedef struct StdRdOptions {
     int check_option_offset; /* for views */
     int view_security_option_offset; /* for views */
     Oid collate; /* table's default collation in b format. */
+#ifdef USE_SPQ
+    /* SPQ OPTIONS */
+    int spq_bt_build_offset;
+#endif
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR 10

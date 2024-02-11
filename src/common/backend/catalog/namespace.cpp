@@ -1090,6 +1090,33 @@ bool IsPlpgsqlLanguageOid(Oid langoid)
     }
 }
 
+/*
+ * some procedure args have tableof variable,
+ * when match the proc parameters' type,
+ * we should change to its base type.
+ */
+bool CheckTableOfType(FuncCandidateList candidate, Oid* argtypes)
+{
+    Oid curArgType;
+    bool res = true;
+    for (int i = 0; i < candidate->nargs; i++) {
+        Oid base_oid = InvalidOid;
+        if (isTableofType(candidate->args[i], &base_oid, NULL)) {
+            /* change to its base type */
+            candidate->args[i] = base_oid;
+            curArgType = base_oid;
+        } else {
+            curArgType = candidate->args[i];
+        }
+
+        /* continue to next arg, cause we need to get all arg's base type value */
+        if (curArgType != argtypes[i]) {
+            res = false;
+        }
+    }
+    return res;
+}
+
 static FuncCandidateList FuncnameAddCandidates(FuncCandidateList resultList, HeapTuple procTup, List* argNames,
     Oid namespaceId, Oid objNsp, int nargs, CatCList* catList, bool expandVariadic, bool expandDefaults,
     bool includeOut, Oid refSynOid, bool enable_outparam_override)
@@ -1108,6 +1135,7 @@ static FuncCandidateList FuncnameAddCandidates(FuncCandidateList resultList, Hea
     int* argNumbers = NULL;
     FuncCandidateList newResult;
     bool isNull = false;
+
 #ifndef ENABLE_MULTIPLE_NODES
     Oid schema_oid = get_func_namespace(HeapTupleGetOid(procTup));
     (void)SysCacheGetAttr(PROCOID, procTup, Anum_pg_proc_proallargtypes, &isNull);
@@ -1332,20 +1360,6 @@ static FuncCandidateList FuncnameAddCandidates(FuncCandidateList resultList, Hea
         errno_t rc = EOK;
         rc = memcpy_s(newResult->args, numProcAllArgs * sizeof(Oid), proargtypes, numProcAllArgs * sizeof(Oid));
         securec_check(rc, "\0", "\0");
-    }
-
-    /* 
-     * some procedure args have tableof variable,
-     * when match the proc parameters' type,
-     * we should change to its base type.
-     */
-    if (numProcAllArgs > 0 && newResult->args != NULL) {
-        for (int i = 0; i < numProcAllArgs; i++) {
-            Oid base_oid = InvalidOid;
-            if(isTableofType(newResult->args[i], &base_oid, NULL)) {
-                newResult->args[i] = base_oid;
-            }
-        }
     }
 
     if (variadic) {
@@ -2130,6 +2144,11 @@ bool FunctionIsVisible(Oid funcid)
         for (; clist; clist = clist->next) {
             if (memcmp(clist->args, proargs->values, nargs * sizeof(Oid)) == 0) {
                 /* Found the expected entry; is it the right proc? */
+                visible = (clist->oid == funcid);
+                break;
+            }
+
+            if (CheckTableOfType(clist, proargs->values)) {
                 visible = (clist->oid == funcid);
                 break;
             }
@@ -3354,6 +3373,9 @@ Oid LookupExplicitNamespace(const char* nspname, bool missing_ok)
 
     if (!(u_sess->analyze_cxt.is_under_analyze || (IS_PGXC_DATANODE && IsConnFromCoord())) ||
         u_sess->exec_cxt.is_exec_trigger_func) {
+        if (!OidIsValid(namespaceId) && enable_plpgsql_undefined_not_check_nspoid()) {
+            return namespaceId;
+        }
         aclresult = pg_namespace_aclcheck(namespaceId, GetUserId(), ACL_USAGE);
         if (aclresult != ACLCHECK_OK)
             aclcheck_error(aclresult, ACL_KIND_NAMESPACE, nspname);
@@ -3543,7 +3565,12 @@ Oid get_namespace_oid(const char* nspname, bool missing_ok)
     Oid oid = InvalidOid;
 
     oid = GetSysCacheOid1(NAMESPACENAME, CStringGetDatum(nspname));
-    if (!OidIsValid(oid) && !missing_ok) {      
+    if (!OidIsValid(oid) && !missing_ok) {     
+        if (enable_plpgsql_undefined_not_check_nspoid()) {
+            ereport(LOG, (errmodule(MOD_PLSQL),
+             (ERRCODE_UNDEFINED_SCHEMA), errmsg("%s does not exist. Ignore it.", nspname)));
+             return oid;
+        }
         char message[MAXSTRLEN]; 
         errno_t rc = sprintf_s(message, MAXSTRLEN, "schema \"%s\" does not exist", nspname);
         if (strlen(nspname) > MAXSTRLEN) {
@@ -3940,6 +3967,8 @@ void PushOverrideSearchPath(OverrideSearchPath* newpath, bool inProcedure)
                 break;
             }
         }
+        pfree_ext(rawname);
+        list_free_ext(namelist);
     }
 
     /*

@@ -150,7 +150,11 @@ ForkNumber forkname_to_number(char* forkName, BlockNumber* segno)
         /* it is a column data bcm file. C1_bcm */
         /* skip 'C' */
         token = token + 1;
-        forkNum = ColumnId2ColForkNum(atooid(token));
+        Oid colOid = atooid(token);
+        if (!AttrNumberIsForUserDefinedAttr(colOid))
+            return InvalidForkNumber;
+
+        forkNum = ColumnId2ColForkNum(colOid);
 
         /* bcm.1 */
         token = strtok_r(NULL, ".", &tmptoken);
@@ -665,7 +669,7 @@ RelFileNodeForkNum relpath_to_filenode(char* path)
         relpath_parse_rnode(tmptoken, filenode);
     } else {
         pfree(parsepath);
-        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid relation file path %s: %m", path)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid relation file path %s: %s", path, TRANSLATE_ERRNO)));
     }
 
     pfree(parsepath);
@@ -921,9 +925,15 @@ bool IsSnapshotNamespace(Oid namespaceId)
     return namespaceId == PG_SNAPSHOT_NAMESPACE;
 }
 
+bool IsProcCoverageNamespace(Oid namespaceId)
+{
+    return namespaceId == PROC_COVERAGE_NAMESPACE;
+}
+
 bool IsMonitorSpace(Oid namespaceId)
 {
-    return IsPerformanceNamespace(namespaceId) || IsSnapshotNamespace(namespaceId);
+    return IsPerformanceNamespace(namespaceId) || IsSnapshotNamespace(namespaceId) ||
+           IsProcCoverageNamespace(namespaceId);
 }
 /*
  * IsReservedName

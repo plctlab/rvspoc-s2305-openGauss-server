@@ -724,11 +724,15 @@ public:
     /* get ThreadInstrumentation */
     ThreadInstrumentation *getThreadInstrumentation(int idx, int planNodeId, int smpId)
     {
-        ThreadInstrumentation *threadInstr =
-#ifdef ENABLE_MULTIPLE_NODES
-            getThreadInstrumentationCN(idx, planNodeId, smpId);
+        ThreadInstrumentation *threadInstr = NULL;
+#if defined(ENABLE_MULTIPLE_NODES) || defined(USE_SPQ)
+        if (t_thrd.spq_ctx.spq_role != ROLE_UTILITY) {
+            threadInstr = getThreadInstrumentationCN(idx, planNodeId, smpId);
+        } else {
+            threadInstr = getThreadInstrumentationDN(planNodeId, smpId);
+        }
 #else
-            getThreadInstrumentationDN(planNodeId, smpId);
+        threadInstr = getThreadInstrumentationDN(planNodeId, smpId);
 #endif /* ENABLE_MULTIPLE_NODES */
         return threadInstr;
     }
@@ -897,9 +901,6 @@ typedef struct Qpid {
 } Qpid;
 
 typedef struct OperatorProfileTable {
-    int max_realtime_num;    /* max session info num in the hash table */
-    int max_collectinfo_num; /* max collect info num in list */
-
     HTAB* explain_info_hashtbl;   /* collect information hash table */
     HTAB* collected_info_hashtbl; /* collect information hash table */
 } OperatorProfileTable;

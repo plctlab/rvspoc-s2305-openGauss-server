@@ -53,9 +53,20 @@ extern ExecNodes* getExecNodesByGroupName(const char* gname);
 extern PlannedStmt* planner(Query* parse, int cursorOptions, ParamListInfo boundParams);
 extern PlannedStmt* standard_planner(Query* parse, int cursorOptions, ParamListInfo boundParams);
 
-typedef void (*planner_hook_type) (Query* parse, int cursorOptions, ParamListInfo boundParams);
+typedef PlannedStmt* (*planner_hook_type) (Query* parse, int cursorOptions, ParamListInfo boundParams);
+typedef List* (*for_tsdb_hook_type) (PlannerInfo *root,RelOptInfo *rel,
+						CmdType operation, bool canSetTag,
+						Index nominalRelation,
+						List *resultRelations, List *subpaths,
+						List *withCheckOptionLists, List *returningLists,
+						List *rowMarks, int epqParam,List *tlist);
+
 typedef void (*ndp_pushdown_hook_type) (Query* querytree, PlannedStmt *stmt);
 extern THR_LOCAL PGDLLIMPORT ndp_pushdown_hook_type ndp_pushdown_hook;
+#ifdef USE_SPQ
+typedef PlannedStmt *(*spq_planner_hook_type) (Query* parse, int cursorOptions, ParamListInfo boundParams);
+extern THR_LOCAL PGDLLIMPORT spq_planner_hook_type spq_planner_hook;
+#endif
 
 extern Plan* subquery_planner(PlannerGlobal* glob, Query* parse, PlannerInfo* parent_root, bool hasRecursion,
     double tuple_fraction, PlannerInfo** subroot, int options = SUBQUERY_NORMAL, ItstDisKey* diskeys = NULL,
@@ -212,5 +223,10 @@ extern bool IsPlanForPartitionScan(Plan* plan);
 extern bool queryIsReadOnly(Query* query);
 
 typedef PlannedStmt* (*plannerFunc)(Query* parse, int cursorOptions, ParamListInfo boundParams);
+
+#ifdef USE_SPQ
+extern List* spq_get_distributekey_from_tlist(
+    PlannerInfo* root, List* tlist, List* groupcls, double rows, double* result_multiple, void* skew_info = NULL);
+#endif
 
 #endif /* PLANNER_H */

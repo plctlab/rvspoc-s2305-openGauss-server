@@ -29,6 +29,7 @@
 #include "utils/typcache.h"
 #include "replication/output_plugin.h"
 #include "replication/logical.h"
+#include "tcop/ddldeparse.h"
 
 PG_MODULE_MAGIC;
 
@@ -48,6 +49,8 @@ static void pg_decode_prepare_txn(LogicalDecodingContext* ctx, ReorderBufferTXN*
 static void pg_decode_change(
     LogicalDecodingContext* ctx, ReorderBufferTXN* txn, Relation rel, ReorderBufferChange* change);
 static bool pg_decode_filter(LogicalDecodingContext* ctx, RepOriginId origin_id);
+static void pg_decode_ddl(LogicalDecodingContext* ctx, ReorderBufferTXN* txn, XLogRecPtr message_lsn,
+    const char *prefix, Oid relid, DeparsedCommandType cmdtype, Size sz, const char *message);
 
 void _PG_init(void)
 {
@@ -67,6 +70,7 @@ void _PG_output_plugin_init(OutputPluginCallbacks* cb)
     cb->prepare_cb = pg_decode_prepare_txn;
     cb->filter_by_origin_cb = pg_decode_filter;
     cb->shutdown_cb = pg_decode_shutdown;
+    cb->ddl_cb = pg_decode_ddl;
 }
 
 /* initialize this plugin */
@@ -199,87 +203,7 @@ static bool pg_decode_filter(LogicalDecodingContext* ctx, RepOriginId origin_id)
         return true;
     return false;
 }
-static void tuple_to_stringinfo(Relation relation, StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool isOld)
-{
-    if ((tuple->tupTableType == HEAP_TUPLE) && (HEAP_TUPLE_IS_COMPRESSED(tuple->t_data) ||
-        (int)HeapTupleHeaderGetNatts(tuple->t_data, tupdesc) > tupdesc->natts)) {
-        return;
-    }
 
-    Oid oid;
-
-    /* print oid of tuple, it's not included in the TupleDesc */
-    if ((oid = HeapTupleHeaderGetOid(tuple->t_data)) != InvalidOid) {
-        appendStringInfo(s, " oid[oid]:%u", oid);
-    }
-
-    /* print all columns individually */
-    for (int natt = 0; natt < tupdesc->natts; natt++) {
-        Form_pg_attribute attr; /* the attribute itself */
-        Oid typoutput;          /* output function */
-        bool typisvarlena = false;
-        Datum origval;      /* possibly toasted Datum */
-        bool isnull = true; /* column is null? */
-
-        attr = &tupdesc->attrs[natt];
-
-        /*
-         * don't print dropped columns, we can't be sure everything is
-         * available for them
-         */
-        if (attr->attisdropped)
-            continue;
-
-        /*
-         * Don't print system columns, oid will already have been printed if
-         * present.
-         */
-        if (attr->attnum < 0 || (isOld && !IsRelationReplidentKey(relation, attr->attnum)))
-            continue;
-
-        Oid typid = attr->atttypid; /* type of current attribute */
-
-        /* get Datum from tuple */
-        if (tuple->tupTableType == HEAP_TUPLE) {
-            origval = heap_getattr(tuple, natt + 1, tupdesc, &isnull);
-        } else {
-            origval = uheap_getattr((UHeapTuple)tuple, natt + 1, tupdesc, &isnull);
-        }
-
-        /* print attribute name */
-        appendStringInfoChar(s, ' ');
-        appendStringInfoString(s, quote_identifier(NameStr(attr->attname)));
-
-        /* print attribute type */
-        appendStringInfoChar(s, '[');
-        char* type_name = format_type_be(typid);
-        if (strlen(type_name) == strlen("clob") && strncmp(type_name, "clob", strlen("clob")) == 0) {
-            errno_t rc = strcpy_s(type_name, sizeof("clob"), "text");
-            securec_check_c(rc, "\0", "\0");
-        }
-        appendStringInfoString(s, type_name);
-        appendStringInfoChar(s, ']');
-
-        /* query output function */
-        getTypeOutputInfo(typid, &typoutput, &typisvarlena);
-
-        /* print separator */
-        appendStringInfoChar(s, ':');
-
-        /* print data */
-        if (isnull)
-            appendStringInfoString(s, "null");
-        else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK_B(origval))
-            appendStringInfoString(s, "unchanged-toast-datum");
-        else if (!typisvarlena)
-            PrintLiteral(s, typid, OidOutputFunctionCall(typoutput, origval));
-        else {
-            Datum val; /* definitely detoasted Datum */
-            val = PointerGetDatum(PG_DETOAST_DATUM(origval));
-            PrintLiteral(s, typid, OidOutputFunctionCall(typoutput, val));
-        }
-    }
-}
 /*
  * callback for individual changed tuples
  */
@@ -380,6 +304,62 @@ static void pg_decode_change(
             break;
         default:
             Assert(false);
+    }
+
+    MemoryContextSwitchTo(old);
+    MemoryContextReset(data->context);
+
+    OutputPluginWrite(ctx, true);
+}
+
+static char *deparse_command_type(DeparsedCommandType cmdtype)
+{
+    switch (cmdtype) {
+        case DCT_SimpleCmd:
+            return "Simple";
+        case DCT_TableDropStart:
+            return "Drop table";
+        case DCT_TableDropEnd:
+            return "Drop Table End";
+        default:
+            Assert(false);
+    }
+    return NULL;
+}
+
+static void pg_decode_ddl(LogicalDecodingContext* ctx, 
+                        ReorderBufferTXN* txn, XLogRecPtr message_lsn,
+                        const char *prefix, Oid relid, 
+                        DeparsedCommandType cmdtype, 
+                        Size sz, const char *message)
+{
+    PluginTestDecodingData* data = NULL;
+    MemoryContext old;
+
+    data = (PluginTestDecodingData*)ctx->output_plugin_private;
+
+    /* output BEGIN if we haven't yet */
+    if (data->skip_empty_xacts && !data->xact_wrote_changes) {
+        pg_output_begin(ctx, data, txn, false);
+    }
+    data->xact_wrote_changes = true;
+
+    /* Avoid leaking memory by using and resetting our own context */
+    old = MemoryContextSwitchTo(data->context);
+    OutputPluginPrepareWrite(ctx, true);
+
+    appendStringInfo(ctx->out, "message: prefix %s, relid %u, cmdtype: %s, sz: %lu content: %s",
+        prefix,
+        relid,
+        deparse_command_type(cmdtype),
+        sz,
+        message);
+    if (cmdtype != DCT_TableDropStart) {
+        char *tmp = pstrdup(message);
+        char *owner = NULL;
+        char *decodestring = deparse_ddl_json_to_string(tmp, &owner);
+        appendStringInfo(ctx->out, "\ndecode to : %s, [owner %s]", decodestring, owner ? owner : "none");
+        pfree(tmp);
     }
 
     MemoryContextSwitchTo(old);

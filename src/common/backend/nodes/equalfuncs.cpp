@@ -209,6 +209,7 @@ static bool _equalParam(const Param* a, const Param* b)
     COMPARE_LOCATION_FIELD(location);
     COMPARE_SCALAR_FIELD(tableOfIndexType);
     COMPARE_SCALAR_FIELD(recordVarTypOid);
+    COMPARE_SCALAR_FIELD(is_bind_param);
 
     return true;
 }
@@ -222,6 +223,9 @@ static bool _equalAggref(const Aggref* a, const Aggref* b)
     COMPARE_SCALAR_FIELD(agghas_collectfn);
     COMPARE_SCALAR_FIELD(aggstage);
 #endif /* PGXC */
+#ifdef USE_SPQ
+    COMPARE_SCALAR_FIELD(aggsplittype);
+#endif
     COMPARE_SCALAR_FIELD(aggcollid);
     COMPARE_SCALAR_FIELD(inputcollid);
     COMPARE_NODE_FIELD(aggdirectargs);
@@ -979,6 +983,10 @@ static bool _equalQuery(const Query* a, const Query* b)
     }
     
     COMPARE_NODE_FIELD(indexhintList);
+    if (t_thrd.proc->workingVersionNum >= SELECT_STMT_HAS_USERVAR) {
+        COMPARE_SCALAR_FIELD(has_uservar);
+    }
+    
     return true;
 }
 
@@ -1098,6 +1106,7 @@ static bool _equalAlterTableStmt(const AlterTableStmt* a, const AlterTableStmt* 
     COMPARE_NODE_FIELD(cmds);
     COMPARE_SCALAR_FIELD(relkind);
     COMPARE_SCALAR_FIELD(missing_ok);
+    COMPARE_SCALAR_FIELD(fromCreate);
 
     return true;
 }
@@ -1581,6 +1590,7 @@ static bool _equalRenameStmt(const RenameStmt* a, const RenameStmt* b)
     COMPARE_NODE_FIELD(objarg);
     COMPARE_STRING_FIELD(subname);
     COMPARE_STRING_FIELD(newname);
+    COMPARE_STRING_FIELD(newschema);
     COMPARE_SCALAR_FIELD(behavior);
     COMPARE_SCALAR_FIELD(missing_ok);
     COMPARE_NODE_FIELD(renameTargetList);
@@ -1661,6 +1671,7 @@ static bool _equalTransactionStmt(const TransactionStmt* a, const TransactionStm
 
 static bool _equalCompositeTypeStmt(const CompositeTypeStmt* a, const CompositeTypeStmt* b)
 {
+    COMPARE_SCALAR_FIELD(replace);
     COMPARE_NODE_FIELD(typevar);
     COMPARE_NODE_FIELD(coldeflist);
 
@@ -1669,6 +1680,7 @@ static bool _equalCompositeTypeStmt(const CompositeTypeStmt* a, const CompositeT
 
 static bool _equalTableOfTypeStmt(const TableOfTypeStmt* a, const TableOfTypeStmt* b)
 {
+    COMPARE_SCALAR_FIELD(replace);
     COMPARE_NODE_FIELD(typname);
     COMPARE_NODE_FIELD(reftypname);
 
@@ -1892,6 +1904,8 @@ static bool _equalCreateSeqStmt(const CreateSeqStmt* a, const CreateSeqStmt* b)
     COMPARE_SCALAR_FIELD(uuid);
     COMPARE_SCALAR_FIELD(canCreateTempSeq);
     COMPARE_SCALAR_FIELD(is_large);
+    COMPARE_SCALAR_FIELD(missing_ok);
+    COMPARE_SCALAR_FIELD(is_autoinc);
 
     return true;
 }
@@ -1902,6 +1916,7 @@ static bool _equalAlterSeqStmt(const AlterSeqStmt* a, const AlterSeqStmt* b)
     COMPARE_NODE_FIELD(options);
     COMPARE_SCALAR_FIELD(missing_ok);
     COMPARE_SCALAR_FIELD(is_large);
+    COMPARE_SCALAR_FIELD(is_autoinc);
 
     return true;
 }
@@ -2551,6 +2566,7 @@ static bool _equalAStar(const A_Star* a, const A_Star* b)
 
 static bool _equalAIndices(const A_Indices* a, const A_Indices* b)
 {
+    COMPARE_SCALAR_FIELD(is_slice);
     COMPARE_NODE_FIELD(lidx);
     COMPARE_NODE_FIELD(uidx);
 
@@ -3047,6 +3063,7 @@ static bool _equalStartWithClause(const StartWithClause * a, const StartWithClau
 static bool _equalUpsertClause(const UpsertClause* a, const UpsertClause* b)
 {
    COMPARE_NODE_FIELD(targetList);
+   COMPARE_NODE_FIELD(aliasName);
    COMPARE_LOCATION_FIELD(location);
    COMPARE_NODE_FIELD(whereClause);
 
@@ -3117,6 +3134,7 @@ static bool _equalCreateDirectoryStmt(const CreateDirectoryStmt* a, const Create
 static bool _equalDropDirectoryStmt(const DropDirectoryStmt* a, const DropDirectoryStmt* b)
 {
     COMPARE_STRING_FIELD(directoryname);
+    COMPARE_SCALAR_FIELD(missing_ok);
 
     return true;
 }
@@ -3485,6 +3503,7 @@ static bool _equalCharsetClause(const CharsetClause* a, const CharsetClause* b)
     COMPARE_SCALAR_FIELD(charset);
     COMPARE_SCALAR_FIELD(is_binary);
     COMPARE_LOCATION_FIELD(location);
+    return true;
 }
 
 static bool _equalPrefixKey(const PrefixKey* a, const PrefixKey* b)

@@ -147,6 +147,23 @@ int main(int argc, char* argv[])
 
     progname = get_progname(argv[0]);
 
+#ifdef PROFILE_PID_DIR
+{
+    char* gmon_env = NULL;
+    gmon_env = gs_getenv_r("GMON_OUT_PREFIX");
+    if(gmon_env == NULL){
+        if (gs_putenv_r("GMON_OUT_PREFIX=gmon.out") == -1) {
+            ereport(WARNING,
+                (errmsg("Failed to set ENV, cannot output gmon.out under multi-progress: EnvName=%s,"
+                        " Errno=%d, Errmessage=%s.",
+                    "GMON_OUT_PREFIX",
+                    errno,
+                    gs_strerror(errno))));
+        }
+    }
+}
+#endif
+
     /*
      * Platform-specific startup hacks
      */
@@ -216,6 +233,14 @@ int main(int argc, char* argv[])
 #else
     pg_perm_setlocale(LC_COLLATE, "");
     pg_perm_setlocale(LC_CTYPE, "");
+#endif
+
+    /*
+     * LC_MESSAGES will get set later during GUC option processing, but we set
+     * it here to allow startup error messages to be localized.
+     */
+#if defined(ENABLE_NLS) && defined(LC_MESSAGES)
+    pg_perm_setlocale(LC_MESSAGES, "");
 #endif
 
     /*

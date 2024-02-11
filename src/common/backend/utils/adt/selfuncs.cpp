@@ -183,7 +183,6 @@ static void convert_bytea_to_scalar(
 static double convert_one_string_to_scalar(const char* value, int rangelo, int rangehi);
 static double convert_one_bytea_to_scalar(unsigned char* value, int valuelen, int rangelo, int rangehi);
 static char* convert_string_datum(Datum value, Oid typid);
-static double convert_timevalue_to_scalar(Datum value, Oid typid);
 static void examine_simple_variable(PlannerInfo* root, Var* var, VariableStatData* vardata);
 static bool get_variable_range(PlannerInfo* root, VariableStatData* vardata, Oid sortop, Datum* min, Datum* max);
 static bool get_actual_variable_range(PlannerInfo* root, VariableStatData* vardata, Oid sortop, Datum* min, Datum* max);
@@ -4375,7 +4374,7 @@ static double convert_one_bytea_to_scalar(unsigned char* value, int valuelen, in
 /*
  * Do convert_to_scalar()'s work for any timevalue data type.
  */
-static double convert_timevalue_to_scalar(Datum value, Oid typid)
+double convert_timevalue_to_scalar(Datum value, Oid typid)
 {
     switch (typid) {
         case TIMESTAMPOID:
@@ -5098,6 +5097,11 @@ double get_variable_numdistinct(VariableStatData* vardata, bool* isdefault, bool
                     stadistinct = 1.0; /* only 1 value */
                     break;
 #endif
+#ifdef USE_SPQ
+                case RootSelfItemPointerAttributeNumber:
+                    stadistinct = 0.0; /* means "unknown" */
+                    break;
+#endif
                 default:
                     stadistinct = 0.0; /* means "unknown" */
                     break;
@@ -5670,6 +5674,12 @@ static Pattern_Prefix_Status like_fixed_prefix(
     bool is_multibyte = (pg_database_encoding_max_length() > 1);
     pg_locale_t locale = 0;
     bool locale_is_c = false;
+
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT &&
+        (typeId == get_typeoid(PG_CATALOG_NAMESPACE, "binary") ||
+            typeId == get_typeoid(PG_CATALOG_NAMESPACE, "varbinary"))) {
+        typeId = BYTEAOID;
+    }
 
     /* the right-hand const is type text or bytea */
     Assert(typeId == BYTEAOID || typeId == TEXTOID);

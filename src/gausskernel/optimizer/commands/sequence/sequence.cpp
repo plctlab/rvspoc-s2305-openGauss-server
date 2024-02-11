@@ -821,6 +821,18 @@ static ObjectAddress DefineSequence(CreateSeqStmt* seq)
     bool isUseLocalSeq = false;
     Oid namespaceOid = InvalidOid;
     ObjectAddress address;
+    Oid existing_relid = InvalidOid;
+    Oid namespaceId = InvalidOid;
+    char rel_kind = large ? RELKIND_LARGE_SEQUENCE : RELKIND_SEQUENCE;
+
+    if (seq->missing_ok) {
+        namespaceId = RangeVarGetAndCheckCreationNamespace(seq->sequence, NoLock, &existing_relid, rel_kind);
+        if (existing_relid != InvalidOid) {
+            char* namespace_of_existing_rel = get_namespace_name(namespaceId);
+            ereport(NOTICE, (errmodule(MOD_COMMAND), errmsg("relation \"%s\" already exists in schema \"%s\", skipping", seq->sequence->relname, namespace_of_existing_rel)));
+            return InvalidObjectAddress;
+        }
+    }
 
 #ifdef PGXC /* PGXC_COORD */
     GTM_Sequence start_value = 1;
@@ -834,7 +846,11 @@ static ObjectAddress DefineSequence(CreateSeqStmt* seq)
         namespaceOid = get_namespace_oid(seq->sequence->schemaname, true);
     }
     /* temp sequence and single_node do not need gtm, they use information on local node */
+#ifdef ENABLE_MUTIPLE_NODES
     isUseLocalSeq = IS_SINGLE_NODE || isTempNamespace(namespaceOid);
+#else
+    isUseLocalSeq = true;
+#endif
 
     bool notSupportTmpSeq = false;
     if (seq->sequence->relpersistence == RELPERSISTENCE_TEMP ||
@@ -996,7 +1012,6 @@ static ObjectAddress DefineSequence(CreateSeqStmt* seq)
     stmt->tablespacename = NULL;
     stmt->if_not_exists = false;
     stmt->charset = PG_INVALID_ENCODING;
-    char rel_kind = large ? RELKIND_LARGE_SEQUENCE : RELKIND_SEQUENCE;
     address = DefineRelation(stmt, rel_kind, seq->ownerId, NULL);
     seqoid = address.objectId;
     Assert(seqoid != InvalidOid);
@@ -1389,7 +1404,15 @@ bool shouldReturnNumeric()
             break;
     }
 
-    return get_nextval_rettype() == NUMERICOID;
+    HeapTuple ftup = SearchSysCache1(PROCOID, ObjectIdGetDatum(NEXTVALFUNCOID));
+    if (!HeapTupleIsValid(ftup)) {
+        ereport(ERROR, (errmsg("cache lookup failed for function %u", NEXTVALFUNCOID)));
+    }
+    Form_pg_proc pform = (Form_pg_proc)GETSTRUCT(ftup);
+    bool ret = pform->prorettype == NUMERICOID;
+    ReleaseSysCache(ftup);
+
+    return ret;
 }
 
 Datum nextval_oid(PG_FUNCTION_ARGS)
@@ -1417,6 +1440,9 @@ int128 nextval_internal(Oid relid)
 
     if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
         ereport(ERROR, (errmsg("Standby do not support nextval, please do it in primary!")));
+    }
+    if (SS_STANDBY_MODE) {
+        ereport(ERROR, (errmsg("Shared storage standby do not support nextval, please do it in shared storage primary!")));
     }
 
     /* open and lock sequence */
@@ -2007,28 +2033,28 @@ static T_Form read_seq_tuple(SeqTable elm, Relation rel, Buffer* buf, HeapTuple 
 }
 
 template<typename T_Int, bool large>
-static void check_value_min_max(T_Int value, T_Int min_value, T_Int max_value)
+static void CheckValueMinMax(T_Int value, T_Int minValue, T_Int maxValue, bool isStart)
 {
     char* bufs = NULL;
     char* bufm = NULL;
     /* crosscheck RESTART (or current value, if changing MIN/MAX) */
-    if (value < min_value) {
+    if (value < minValue) {
         bufs = large ? DatumGetCString(DirectFunctionCall1(int16out, Int128GetDatum(value))) :
             DatumGetCString(DirectFunctionCall1(int8out, value));
-        bufm = large ? DatumGetCString(DirectFunctionCall1(int16out, Int128GetDatum(min_value))) :
-            DatumGetCString(DirectFunctionCall1(int8out, min_value));
+        bufm = large ? DatumGetCString(DirectFunctionCall1(int16out, Int128GetDatum(minValue))) :
+            DatumGetCString(DirectFunctionCall1(int8out, minValue));
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("RESTART value (%s) cannot be less than MINVALUE (%s)", bufs, bufm)));
+                errmsg("%s value (%s) cannot be less than MINVALUE (%s)", isStart? "START":"RESTART", bufs, bufm)));
     }
-    if (value > max_value) {
+    if (value > maxValue) {
         bufs = large ? DatumGetCString(DirectFunctionCall1(int16out, Int128GetDatum(value))) :
             DatumGetCString(DirectFunctionCall1(int8out, value));
-        bufm = large ? DatumGetCString(DirectFunctionCall1(int16out, Int128GetDatum(max_value))) :
-            DatumGetCString(DirectFunctionCall1(int8out, max_value));
+        bufm = large ? DatumGetCString(DirectFunctionCall1(int16out, Int128GetDatum(maxValue))) :
+            DatumGetCString(DirectFunctionCall1(int8out, maxValue));
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("RESTART value (%s) cannot be greater than MAXVALUE (%s)", bufs, bufm)));
+                errmsg("%s value (%s) cannot be greater than MAXVALUE (%s)", isStart? "START":"RESTART", bufs, bufm)));
     }
 }
 
@@ -2082,22 +2108,6 @@ static void PreProcessSequenceOptions(
 
     foreach (option, options) {
         DefElem* defel = (DefElem*)lfirst(option);
-
-        /* Now we only support ALTER SEQUENCE OWNED BY and MAXVALUE to support upgrade. */
-        if (!isInit) {
-            /* isInit is true for DefineSequence, false for AlterSequence, we use it
-             * to differentiate them
-             */
-            bool isDefOwnedAndMaxValue =
-                strcmp(defel->defname, "owned_by") != 0 && strcmp(defel->defname, "maxvalue") != 0;
-#ifndef ENABLE_MULTIPLE_NODES
-            isDefOwnedAndMaxValue = isDefOwnedAndMaxValue && strcmp(defel->defname, "cache") != 0;
-#endif
-            if (isDefOwnedAndMaxValue) {
-                ereport(
-                    ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("ALTER SEQUENCE is not yet supported.")));
-            }
-        }
 
         if (strcmp(defel->defname, "increment") == 0) {
             CheckDuplicateDef(elms[DEF_IDX_INCREMENT_BY]);
@@ -2319,14 +2329,14 @@ static void init_params(List* options, bool isInit, bool isUseLocalSeq, void* ne
     ProcessSequenceOptStartWith<T_Form, T_Int, large>(elms[DEF_IDX_START_VALUE], newm, isInit);
 
     /* crosscheck START */
-    check_value_min_max<T_Int, large>(newm->start_value, newm->min_value, newm->max_value);
+    CheckValueMinMax<T_Int, large>(newm->start_value, newm->min_value, newm->max_value, true);
 
     ProcessSequenceOptReStartWith<T_Form, T_Int, large>(
         elms[DEF_IDX_RESTART_VALUE], newm, isInit, is_restart, isUseLocalSeq);
 
     if (isUseLocalSeq) {
         /* crosscheck RESTART (or current value, if changing MIN/MAX) */
-        check_value_min_max<T_Int, large>(newm->last_value, newm->min_value, newm->max_value);
+        CheckValueMinMax<T_Int, large>(newm->last_value, newm->min_value, newm->max_value, false);
     }
 
     ProcessSequenceOptCache<T_Form, T_Int, large>(
@@ -2424,6 +2434,58 @@ static void process_owned_by(const Relation seqrel, List* owned_by)
     /* Done, but hold lock until commit */
     if (tablerel)
         relation_close(tablerel, NoLock);
+}
+
+/*
+ * Return sequence parameters, detailed
+ */
+sequence_values *get_sequence_values(Oid sequenceId)
+{
+    Relation seq_rel;
+    SeqTable elm = NULL;
+    HeapTupleData seqtuple;
+    int64 uuid;
+    Buffer buf;
+
+    sequence_values *seqvalues = NULL;
+
+    /*
+     * Read the old sequence. This does a bit more work than really
+     * necessary, but it's simple, and we do want to double-check that it's
+     * indeed a sequence.
+     */
+    init_sequence(sequenceId, &elm, &seq_rel);
+
+    seqvalues = (sequence_values *)palloc(sizeof(sequence_values));
+    seqvalues->large = (RelationGetRelkind(seq_rel) == RELKIND_LARGE_SEQUENCE);
+
+    if (seqvalues->large) {
+        Form_pg_large_sequence seq = read_seq_tuple<Form_pg_large_sequence>(elm, seq_rel, &buf, &seqtuple, &uuid);
+        seqvalues->sequence_name = pstrdup(seq->sequence_name.data);
+        seqvalues->is_cycled = seq->is_cycled;
+        seqvalues->last_value = Int8or16Out<int128, true>(seq->last_value);
+        seqvalues->start_value = Int8or16Out<int128, true>(seq->start_value);
+        seqvalues->increment_by = Int8or16Out<int128, true>(seq->increment_by);
+        seqvalues->max_value = Int8or16Out<int128, true>(seq->max_value);
+        seqvalues->min_value = Int8or16Out<int128, true>(seq->min_value);
+        seqvalues->cache_value = Int8or16Out<int128, true>(seq->cache_value);
+        UnlockReleaseBuffer(buf);
+    } else {
+        Form_pg_sequence seq = read_seq_tuple<Form_pg_sequence>(elm, seq_rel, &buf, &seqtuple, &uuid);
+        seqvalues->sequence_name = pstrdup(seq->sequence_name.data);
+        seqvalues->is_cycled = seq->is_cycled;
+        seqvalues->last_value = Int8or16Out<int64, false>(seq->last_value);
+        seqvalues->start_value = Int8or16Out<int64, false>(seq->start_value);
+        seqvalues->increment_by = Int8or16Out<int64, false>(seq->increment_by);
+        seqvalues->max_value = Int8or16Out<int64, false>(seq->max_value);
+        seqvalues->min_value = Int8or16Out<int64, false>(seq->min_value);
+        seqvalues->cache_value = Int8or16Out<int64, false>(seq->cache_value);
+        UnlockReleaseBuffer(buf);
+    }
+
+    relation_close(seq_rel, NoLock);
+    
+    return seqvalues;
 }
 
 /*

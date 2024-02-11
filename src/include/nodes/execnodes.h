@@ -221,6 +221,10 @@ typedef struct ExprContext {
     bool can_ignore;    // indicates whether ERROR can be ignored when type casting
 
     RightRefState* rightRefState;
+#ifdef USE_SPQ
+    OffsetNumber cached_root_offsets[MaxHeapTuplesPerPage];
+    BlockNumber cached_blkno;
+#endif
 } ExprContext;
 
 /*
@@ -586,6 +590,9 @@ typedef struct ResultRelInfo {
     List* ri_WithCheckOptionExprs;
 
     ProjectionInfo* ri_updateWhere; /* list of ON CONFLICT DO UPDATE exprs (qual)*/
+#ifdef USE_SPQ
+    AttrNumber ri_actionAttno; /* is this an INSERT or DELETE ? */
+#endif
 } ResultRelInfo;
 
 /* bloom filter controller */
@@ -722,6 +729,11 @@ typedef struct EState {
     bool have_current_xact_date; /* Check whether dirty reads exist in the cursor rollback scenario. */
     int128 first_autoinc; /* autoinc has increased during this execution */
 	int result_rel_index;    /* which result_rel_info to be excuted when multiple-relation modified. */
+    int128 cur_insert_autoinc;
+    int128 next_autoinc;
+#ifdef USE_SPQ
+    List *es_sharenode;
+#endif
 } EState;
 
 /*
@@ -963,6 +975,8 @@ typedef struct FuncExprState {
      * fcinfo_data already contains valid argument data.
      */
     bool setArgsValid;
+
+    bool setArgByVal; /* all args are by val? */
 
     bool setHasSetArg;
 
@@ -1494,6 +1508,7 @@ typedef struct ModifyTableState {
     bool mt_done;         /* are we done? */
     bool isReplace;
     bool isConflict;
+    bool isinherit;
     PlanState** mt_plans; /* subplans (one per target rel) */
 #ifdef PGXC
     PlanState** mt_remoterels;        /* per-target remote query node */
@@ -1527,6 +1542,9 @@ typedef struct ModifyTableState {
     List* mt_ResultTupleSlots;            /* for multiple modifying, ResultTupleSlot list for build mt_ProjInfos. */
     ProjectionInfo** mt_ProjInfos;        /* for multiple modifying, projectInfo list array for each result relation. */
     char** partExprKeyStrArray;           /* for multiple modifying, partition expr key */
+#ifdef USE_SPQ
+    bool* mt_isSplitUpdates; /* per-subplan flag to indicate if it's a split update */
+#endif
 } ModifyTableState;
 
 typedef struct CopyFromManagerData* CopyFromManager;
@@ -1832,6 +1850,58 @@ typedef struct ScanState {
  */
 typedef ScanState SeqScanState;
 
+#ifdef USE_SPQ
+/*
+ * SpqSeqScanState
+ */
+typedef struct SpqSeqScanState {
+    SeqScanState ss;
+    void* pageManager;
+    void* blockManager;
+} SpqSeqScanState;
+typedef struct AssertOpState {
+    PlanState ps;
+} AssertOpState;
+
+/* ----------------
+ *       State of each scanner of the ShareInput node
+ * ----------------
+ */
+typedef struct ShareInputScanState {
+    ScanState ss;
+    Tuplestorestate *ts_state;
+    int ts_pos;
+    struct shareinput_local_state *local_state;
+    struct shareinput_Xslice_reference *ref;
+    bool isready;
+} ShareInputScanState;
+
+typedef struct SequenceState {
+    PlanState ps;
+    PlanState **subplans;
+    int numSubplans;
+
+    /*
+     * True if no subplan has been executed.
+     */
+    bool initState;
+} SequenceState;
+
+/*
+ * ExecNode for Split.
+ * This operator contains a Plannode in PlanState.
+ * The Plannode contains indexes to the ctid, insert, delete, resjunk columns
+ * needed for adding the action (Insert/Delete).
+ * A MemoryContext and TupleTableSlot are maintained to keep the INSERT
+ * tuple until requested.
+ */
+typedef struct SplitUpdateState {
+    PlanState ps;
+    bool processInsert; /* flag that specifies the operator's next action. */
+    TupleTableSlot *insertTuple; /* tuple to Insert */
+    TupleTableSlot *deleteTuple; /* tuple to Delete */
+} SplitUpdateState;
+#endif
 /*
  * These structs store information about index quals that don't have simple
  * constant right-hand sides.  See comments for ExecIndexBuildScanKeys()
@@ -2202,6 +2272,12 @@ typedef struct NestLoopState {
     bool nl_MatchedOuter;
     bool nl_MaterialAll;
     TupleTableSlot* nl_NullInnerTupleSlot;
+#ifdef USE_SPQ
+    List *nl_InnerJoinKeys;        /* list of ExprState nodes */
+    List *nl_OuterJoinKeys;        /* list of ExprState nodes */
+    bool nl_innerSideScanned;      /* set to true once we've scanned all inner tuples the first time */
+    bool prefetch_inner;
+#endif
 } NestLoopState;
 
 /* ----------------
@@ -2379,6 +2455,12 @@ typedef struct HashJoinState {
     bool hj_streamBothSides;
     bool hj_rebuildHashtable;
     List* hj_hashCollations; /* list of collations OIDs */
+#ifdef USE_SPQ
+    bool hj_nonequijoin; /* set true if force hash table to keep nulls */
+    bool hj_InnerEmpty;  /* set to true if inner side is empty */
+    bool prefetch_inner;
+    bool is_set_op_join;
+#endif
 } HashJoinState;
 
 /* ----------------------------------------------------------------
@@ -2478,6 +2560,9 @@ typedef struct AggState {
     AggStatePerAgg peragg;      /* per-Aggref information */
     MemoryContext* aggcontexts; /* memory context for long-lived data */
     ExprContext* tmpcontext;    /* econtext for input expressions */
+#ifdef USE_SPQ
+    AggSplit aggsplittype;		/* agg-splitting mode, see nodes.h */
+#endif
     AggStatePerAgg curperagg;   /* identifies currently active aggregate */
     bool input_done;            /* indicates end of input */
     bool agg_done;              /* indicates completion of Agg scan */
@@ -2626,7 +2711,11 @@ typedef struct HashState {
     List* hashkeys;          /* list of ExprState nodes */
     int32 local_work_mem;    /* work_mem local for this hash join */
     int64 spill_size;
-
+#ifdef USE_SPQ
+    bool hs_keepnull;        /* Keep nulls */
+    bool hs_quit_if_hashkeys_null; /* quit building hash table if hashkeys are all null */
+    bool hs_hashkeys_null;   /* found an instance wherein hashkeys are all null */
+#endif
     /* hashkeys is same as parent's hj_InnerHashKeys */
 } HashState;
 

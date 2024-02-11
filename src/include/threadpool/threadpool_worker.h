@@ -55,7 +55,6 @@ typedef struct Backend {
     bool is_autovacuum; /* is it an autovacuum process? */
     volatile bool dead_end; /* is it going to send an quit? */
     volatile int flag;
-    int backend_type;
     Dlelem elem; /* list link in BackendList */
 } Backend;
 
@@ -145,6 +144,7 @@ private:
     uint m_idx;
     knl_session_context* m_currentSession;
     volatile ThreadStatus m_threadStatus;
+    bool m_thrd_idle_waiting;
     ThreadStayReason m_reason;
     Dlelem m_elem;
     ThreadPoolGroup* m_group;

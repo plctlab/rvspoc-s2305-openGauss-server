@@ -36,7 +36,25 @@ typedef enum {
 
 extern ExtremeRtoRedoType g_extreme_rto_type;
 
-void SetOndemandExtremeRtoMode();
+inline void SetDefaultExtremeRtoMode()
+{
+    g_extreme_rto_type = DEFAULT_EXTREME_RTO;
+}
+
+inline void SetOndemandExtremeRtoMode()
+{
+    g_extreme_rto_type = ONDEMAND_EXTREME_RTO;
+}
+
+inline bool IsDefaultExtremeRtoMode()
+{
+    return (g_extreme_rto_type == DEFAULT_EXTREME_RTO);
+}
+
+inline bool IsOndemandExtremeRtoMode()
+{
+    return (g_extreme_rto_type == ONDEMAND_EXTREME_RTO);
+}
 void ExtremeWaitAllReplayWorkerIdle();
 void ExtremeDispatchCleanInvalidPageMarkToAllRedoWorker(RepairFileKey key);
 void ExtremeDispatchClosefdMarkToAllRedoWorker();

@@ -56,12 +56,15 @@ option(ENABLE_LCOV "enable lcov, the old is --enable-lcov" OFF)
 option(ENABLE_MULTIPLE_NODES "enable distribute,the old is --enable-multiple-nodes" OFF)
 option(ENABLE_PRIVATEGAUSS "enable privategauss,the old is --enable-pribategauss" OFF)
 option(ENABLE_LITE_MODE "enable lite in single_node mode,the old is --enable-lite-mode" OFF)
+option(ENABLE_FINANCE_MODE "enable finance in single_node mode,the old is --enable-finance-mode" OFF)
 option(ENABLE_DEBUG "enable privategauss,the old is --enable-pribategauss" OFF)
 option(ENABLE_MOT "enable mot in single_node mode,the old is --enable-mot" OFF)
 option(ENABLE_NUMA "enable numa,the old is --enable-numa" ON)
 option(ENABLE_LSE "enable lse,the old is --enable-lse" ON)
 option(ENABLE_MYSQL_FDW "enable export or import data with mysql,the old is --enable-mysql-fdw" OFF)
 option(ENABLE_ORACLE_FDW "enable export or import data with oracle,the old is --enable-oracle-fdw" OFF)
+option(ENABLE_BBOX "enable bbox,the old is --enable-bbox " ON)
+option(ENABLE_JEMALLOC "enable jemalloc,the old is --enable-jemalloc " ON)
 option(BUILD_BY_CMAKE "the BUILD_BY_CMAKE is new,used in distribute pg_regress.cpp" ON)
 option(DEBUG_UHEAP "collect USTORE statistics" OFF)
 option(MAX_ALLOC_SEGNUM "max alloc xlog seg num in extreme_rto" 4)
@@ -71,6 +74,7 @@ option(USE_TASSL "build with tassl, the old is --with-tassl" OFF)#ON
 option(ENABLE_THREAD_SAFETY "enable thread safety, the old is --enable-thread-safety" ON)
 
 #The following are basically no need to configure, because these libraries are necessary or must not be used in mppdb
+option(USE_SPQ "enable spq optimizer" OFF)
 option(USE_BONJOUR "enable bonjour, the old is --with-bonjour" OFF)
 option(USE_LDAP "build with ldap, the old is --with-ldap" OFF)#ON
 option(USE_ETCD "build with etcd libs, new option for old mppdb, after 8.1 close it" OFF)
@@ -158,7 +162,7 @@ set(PROTECT_OPTIONS -fwrapv -std=c++14 -fnon-call-exceptions ${OPTIMIZE_LEVEL})
 set(WARNING_OPTIONS -Wall -Wendif-labels -Wformat-security)
 set(OPTIMIZE_OPTIONS -pipe -pthread -fno-aggressive-loop-optimizations -fno-expensive-optimizations -fno-omit-frame-pointer -fno-strict-aliasing -freg-struct-return)
 set(CHECK_OPTIONS -Wmissing-format-attribute -Wno-attributes -Wno-unused-but-set-variable -Wno-write-strings -Wpointer-arith)
-set(MACRO_OPTIONS -D_GLIBCXX_USE_CXX11_ABI=0 -DENABLE_GSTRACE -D_GNU_SOURCE -DPGXC -D_POSIX_PTHREAD_SEMANTICS -D_REENTRANT -DSTREAMPLAN -D_THREAD_SAFE ${DB_COMMON_DEFINE})
+set(MACRO_OPTIONS -D_GLIBCXX_USE_CXX11_ABI=0 -DENABLE_GSTRACE -D_GNU_SOURCE -DPGXC -D_POSIX_PTHREAD_SEMANTICS -D_REENTRANT -DSTREAMPLAN -D_THREAD_SAFE -DUSE_SPQ ${DB_COMMON_DEFINE})
 
 # Set MAX_ALLOC_SEGNUM size in extreme_rto
 if(${WAL_SEGSIZE} LESS 256)
@@ -223,6 +227,10 @@ endif()
 if("${ENABLE_LCOV}" STREQUAL "ON")
     list(APPEND CHECK_OPTIONS -fprofile-arcs -ftest-coverage)
     set(TEST_LINK_OPTIONS -lgcov -L${LCOV_LIB_PATH})
+endif()
+
+if(${USE_SPQ})
+    set(GAUSSDB_CONFIGURE "${GAUSSDB_CONFIGURE} -DUSE_SPQ")
 endif()
 
 if(${USE_LDAP})
@@ -363,4 +371,8 @@ endif()
 
 if("${ENABLE_MULTIPLE_NODES}" STREQUAL "ON" AND "${ENABLE_LITE_MODE}" STREQUAL "ON")
     message(FATAL_ERROR "error: --enable-lite-mode option is not supported with --enable-multiple-nodes option")
+endif()
+
+if("${ENABLE_FINANCE_NODES}" STREQUAL "ON" AND "${ENABLE_LITE_MODE}" STREQUAL "ON")
+    message(FATAL_ERROR "error: --enable-lite-mode option is not supported with --enable-finance-nodes option")
 endif()

@@ -75,7 +75,7 @@
 
 #define STATEMENT_DETAILS_HEAD_SIZE (1)     /* [VERSION] */
 #define INSTR_STMT_UNIX_DOMAIN_PORT (-1)
-#define INSTR_STATEMENT_ATTRNUM 53
+#define INSTR_STATEMENT_ATTRNUM (45 + TOTAL_TIME_INFO_TYPES)
 
 /* support different areas in stmt detail column */
 #define STATEMENT_DETAIL_TYPE_LEN (1)
@@ -503,9 +503,10 @@ static HeapTuple GetStatementTuple(Relation rel, StatementStatContext* statement
     set_stmt_row_activity_cache_io(statementInfo, values, &i);
 
     /* time info */
-    for (int num = 0; num < TOTAL_TIME_INFO_TYPES; num++) {
-        if (num == NET_SEND_TIME)
+    for (int num = 0; num < TOTAL_TIME_INFO_TYPES_P1; num++) {
+        if (num == NET_SEND_TIME) {
             continue;
+        }
         values[i++] = Int64GetDatum(statementInfo->timeModel[num]);
     }
 
@@ -550,6 +551,12 @@ static HeapTuple GetStatementTuple(Relation rel, StatementStatContext* statement
 
     SET_TEXT_VALUES(statementInfo->trace_id, i++);
     set_stmt_advise(statementInfo, values, nulls, &i);
+    /* time info addition */
+    values[i++] = Int64GetDatum(statementInfo->timeModel[NET_SEND_TIME]);
+    for (int num = TOTAL_TIME_INFO_TYPES_P1; num < TOTAL_TIME_INFO_TYPES; num++) {
+        values[i++] = Int64GetDatum(statementInfo->timeModel[num]);
+    }
+    values[i++] = Int64GetDatum(statementInfo->parent_query_id);
     Assert(INSTR_STATEMENT_ATTRNUM == i);
     return heap_form_tuple(RelationGetDescr(rel), values, nulls);
 }
@@ -887,7 +894,6 @@ static void FlushAllStatement()
 
 static void StatementFlush()
 {
-    const int flush_usleep_interval = 100000;
     int count = 0;
     bool is_readonly_log_needed = false;
 
@@ -899,7 +905,7 @@ static void StatementFlush()
                 ereport(WARNING, (errmodule(MOD_INSTR),
                     errmsg("[Statement] cannot flush suspend list to statement_history in a read-only transaction")));
             }
-            pg_usleep(flush_usleep_interval);
+            pg_usleep(FLUSH_USLEEP_INTERVAL);
             continue;
         }
         if (is_readonly_log_needed) {
@@ -919,7 +925,7 @@ static void StatementFlush()
         /* report statement_history state to pgstat */
         if (OidIsValid(u_sess->proc_cxt.MyDatabaseId))
             pgstat_report_stat(true);
-        pg_usleep(flush_usleep_interval);
+        pg_usleep(FLUSH_USLEEP_INTERVAL);
     }
 }
 
@@ -1699,7 +1705,7 @@ static int stmt_compare_wait_events(const void *a, const void *b)
 void decode_stmt_wait_events(StringInfo resultBuf, const char *details,
     uint32 total_len, bool *is_valid_record, bool pretty)
 {
-    if (total_len <= 0) {
+    if (total_len == 0) {
         *is_valid_record = false;
         return;
     }
@@ -1771,7 +1777,7 @@ void decode_stmt_wait_events(StringInfo resultBuf, const char *details,
 void decode_statement_detail(StringInfo resultBuf, const char *details,
     uint32 total_len, bool *is_valid_record, bool pretty)
 {
-    if (total_len <= 0) {
+    if (total_len == 0) {
         *is_valid_record = false;
         return;
     }
@@ -2065,10 +2071,12 @@ void instr_stmt_report_query(uint64 unique_query_id)
     CHECK_STMT_HANDLE();
     CURRENT_STMT_METRIC_HANDLE->unique_query_id = unique_query_id;
     CURRENT_STMT_METRIC_HANDLE->unique_sql_cn_id = u_sess->unique_sql_cxt.unique_sql_cn_id;
+    CURRENT_STMT_METRIC_HANDLE->parent_query_id = u_sess->unique_sql_cxt.parent_unique_sql_id;
 
-    if (likely(!is_local_unique_sql() || 
-        (!u_sess->attr.attr_common.track_stmt_parameter && CURRENT_STMT_METRIC_HANDLE->query) ||
-        (u_sess->attr.attr_common.track_stmt_parameter && 
+    if (likely(!is_local_unique_sql() ||
+        (!u_sess->attr.attr_common.track_stmt_parameter && CURRENT_STMT_METRIC_HANDLE->query
+                && !u_sess->unique_sql_cxt.need_record_in_dynexecplsql) ||
+        (u_sess->attr.attr_common.track_stmt_parameter &&
          (u_sess->pbe_message == PARSE_MESSAGE_QUERY || u_sess->pbe_message == BIND_MESSAGE_QUERY)))) {
         return;
     }
@@ -2128,6 +2136,10 @@ void instr_stmt_report_stat_at_handle_init()
     CURRENT_STMT_METRIC_HANDLE->level =
         (StatLevel)Max(u_sess->statement_cxt.statement_level[0], u_sess->statement_cxt.statement_level[1]);
 
+    /* unit: microseconds */
+    CURRENT_STMT_METRIC_HANDLE->slow_query_threshold =
+        (int64)u_sess->attr.attr_storage.log_min_duration_statement * 1000;
+
     /* fill basic information */
     instr_stmt_report_basic_info();
 
@@ -2154,11 +2166,6 @@ void instr_stmt_report_stat_at_handle_commit()
     MemoryContext old_ctx = MemoryContextSwitchTo(u_sess->statement_cxt.stmt_stat_cxt);
     CURRENT_STMT_METRIC_HANDLE->schema_name = pstrdup(u_sess->attr.attr_common.namespace_search_path);
     CURRENT_STMT_METRIC_HANDLE->application_name = pstrdup(u_sess->attr.attr_common.application_name);
-
-    /* unit: microseconds */
-    CURRENT_STMT_METRIC_HANDLE->slow_query_threshold =
-        (int64)u_sess->attr.attr_storage.log_min_duration_statement * 1000;
-
     CURRENT_STMT_METRIC_HANDLE->tid = t_thrd.proc_cxt.MyProcPid;
 
     /* sql from remote node */
@@ -2228,20 +2235,59 @@ void instr_stmt_report_unique_sql_info(const PgStat_TableCounts *agg_table_stat,
     }
 }
 
+static inline bool instr_stmt_level_fullsql_open()
+{
+    int fullsql_level = u_sess->statement_cxt.statement_level[0];
+    /* only record query plan when level >= L1 */
+    return fullsql_level >= STMT_TRACK_L1 && fullsql_level <= STMT_TRACK_L2;
+}
+
+static inline bool instr_stmt_level_slowsql_only_open()
+{
+    if (CURRENT_STMT_METRIC_HANDLE == NULL || CURRENT_STMT_METRIC_HANDLE->slow_query_threshold < 0) {
+        return false;
+    }
+
+    int slowsql_level = u_sess->statement_cxt.statement_level[1];
+    /* only record query plan when level >= L1 */
+    return slowsql_level >= STMT_TRACK_L1 && slowsql_level <= STMT_TRACK_L2;
+}
+
+static inline bool instr_stmt_is_slowsql()
+{
+    if (CURRENT_STMT_METRIC_HANDLE->slow_query_threshold == 0) {
+        return true;
+    }
+    StatementStatContext *ssctx = (StatementStatContext *)u_sess->statement_cxt.curStatementMetrics;
+    if (ssctx->query_plan != NULL) {
+        return false;
+    }
+    TimestampTz cur_time = GetCurrentTimestamp();
+    int64 start_time = (int64)ssctx->start_time;
+    int64 elapse_time = (int64)(cur_time - start_time);
+
+    return CURRENT_STMT_METRIC_HANDLE->slow_query_threshold <= elapse_time;
+}
+
 bool instr_stmt_need_track_plan()
 {
-    if (CURRENT_STMT_METRIC_HANDLE == NULL || CURRENT_STMT_METRIC_HANDLE->level <= STMT_TRACK_L0 ||
-        CURRENT_STMT_METRIC_HANDLE->level > STMT_TRACK_L2)
+    if (CURRENT_STMT_METRIC_HANDLE == NULL) {
         return false;
+    }
 
-    return true;
+    if (instr_stmt_level_fullsql_open() || (instr_stmt_level_slowsql_only_open() && instr_stmt_is_slowsql())) {
+        return true;
+    }
+
+    return false;
 }
 
 void instr_stmt_report_query_plan(QueryDesc *queryDesc)
 {
     StatementStatContext *ssctx = (StatementStatContext *)u_sess->statement_cxt.curStatementMetrics;
     if (queryDesc == NULL || ssctx == NULL || ssctx->level <= STMT_TRACK_L0
-        || ssctx->level > STMT_TRACK_L2 || ssctx->plan_size != 0 || u_sess->statement_cxt.executer_run_level > 1) {
+        || ssctx->level > STMT_TRACK_L2 || (ssctx->plan_size != 0 && !u_sess->unique_sql_cxt.is_open_cursor)
+        || (u_sess->statement_cxt.executer_run_level > 1 && !IS_UNIQUE_SQL_TRACK_ALL)) {
         return;
     }
     /* when getting plan directly from CN, the plan is partial, deparse plan will be failed,

@@ -307,6 +307,6 @@ void ForbidUserToSetCompressedOptions(List *options);
 void SetOneOfCompressOption(DefElem* defElem, TableCreateSupport *tableCreateSupport);
 bool ReadBoolFromDefElem(DefElem* defElem);
 void CheckCompressOption(TableCreateSupport *tableCreateSupport);
-void ForbidUserToSetCompressedOptions(List *options);
+bool CheckSegmentStorageOption(List *options);
 #endif /* RELOPTIONS_H */
 

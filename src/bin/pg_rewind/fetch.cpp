@@ -26,6 +26,8 @@
 #include "catalog/catalog.h"
 #include "PageCompression.h"
 #include "catalog/pg_type.h"
+#include "storage/file/fio_device.h"
+#include "access/extreme_rto/standby_read/standby_read_base.h"
 
 PGconn* conn = NULL;
 char source_slot_name[NAMEDATALEN] = {0};
@@ -57,6 +59,12 @@ static BuildErrorCode recurse_dir(const char* datadir, const char* path, process
 static void get_slot_name_by_app_name(void);
 static BuildErrorCode CheckResultSet(PGresult* pgResult);
 static void get_log_directory_guc(void);
+static void *ProgressReportIncrementalBuild(void *arg);
+
+static volatile bool g_progressFlag = false;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 BuildErrorCode libpqConnect(const char* connstr)
 {
     PGresult* res = NULL;
@@ -122,6 +130,8 @@ BuildErrorCode libpqGetParameters(void)
     }
     str2 = run_simple_query("SHOW enable_incremental_checkpoint");
     if (str2 == NULL) {
+        pg_free(str);
+        str = NULL;
         return BUILD_FATAL;
     }
     if (strcmp(str, "on") != 0 && strcmp(str2, "on") != 0) {
@@ -300,6 +310,9 @@ BuildErrorCode fetchSourceFileList()
             continue;
         if (NULL != strstr(path, "disable_conn_file"))
             continue;
+        if (NULL != strstr(path, EXRTO_FILE_DIR)) {
+            continue;
+        }
 
         if (PQgetisnull(res, 0, 1)) {
             /*
@@ -368,6 +381,10 @@ static BuildErrorCode receiveFileChunks(const char* sql, FILE* file)
         pg_fatal("could not set libpq connection to single row mode\n");
         return BUILD_FATAL;
     }
+
+    fprintf(stdout, "Begin fetching files \n");
+    pthread_t progressThread;
+    pthread_create(&progressThread, NULL, ProgressReportIncrementalBuild, NULL);
 
     while ((res = PQgetResult(conn)) != NULL) {
         char* filename = NULL;
@@ -484,6 +501,15 @@ static BuildErrorCode receiveFileChunks(const char* sql, FILE* file)
         }
         PG_CHECKBUILD_AND_FREE_PGRESULT_RETURN(res);
     }
+
+    g_progressFlag = true;
+    pthread_mutex_lock(&g_mutex);
+    pthread_cond_signal(&g_cond);
+    pthread_mutex_unlock(&g_mutex);
+    pthread_join(progressThread, NULL);
+
+    fprintf(stdout, "Finish fetching files \n");
+
     return BUILD_SUCCESS;
 }
 
@@ -1299,3 +1325,40 @@ bool checkDummyStandbyConnection(void)
     return ret;
 }
 
+/*
+ * Print a progress report based on the global variables.
+ * Execute this function in another thread and print the progress periodically.
+ */
+static void *ProgressReportIncrementalBuild(void *arg)
+{
+    if (fetch_size == 0) {
+        return nullptr;
+    }
+    char progressBar[53];
+    int percent;
+    do {
+        /* progress report */
+        percent = (int)(fetch_done * 100 / fetch_size);
+        GenerateProgressBar(percent, progressBar);
+        fprintf(stdout, "Progress: %s %d%% (%lu/%luKB). fetch files \r",
+            progressBar, percent, fetch_done / 1024, fetch_size /1024);
+        pthread_mutex_lock(&g_mutex);
+        timespec timeout;
+        timeval now;
+        gettimeofday(&now, nullptr);
+        timeout.tv_sec = now.tv_sec + 1;
+        timeout.tv_nsec = 0;
+        int ret = pthread_cond_timedwait(&g_cond, &g_mutex, &timeout);
+        pthread_mutex_unlock(&g_mutex);
+        if (ret == ETIMEDOUT) {
+            continue;
+        } else {
+            break;
+        }
+    } while ((fetch_done < fetch_size) && !g_progressFlag);
+    percent = 100;
+    GenerateProgressBar(percent, progressBar);
+    fprintf(stdout, "Progress: %s %d%% (%lu/%luKB). fetch files \n",
+            progressBar, percent, fetch_done /1024, fetch_size / 1024);
+    return nullptr;
+}

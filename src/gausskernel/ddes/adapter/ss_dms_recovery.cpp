@@ -33,15 +33,19 @@
 #include "storage/smgr/segment.h"
 #include "postmaster/postmaster.h"
 #include "storage/file/fio_device.h"
+#include "replication/ss_disaster_cluster.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 #include "ddes/dms/ss_dms_recovery.h"
 #include "ddes/dms/ss_reform_common.h"
+#include "ddes/dms/ss_transaction.h"
 #include "access/double_write.h"
+#include "access/twophase.h"
 #include <sys/types.h>
 #include <dirent.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include "access/xlogproc.h"
 
 int SSGetPrimaryInstId()
 {
@@ -50,8 +54,10 @@ int SSGetPrimaryInstId()
 
 void SSSavePrimaryInstId(int id)
 {
+    LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
     g_instance.dms_cxt.SSReformerControl.primaryInstId = id;
-    SSSaveReformerCtrl();
+    SSUpdateReformerCtrl();
+    LWLockRelease(ControlFileLock);
 }
 
 void SSWaitStartupExit()
@@ -125,7 +131,7 @@ bool SSRecoveryNodes()
          * recovery phase could be regarded successful in hot_standby thus set pmState = PM_HOT_STANDBY, which
          * indicate database systerm is ready to accept read only connections.
          */
-        if (SS_STANDBY_CLUSTER_MAIN_STANDBY && pmState == PM_HOT_STANDBY) {
+        if (SS_DISASTER_MAIN_STANDBY_NODE && pmState == PM_HOT_STANDBY) {
             result = true;
             break;
         }
@@ -146,11 +152,11 @@ bool SSRecoveryApplyDelay()
         return false;
     }
     
-    if (DORADO_STANDBY_CLUSTER) {
+    if (SS_DISASTER_STANDBY_CLUSTER) {
         return true;
     }
 
-    while (g_instance.dms_cxt.SSRecoveryInfo.recovery_pause_flag) {
+    while (g_instance.dms_cxt.SSRecoveryInfo.recovery_pause_flag || SS_ONDEMAND_RECOVERY_PAUSE) {
         /* might change the trigger file's location */
         RedoInterruptCallBack();
 
@@ -166,7 +172,8 @@ void SSInitReformerControlPages(void)
     /*
      * If already exists control file, reformer page must have been initialized
      */
-    if (dss_exist_file(XLOG_CONTROL_FILE)) {
+    struct stat st;
+    if (stat(XLOG_CONTROL_FILE, &st) == 0 && S_ISREG(st.st_mode)) {
         SSReadControlFile(REFORM_CTRL_PAGE);
         if (g_instance.dms_cxt.SSReformerControl.list_stable != 0 ||
             g_instance.dms_cxt.SSReformerControl.primaryInstId == SS_MY_INST_ID) {
@@ -186,12 +193,13 @@ void SSInitReformerControlPages(void)
      * Initialize list_stable and primaryInstId
      * First node to initdb is chosen as primary for now, and for first-time cluster startup.
      */
-    Assert(!dss_exist_file(XLOG_CONTROL_FILE));
+    Assert(stat(XLOG_CONTROL_FILE, &st) != 0 || !S_ISREG(st.st_mode));
     g_instance.dms_cxt.SSReformerControl.list_stable = 0;
     g_instance.dms_cxt.SSReformerControl.primaryInstId = SS_MY_INST_ID;
     g_instance.dms_cxt.SSReformerControl.recoveryInstId = INVALID_INSTANCEID;
     g_instance.dms_cxt.SSReformerControl.version = REFORM_CTRL_VERSION;
     g_instance.dms_cxt.SSReformerControl.clusterStatus = CLUSTER_NORMAL;
+    g_instance.dms_cxt.SSReformerControl.clusterRunMode = RUN_MODE_PRIMARY;
     (void)printf("[SS] Current node:%d initdb first, will become PRIMARY for first-time SS cluster startup.\n",
         SS_MY_INST_ID);
 
@@ -226,7 +234,9 @@ void SSInitReformerControlPages(void)
 void SShandle_promote_signal()
 {
     if (pmState == PM_WAIT_BACKENDS) {
-        g_instance.pid_cxt.StartupPID = initialize_util_thread(STARTUP);
+        if (SS_ONDEMAND_REALTIME_BUILD_DISABLED) {
+            g_instance.pid_cxt.StartupPID = initialize_util_thread(STARTUP);
+        }
         Assert(g_instance.pid_cxt.StartupPID != 0);
         pmState = PM_STARTUP;
     }
@@ -294,4 +304,148 @@ void ss_switchover_promoting_dw_init()
     dw_init();
     g_instance.dms_cxt.dw_init = true;
     ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS switchover] dw init finished")));
+}
+
+XLogRecPtr SSOndemandRequestPrimaryCkptAndGetRedoLsn()
+{
+    XLogRecPtr primaryRedoLsn = InvalidXLogRecPtr;
+
+    ereport(DEBUG1, (errmodule(MOD_DMS),
+        errmsg("[On-demand] start request primary node %d do checkpoint", SS_PRIMARY_ID)));
+    if (SS_ONDEMAND_REALTIME_BUILD_NORMAL) {
+        dms_context_t dms_ctx;
+        InitDmsContext(&dms_ctx);
+        dms_ctx.xmap_ctx.dest_id = (unsigned int)SS_PRIMARY_ID;
+        if (dms_req_opengauss_immediate_checkpoint(&dms_ctx, (unsigned long long *)&primaryRedoLsn) == GS_SUCCESS) {
+            ereport(DEBUG1, (errmodule(MOD_DMS),
+                errmsg("[On-demand] request primary node %d checkpoint success, redoLoc %X/%X", SS_PRIMARY_ID,
+                    (uint32)(primaryRedoLsn << 32), (uint32)primaryRedoLsn)));
+            return primaryRedoLsn;
+        }
+        ereport(DEBUG1, (errmodule(MOD_DMS),
+            errmsg("[On-demand] request primary node %d checkpoint failed", SS_PRIMARY_ID)));
+    }
+
+    // read from DMS failed, so read from DSS
+    SSReadControlFile(SS_PRIMARY_ID, true);
+    primaryRedoLsn = g_instance.dms_cxt.ckptRedo;
+    ereport(DEBUG1, (errmodule(MOD_DMS),
+        errmsg("[On-demand] read primary node %d checkpoint loc in control file, redoLoc %X/%X", SS_PRIMARY_ID,
+            (uint32)(primaryRedoLsn << 32), (uint32)primaryRedoLsn)));
+    return primaryRedoLsn;
+}
+
+void StartupOndemandRecovery()
+{
+    g_instance.dms_cxt.SSRecoveryInfo.in_ondemand_recovery = true;
+    g_instance.dms_cxt.SSRecoveryInfo.cluster_ondemand_status = CLUSTER_IN_ONDEMAND_BUILD;
+    /* for other nodes in cluster and ondeamnd recovery failed */
+    LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+    g_instance.dms_cxt.SSReformerControl.clusterStatus = CLUSTER_IN_ONDEMAND_BUILD;
+    g_instance.dms_cxt.SSReformerControl.recoveryInstId = g_instance.dms_cxt.SSRecoveryInfo.recovery_inst_id;
+    SSUpdateReformerCtrl();
+    LWLockRelease(ControlFileLock);
+    SSRequestAllStandbyReloadReformCtrlPage();
+    SetOndemandExtremeRtoMode();
+}
+
+void OndemandRealtimeBuildHandleFailover()
+{
+    Assert(SS_ONDEMAND_REALTIME_BUILD_NORMAL);
+
+    SSReadControlFile(SSGetPrimaryInstId());
+    ss_failover_dw_init();
+    StartupOndemandRecovery();
+    StartupReplicationSlots();
+    restoreTwoPhaseData();
+    OnDemandUpdateRealtimeBuildPrunePtr();
+    SendPostmasterSignal(PMSIGNAL_RECOVERY_STARTED);
+    while (g_instance.dms_cxt.SSRecoveryInfo.recovery_pause_flag) {
+        pg_usleep(REFORM_WAIT_TIME);
+    }
+    g_instance.dms_cxt.SSRecoveryInfo.ondemand_realtime_build_status = BUILD_TO_REDO;
+    ereport(LOG, (errmodule(MOD_DMS), errmsg("[On-demand] Node:%d receive failover signal, "
+        "close realtime build and start ondemand build, set status to BUILD_TO_REDO.", SS_MY_INST_ID)));
+}
+
+XLogRedoAction SSCheckInitPageXLog(XLogReaderState *record, uint8 block_id, RedoBufferInfo *redo_buf)
+{
+    if (!ENABLE_DMS) {
+        return BLK_NEEDS_REDO;
+    }
+
+    XLogRedoAction action = BLK_NEEDS_REDO;
+    RedoBufferTag blockinfo;
+    if (!XLogRecGetBlockTag(record, block_id, &(blockinfo.rnode), &(blockinfo.forknum), &(blockinfo.blkno),
+        &(blockinfo.pblk))) {
+            ereport(PANIC, (errmsg("[SS redo] failed to locate backup block with ID %d", block_id)));
+    }
+    bool skip = false;
+    char pageid[DMS_PAGEID_SIZE] = {0};
+    errno_t rc = memcpy_s(pageid, DMS_PAGEID_SIZE, &blockinfo, sizeof(BufferTag));
+    securec_check(rc, "\0", "\0");
+    dms_recovery_page_need_skip(pageid, (unsigned char*)&skip, (unsigned int)false);
+
+    if (skip) {
+        XLogPhyBlock *pblk = (blockinfo.pblk.relNode != InvalidOid) ? &blockinfo.pblk : NULL;
+        bool tde = false;
+        if (record->isTde) {
+            tde = InsertTdeInfoToCache(blockinfo.rnode, record->blocks[block_id].tdeinfo);
+        }
+        Buffer buf = XLogReadBufferExtended(blockinfo.rnode, blockinfo.forknum, blockinfo.blkno,
+            RBM_NORMAL, pblk, tde);
+        if (BufferIsInvalid(buf)) {
+            ereport(PANIC, (errmsg("[SS redo][%u/%u/%u/%d %d-%u] buffer should be found",
+                blockinfo.rnode.spcNode, blockinfo.rnode.dbNode, blockinfo.rnode.relNode,
+                blockinfo.rnode.bucketNode, blockinfo.forknum, blockinfo.blkno))); 
+        }
+        redo_buf->buf = buf;
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        SSCheckBufferIfNeedMarkDirty(redo_buf->buf);
+        action = BLK_DONE;
+    }
+    return action;
+}
+
+XLogRedoAction SSCheckInitPageXLogSimple(XLogReaderState *record, uint8 block_id, RedoBufferInfo *redo_buf)
+{
+    XLogRedoAction action = SSCheckInitPageXLog(record, block_id, redo_buf);
+    if (action == BLK_DONE) {
+        if (IsSegmentBufferID(redo_buf->buf - 1)) {
+            SegUnlockReleaseBuffer(redo_buf->buf);
+        } else {
+            UnlockReleaseBuffer(redo_buf->buf);
+        }
+    }
+    return action;
+}
+
+// used for extreme recovery and on-demand recovery
+bool SSPageReplayNeedSkip(RedoBufferInfo *bufferinfo, XLogRecPtr xlogLsn)
+{
+    RedoBufferTag *blockinfo = &bufferinfo->blockinfo;
+    XLogPhyBlock *pblk = (blockinfo->pblk.relNode != InvalidOid) ? &blockinfo->pblk : NULL;
+    Buffer buf = XLogReadBufferExtended(blockinfo->rnode, blockinfo->forknum, blockinfo->blkno,
+        RBM_NORMAL, pblk, false);
+    if (BufferIsValid(buf)) {
+        Page page = BufferGetPage(buf);
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        if (XLByteLE(xlogLsn, PageGetLSN(page))) {
+            bufferinfo->buf = buf;
+            bufferinfo->lsn = xlogLsn;
+            bufferinfo->pageinfo.page = page;
+            bufferinfo->pageinfo.pagesize = BufferGetPageSize(buf);
+            ereport(LOG, (errmsg("[SS redo][%u/%u/%u/%d %d-%u] page skip replay",
+                blockinfo->rnode.spcNode, blockinfo->rnode.dbNode, blockinfo->rnode.relNode,
+                blockinfo->rnode.bucketNode, blockinfo->forknum, blockinfo->blkno)));
+            return true;
+        } else {
+            if (IsSegmentBufferID(buf - 1)) {
+                SegUnlockReleaseBuffer(buf);
+            } else {
+                UnlockReleaseBuffer(buf);
+            }
+        }
+    }
+    return false;
 }

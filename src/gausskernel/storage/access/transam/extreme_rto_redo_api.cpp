@@ -134,17 +134,12 @@ static const f_extreme_rto_redo extreme_rto_redosw[] = {
         ondemand_extreme_rto::FreeAllocatedRedoItem,
         ondemand_extreme_rto::GetAllWorkerCount,
         ondemand_extreme_rto::GetXLogInvalidPagesFromWorkers,
-        ondemand_extreme_rto::SendRecoveryEndMarkToWorkersAndWaitForFinish,
+        NULL,
         ondemand_extreme_rto::redo_get_io_event,
         ondemand_extreme_rto::redo_get_worker_statistic,
         ondemand_extreme_rto::redo_get_worker_time_count,
     },
 };
-
-void SetOndemandExtremeRtoMode()
-{
-    g_extreme_rto_type = ONDEMAND_EXTREME_RTO;
-}
 
 void ExtremeWaitAllReplayWorkerIdle()
 {

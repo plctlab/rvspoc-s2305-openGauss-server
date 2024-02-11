@@ -49,6 +49,9 @@ void seg_async_read(SMgrRelation reln, ForkNumber forknum, AioDispatchDesc_t **d
 void seg_async_write(SMgrRelation reln, ForkNumber forknum, AioDispatchDesc_t **dList, int32 dn);
 void seg_move_buckets(const RelFileNodeBackend &dest, const RelFileNodeBackend &src, List *bucketList);
 bool seg_fork_exists(SegSpace *spc, SMgrRelation reln, ForkNumber forknum, const XLogPhyBlock *pblk);
+void seg_direct_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, BlockNumber *blocknums, char *buffer,
+                     BlockNumber *locBlock);
+BlockNumber seg_direct_read_get_range(BlockNumber logic_id);
 
 /* Read/write by physical block number; used for segment meta data */
 void seg_physical_read(SegSpace *spc, RelFileNode &rNode, ForkNumber forknum, BlockNumber blocknum, char *buffer);
@@ -67,6 +70,7 @@ int seg_sync_filetag(const FileTag *ftag, char *path);
 int seg_unlink_filetag(const FileTag *ftag, char *path);
 void segForgetDatabaseFsyncRequests(Oid dbid);
 bool seg_filetag_matches(const FileTag *ftag, const FileTag *candidate);
+void df_extend_file_vector(SegLogicFile *sf);
 
 /*
  * XLog Atomic Operation APIs
@@ -146,7 +150,7 @@ Buffer try_get_moved_pagebuf(RelFileNode *rnode, int forknum, BlockNumber logic_
 
 void SetInProgressFlags(BufferDesc *bufDesc, bool input);
 bool HasInProgressBuf(void);    
-void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
+void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits);
 #ifdef USE_ASSERT_CHECKING
 void SegFlushCheckDiskLSN(SegSpace *spc, RelFileNode rNode, ForkNumber forknum, BlockNumber blocknum, char *buf);
 #endif

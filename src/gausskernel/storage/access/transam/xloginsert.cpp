@@ -35,6 +35,7 @@
 #include "utils/guc.h"
 #include "pg_trace.h"
 #include "replication/logical.h"
+#include "replication/ss_disaster_cluster.h"
 #include "pgstat.h"
 #include "access/ustore/knl_upage.h"
 
@@ -84,6 +85,7 @@ void XLogBeginInsert(void)
     Assert(t_thrd.xlog_cxt.max_registered_block_id == 0);
     Assert(t_thrd.xlog_cxt.mainrdata_last == (XLogRecData *)&t_thrd.xlog_cxt.mainrdata_head);
     Assert(t_thrd.xlog_cxt.mainrdata_len == 0);
+    Assert(!(SS_CLUSTER_ONDEMAND_RECOVERY && SS_STANDBY_MODE));
 
     /* cross-check on whether we should be here or not */
     if (!XLogInsertAllowed())
@@ -94,8 +96,8 @@ void XLogBeginInsert(void)
         ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                         errmsg("XLogBeginInsert was already called")));
 
-    if (!SSXLogInsertAllowed()) {
-        ereport(LOG, (errmsg("SS standby cannot insert XLOG entries")));
+    if (SS_DISASTER_STANDBY_CLUSTER) {
+        ereport(LOG, (errmsg("SS dorado standby cluster cannot insert XLOG entries")));
         return;
     }
 

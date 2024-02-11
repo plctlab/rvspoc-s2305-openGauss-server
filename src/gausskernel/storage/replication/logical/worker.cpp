@@ -36,11 +36,16 @@
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_partition_fn.h"
 #include "catalog/pg_subscription_rel.h"
-
+#include "parser/analyze.h"
+#include "tcop/ddldeparse.h"
+#include "tcop/pquery.h"
+#include "tcop/utility.h"
+#include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "commands/subscriptioncmds.h"
 
@@ -89,6 +94,8 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/acl.h"
 #include "utils/syscache.h"
 #include "utils/postinit.h"
 #include "utils/ps_status.h"
@@ -115,6 +122,10 @@ static void ApplyWorkerProcessMsg(char type, StringInfo s, XLogRecPtr *lastRcv);
 static void apply_dispatch(StringInfo s);
 static void apply_handle_conninfo(StringInfo s);
 static void UpdateConninfo(char* standbysInfo);
+static Oid find_conflict_tuple(EState *estate, TupleTableSlot *remoteslot, TupleTableSlot *localslot,
+    TupleTableSlot *originslot = NULL);
+static void IsSkippingChanges(XLogRecPtr finish_lsn);
+static void StopSkippingChanges();
 
 /*
  * Should this worker apply changes for given relation.
@@ -478,6 +489,8 @@ static void apply_handle_begin(StringInfo s)
     t_thrd.applyworker_cxt.remoteFinalLsn = begin_data.final_lsn;
     t_thrd.applyworker_cxt.curRemoteCsn = begin_data.csn;
 
+    IsSkippingChanges(begin_data.final_lsn);
+
     pgstat_report_activity(STATE_RUNNING, NULL);
 }
 
@@ -509,6 +522,21 @@ static void apply_handle_commit(StringInfo s)
 
     /* Process any tables that are being synchronized in parallel. */
     process_syncing_tables(commit_data.end_lsn);
+
+    
+    if (t_thrd.applyworker_cxt.curWorker->needCheckConflict) {
+        t_thrd.applyworker_cxt.curWorker->needCheckConflict = false;
+        MemoryContext oldctx = MemoryContextSwitchTo(INSTANCE_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DEFAULT));
+        pthread_mutex_lock(&g_instance.subIdsLock);
+        g_instance.needCheckConflictSubIds = list_delete_oid(g_instance.needCheckConflictSubIds,
+            t_thrd.applyworker_cxt.curWorker->subid);
+        pthread_mutex_unlock(&g_instance.subIdsLock);
+        MemoryContextSwitchTo(oldctx);
+    }
+
+    if (t_thrd.applyworker_cxt.isSkipTransaction) {
+        StopSkippingChanges();
+    }
 
     pgstat_report_activity(STATE_IDLE, NULL);
 }
@@ -571,6 +599,89 @@ static Oid GetRelationIdentityOrPK(Relation rel)
 }
 
 /*
+ * Find the tuple in a table using any unique index and returns the conflicting
+ * index's oid, if any conflict found.
+ * 
+ * *originslot* contains the old tuple during UPDATE, if conflict with it which
+ * to be updated, ignore it.
+ */
+Oid find_conflict_tuple(EState *estate, TupleTableSlot *remoteslot, TupleTableSlot *localslot,
+    TupleTableSlot *originslot)
+{
+    Oid replidxoid = InvalidOid;
+    bool found = false;
+    ResultRelInfo* relinfo = estate->es_result_relation_info;
+    FakeRelationPartition fakeRelInfo;
+
+    /* Check the replica identity index first */
+    replidxoid = RelationGetReplicaIndex(relinfo->ri_RelationDesc);
+    if (OidIsValid(replidxoid)) {
+        found = RelationFindReplTuple(estate, relinfo->ri_RelationDesc, replidxoid, LockTupleExclusive, remoteslot,
+            localslot, &fakeRelInfo);
+
+        /* Cleanup. */
+        if (fakeRelInfo.needRleaseDummyRel && fakeRelInfo.partRel) {
+            releaseDummyRelation(&fakeRelInfo.partRel);
+        }
+        if (fakeRelInfo.partList) {
+            releasePartitionList(relinfo->ri_RelationDesc, &fakeRelInfo.partList, NoLock);
+        }
+
+        if (found) {
+            if (originslot != NULL && ItemPointerCompare(tableam_tops_get_t_self(relinfo->ri_RelationDesc,
+                localslot->tts_tuple), tableam_tops_get_t_self(relinfo->ri_RelationDesc,
+                originslot->tts_tuple)) == 0) {
+                /* If conflict with the tuple to be updated, ignore it. */
+                found = false;
+            } else {
+                return replidxoid;
+            }
+        }
+    }
+
+    for (int i = 0; i < relinfo->ri_NumIndices; i++) {
+        IndexInfo *ii = relinfo->ri_IndexRelationInfo[i];
+        Relation idxrel;
+        Oid idxoid = InvalidOid;
+
+        if (!ii->ii_Unique) {
+            continue;
+        }
+
+        idxrel = relinfo->ri_IndexRelationDescs[i];
+        idxoid = RelationGetRelid(idxrel);
+
+        if (idxoid == replidxoid) {
+            continue;
+        }
+
+        found = RelationFindReplTuple(estate, relinfo->ri_RelationDesc, idxoid, LockTupleExclusive, remoteslot,
+            localslot, &fakeRelInfo);
+
+        /* Cleanup. */
+        if (fakeRelInfo.needRleaseDummyRel && fakeRelInfo.partRel) {
+            releaseDummyRelation(&fakeRelInfo.partRel);
+        }
+        if (fakeRelInfo.partList) {
+            releasePartitionList(relinfo->ri_RelationDesc, &fakeRelInfo.partList, NoLock);
+        }
+
+        if (found) {
+            if (originslot != NULL && ItemPointerCompare(tableam_tops_get_t_self(relinfo->ri_RelationDesc,
+                localslot->tts_tuple), tableam_tops_get_t_self(relinfo->ri_RelationDesc,
+                originslot->tts_tuple)) == 0) {
+                /* If conflict with the tuple to be updated, ignore it. */
+                found = false;
+            } else {
+                return idxoid;
+            }
+        }
+    }
+
+    return InvalidOid;
+}
+
+/*
  * Handle INSERT message.
  */
 static void apply_handle_insert(StringInfo s)
@@ -582,8 +693,15 @@ static void apply_handle_insert(StringInfo s)
     TupleTableSlot *remoteslot;
     MemoryContext oldctx;
     FakeRelationPartition fakeRelInfo;
+    TupleTableSlot *localslot;
+    EPQState epqstate;
+    Oid conflictIndexOid = InvalidOid;
 
     ensure_transaction();
+
+    if (t_thrd.applyworker_cxt.isSkipTransaction) {
+        return;
+    }
 
     relid = logicalrep_read_insert(s, &newtup);
     rel = logicalrep_rel_open(relid, RowExclusiveLock);
@@ -600,6 +718,8 @@ static void apply_handle_insert(StringInfo s)
     estate = create_estate_for_relation(rel);
     remoteslot = ExecInitExtraTupleSlot(estate, rel->localrel->rd_tam_ops);
     ExecSetSlotDescriptor(remoteslot, RelationGetDescr(rel->localrel));
+    localslot = ExecInitExtraTupleSlot(estate, rel->localrel->rd_tam_ops);
+    ExecSetSlotDescriptor(localslot, RelationGetDescr(rel->localrel));
 
     /* Input functions may need an active snapshot, so get one */
     PushActiveSnapshot(GetTransactionSnapshot());
@@ -614,8 +734,80 @@ static void apply_handle_insert(StringInfo s)
     /* Get fake relation and partition for patitioned table */
     GetFakeRelAndPart(estate, rel->localrel, remoteslot, &fakeRelInfo);
 
-    /* Do the insert. */
-    ExecSimpleRelationInsert(estate, remoteslot, &fakeRelInfo);
+    if (t_thrd.applyworker_cxt.curWorker->needCheckConflict &&
+        (conflictIndexOid = find_conflict_tuple(estate, remoteslot, localslot)) != InvalidOid) {
+        StringInfoData localtup, remotetup;
+        initStringInfo(&localtup);
+        tuple_to_stringinfo(rel->localrel, &localtup, RelationGetDescr(rel->localrel),
+            (HeapTuple)localslot->tts_tuple, false);
+
+        initStringInfo(&remotetup);
+        tuple_to_stringinfo(rel->localrel, &remotetup, RelationGetDescr(rel->localrel),
+            (HeapTuple)tableam_tslot_get_tuple_from_slot(rel->localrel, remoteslot), false);
+
+        switch (u_sess->attr.attr_storage.subscription_conflict_resolution) {
+            case RESOLVE_ERROR:
+                ereport(ERROR, (errmsg("CONFLICT: remote insert on relation %s (local index %s). Resolution: error.",
+                    RelationGetRelationName(rel->localrel), get_rel_name(conflictIndexOid)),
+                    errdetail("local tuple: %s, remote tuple: %s, origin: pg_%u, commit_lsn: %X/%X", localtup.data,
+                    remotetup.data, t_thrd.applyworker_cxt.curWorker->subid,
+                    (uint32)(t_thrd.applyworker_cxt.remoteFinalLsn >> BITS_PER_INT),
+                    (uint32)t_thrd.applyworker_cxt.remoteFinalLsn)));
+                break;
+            case RESOLVE_APPLY_REMOTE:
+                ereport(LOG, (errmsg("CONFLICT: remote insert on relation %s (local index %s). "
+                    "Resolution: apply_remote.",
+                    RelationGetRelationName(rel->localrel), get_rel_name(conflictIndexOid)),
+                    errdetail("local tuple: %s, remote tuple: %s, origin: pg_%u, commit_lsn: %X/%X", localtup.data,
+                    remotetup.data, t_thrd.applyworker_cxt.curWorker->subid,
+                    (uint32)(t_thrd.applyworker_cxt.remoteFinalLsn >> BITS_PER_INT),
+                    (uint32)t_thrd.applyworker_cxt.remoteFinalLsn)));
+                EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
+                EvalPlanQualSetSlot(&epqstate, remoteslot);
+                /* Do the actual update. */
+                ExecSimpleRelationUpdate(estate, &epqstate, localslot, remoteslot, &fakeRelInfo);
+
+                EvalPlanQualEnd(&epqstate);
+                break;
+            case RESOLVE_KEEP_LOCAL:
+                ereport(LOG, (errmsg("CONFLICT: remote insert on relation %s (local index %s). "
+                    "Resolution: keep_local.",
+                    RelationGetRelationName(rel->localrel), get_rel_name(conflictIndexOid)),
+                    errdetail("local tuple: %s, remote tuple: %s, origin: pg_%u, commit_lsn: %X/%X", localtup.data,
+                    remotetup.data, t_thrd.applyworker_cxt.curWorker->subid,
+                    (uint32)(t_thrd.applyworker_cxt.remoteFinalLsn >> BITS_PER_INT),
+                    (uint32)t_thrd.applyworker_cxt.remoteFinalLsn)));
+                break;
+            default:
+                ereport(ERROR, (errmsg("wrong parameter value for subscription_conflict_resolution")));
+                break;
+        }
+        FreeStringInfo(&localtup);
+        FreeStringInfo(&remotetup);
+    } else {
+        PG_TRY();
+        {
+            /* Do the insert. */
+            ExecSimpleRelationInsert(estate, remoteslot, &fakeRelInfo);
+        }
+        PG_CATCH();
+        {
+            ErrorData* errdata = NULL;
+
+            (void*)MemoryContextSwitchTo(oldctx);
+            errdata = CopyErrorData();
+            if (errdata->sqlerrcode == ERRCODE_UNIQUE_VIOLATION) {
+                (void*)MemoryContextSwitchTo(INSTANCE_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DEFAULT));
+                pthread_mutex_lock(&g_instance.subIdsLock);
+                g_instance.needCheckConflictSubIds = lappend_oid(g_instance.needCheckConflictSubIds,
+                    t_thrd.applyworker_cxt.curWorker->subid);
+                pthread_mutex_unlock(&g_instance.subIdsLock);
+                (void*)MemoryContextSwitchTo(oldctx);
+            }
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+    }
 
     /* Cleanup. */
     ExecCloseIndices(estate->es_result_relation_info);
@@ -701,12 +893,18 @@ static void apply_handle_update(StringInfo s)
     bool has_oldtup;
     TupleTableSlot *localslot;
     TupleTableSlot *remoteslot;
+    TupleTableSlot *conflictLocalSlot;
     RangeTblEntry *target_rte = NULL;
     bool found = false;
     MemoryContext oldctx;
     FakeRelationPartition fakeRelInfo;
+    Oid conflictIndexOid = InvalidOid;
 
     ensure_transaction();
+
+    if (t_thrd.applyworker_cxt.isSkipTransaction) {
+        return;
+    }
 
     relid = logicalrep_read_update(s, &has_oldtup, &oldtup, &newtup);
     rel = logicalrep_rel_open(relid, RowExclusiveLock);
@@ -728,6 +926,8 @@ static void apply_handle_update(StringInfo s)
     ExecSetSlotDescriptor(remoteslot, RelationGetDescr(rel->localrel));
     localslot = ExecInitExtraTupleSlot(estate, rel->localrel->rd_tam_ops);
     ExecSetSlotDescriptor(localslot, RelationGetDescr(rel->localrel));
+    conflictLocalSlot = ExecInitExtraTupleSlot(estate, rel->localrel->rd_tam_ops);
+    ExecSetSlotDescriptor(conflictLocalSlot, RelationGetDescr(rel->localrel));
     EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
 
     /*
@@ -783,10 +983,84 @@ static void apply_handle_update(StringInfo s)
         slot_modify_data(remoteslot, localslot, rel, &newtup);
         MemoryContextSwitchTo(oldctx);
 
-        EvalPlanQualSetSlot(&epqstate, remoteslot);
+        if (t_thrd.applyworker_cxt.curWorker->needCheckConflict &&
+            (conflictIndexOid = find_conflict_tuple(estate, remoteslot, conflictLocalSlot, localslot)) != InvalidOid) {
+            StringInfoData localtup, remotetup;
+            initStringInfo(&localtup);
+            tuple_to_stringinfo(rel->localrel, &localtup, RelationGetDescr(rel->localrel),
+                (HeapTuple)conflictLocalSlot->tts_tuple, false);
 
-        /* Do the actual update. */
-        ExecSimpleRelationUpdate(estate, &epqstate, localslot, remoteslot, &fakeRelInfo);
+            initStringInfo(&remotetup);
+            tuple_to_stringinfo(rel->localrel, &remotetup, RelationGetDescr(rel->localrel),
+                (HeapTuple)tableam_tslot_get_tuple_from_slot(rel->localrel, remoteslot), false);
+
+            switch (u_sess->attr.attr_storage.subscription_conflict_resolution) {
+                case RESOLVE_ERROR:
+                    ereport(ERROR, (errmsg("CONFLICT: remote update on relation %s (local index %s). "
+                        "Resolution: error.",
+                        RelationGetRelationName(rel->localrel), get_rel_name(conflictIndexOid)),
+                        errdetail("local tuple: %s, remote tuple: %s, origin: pg_%u, commit_lsn: %X/%X", localtup.data,
+                        remotetup.data, t_thrd.applyworker_cxt.curWorker->subid,
+                        (uint32)(t_thrd.applyworker_cxt.remoteFinalLsn >> BITS_PER_INT),
+                        (uint32)t_thrd.applyworker_cxt.remoteFinalLsn)));
+                    break;
+                case RESOLVE_APPLY_REMOTE:
+                    ereport(LOG, (errmsg("CONFLICT: remote update on relation %s (local index %s). "
+                        "Resolution: apply_remote.",
+                        RelationGetRelationName(rel->localrel), get_rel_name(conflictIndexOid)),
+                        errdetail("local tuple: %s, remote tuple: %s, origin: pg_%u, commit_lsn: %X/%X", localtup.data,
+                        remotetup.data, t_thrd.applyworker_cxt.curWorker->subid,
+                        (uint32)(t_thrd.applyworker_cxt.remoteFinalLsn >> BITS_PER_INT),
+                        (uint32)t_thrd.applyworker_cxt.remoteFinalLsn)));
+                    /* first delete the conflict tuple */
+                    EvalPlanQualSetSlot(&epqstate, conflictLocalSlot);
+                    ExecSimpleRelationDelete(estate, &epqstate, conflictLocalSlot, &fakeRelInfo);
+                    
+                    EvalPlanQualSetSlot(&epqstate, remoteslot);
+                    /* Do the actual update. */
+                    ExecSimpleRelationUpdate(estate, &epqstate, localslot, remoteslot, &fakeRelInfo);
+                    break;
+                case RESOLVE_KEEP_LOCAL:
+                    ereport(LOG, (errmsg("CONFLICT: remote update on relation %s (local index %s). "
+                        "Resolution: keep_local.",
+                        RelationGetRelationName(rel->localrel), get_rel_name(conflictIndexOid)),
+                        errdetail("local tuple: %s, remote tuple: %s, origin: pg_%u, commit_lsn: %X/%X", localtup.data,
+                        remotetup.data, t_thrd.applyworker_cxt.curWorker->subid,
+                        (uint32)(t_thrd.applyworker_cxt.remoteFinalLsn >> BITS_PER_INT),
+                        (uint32)t_thrd.applyworker_cxt.remoteFinalLsn)));
+                    break;
+                default:
+                    ereport(ERROR, (errmsg("wrong parameter value for subscription_conflict_resolution")));
+                    break;
+            }
+            FreeStringInfo(&localtup);
+            FreeStringInfo(&remotetup);
+        } else {
+            PG_TRY();
+            {
+                EvalPlanQualSetSlot(&epqstate, remoteslot);
+
+                /* Do the actual update. */
+                ExecSimpleRelationUpdate(estate, &epqstate, localslot, remoteslot, &fakeRelInfo);
+            }
+            PG_CATCH();
+            {
+                ErrorData* errdata = NULL;
+
+                (void*)MemoryContextSwitchTo(oldctx);
+                errdata = CopyErrorData();
+                if (errdata->sqlerrcode == ERRCODE_UNIQUE_VIOLATION) {
+                    (void*)MemoryContextSwitchTo(INSTANCE_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DEFAULT));
+                    pthread_mutex_lock(&g_instance.subIdsLock);
+                    g_instance.needCheckConflictSubIds = lappend_oid(g_instance.needCheckConflictSubIds,
+                        t_thrd.applyworker_cxt.curWorker->subid);
+                    pthread_mutex_unlock(&g_instance.subIdsLock);
+                    (void*)MemoryContextSwitchTo(oldctx);
+                }
+                PG_RE_THROW();
+            }
+            PG_END_TRY();
+        }
     } else {
         /*
          * The tuple to be updated could not be found.
@@ -825,6 +1099,10 @@ static void apply_handle_delete(StringInfo s)
     FakeRelationPartition fakeRelInfo;
 
     ensure_transaction();
+
+    if (t_thrd.applyworker_cxt.isSkipTransaction) {
+        return;
+    }
 
     relid = logicalrep_read_delete(s, &oldtup);
     rel = logicalrep_rel_open(relid, RowExclusiveLock);
@@ -890,6 +1168,241 @@ static void apply_handle_delete(StringInfo s)
 
 
 /*
+ * Handle CREATE TABLE command
+ *
+ * Call AddSubscriptionRelState for CREATE TABLE command to set the relstate to
+ * SUBREL_STATE_READY so DML changes on this new table can be replicated without
+ * having to manually run "ALTER SUBSCRIPTION ... REFRESH PUBLICATION"
+ */
+static void
+handle_create_table(Node *command)
+{
+    const char *commandTag;
+    RangeVar *rv = NULL;
+    Oid relid;
+    Oid relnamespace = InvalidOid;
+    CreateStmt *cstmt;
+    char *schemaname = NULL;
+    char *relname = NULL;
+
+    commandTag = CreateCommandTag((Node *) command);
+    cstmt = (CreateStmt *) command;
+    rv = cstmt->relation;
+    
+    if (nodeTag(command) == T_CreateStmt) {
+        cstmt = (CreateStmt*)command;
+        rv = cstmt->relation;
+    } else {
+        return;
+    }
+
+    if (!rv)
+        return;
+
+    schemaname = rv->schemaname;
+    relname = rv->relname;
+
+    if (schemaname != NULL)
+        relnamespace = get_namespace_oid(schemaname, false);
+
+    if (relnamespace != InvalidOid)
+        relid = get_relname_relid(relname, relnamespace);
+    else
+        relid = RelnameGetRelid(relname);
+
+    if (OidIsValid(relid))
+    {
+        AddSubscriptionRelState(t_thrd.applyworker_cxt.mySubscription->oid, relid,
+                                SUBREL_STATE_READY);
+        ereport(DEBUG1,
+                (errmsg_internal("table \"%s\" added to subscription \"%s\"",
+                                 relname, t_thrd.applyworker_cxt.mySubscription->name)));
+    }
+}
+
+
+/*
+ * Begin one step (one INSERT, UPDATE, etc) of a replication transaction.
+ *
+ * Start a transaction, if this is the first step (else we keep using the
+ * existing transaction).
+ * Also provide a global snapshot and ensure we run in ApplyMessageContext.
+ */
+static void
+begin_replication_step(void)
+{
+    SetCurrentStatementStartTimestamp();
+
+    if (!IsTransactionState())
+    {
+        StartTransactionCommand();
+        reread_subscription();
+    }
+
+    PushActiveSnapshot(GetTransactionSnapshot());
+}
+
+/*
+ * Finish up one step of a replication transaction.
+ * Callers of begin_replication_step() must also call this.
+ *
+ * We don't close out the transaction here, but we should increment
+ * the command counter to make the effects of this step visible.
+ */
+static void
+end_replication_step(void)
+{
+    PopActiveSnapshot();
+
+    CommandCounterIncrement();
+}
+
+/*
+ * Handle DDL commands
+ *
+ * Handle DDL replication messages. Convert the json string into a query
+ * string and run it through the query portal.
+ */
+static void
+apply_handle_ddl(StringInfo s)
+{
+    XLogRecPtr lsn;
+    const char *prefix = NULL;
+    char *message = NULL;
+    char *ddl_command;
+    char *owner;
+    Size sz;
+    List *parsetree_list;
+    ListCell *parsetree_item;
+    DestReceiver *receiver;
+    MemoryContext oldcontext;
+    Oid owner_oid = InvalidOid;
+    Oid saved_current_user = InvalidOid;
+    int save_sec_context = 0;
+
+    const char *save_debug_query_string = t_thrd.postgres_cxt.debug_query_string;
+
+    MemoryContext per_parsetree_context = NULL;
+
+    ensure_transaction();
+
+    message = logicalrep_read_ddl(s, &lsn, &prefix, &sz);
+
+    begin_replication_step();
+
+    ddl_command = deparse_ddl_json_to_string(message, &owner);
+    t_thrd.postgres_cxt.debug_query_string = ddl_command;
+
+    ereport(LOG, (errmsg("apply [ddl] for %s [owner] %s", ddl_command, owner ? owner : "none")));
+
+    /*
+     * If requested, set the current role to the owner that executed the
+     * command on the publication server.
+     */
+    GetUserIdAndSecContext(&saved_current_user, &save_sec_context);
+    if (t_thrd.applyworker_cxt.mySubscription->matchddlowner && owner) {
+        owner_oid = get_role_oid(owner, false);
+        SetUserIdAndSecContext(owner_oid, save_sec_context);
+    }
+
+    /* DestNone for logical replication */
+    receiver = CreateDestReceiver(DestNone);
+    parsetree_list = pg_parse_query(ddl_command);
+
+    foreach(parsetree_item, parsetree_list) {
+        List *plantree_list;
+        List *querytree_list;
+        Node *command = (Node *) lfirst(parsetree_item);
+        const char *commandTag;
+
+        Portal portal;
+        bool snapshot_set = false;
+
+        commandTag = CreateCommandTag((Node *) command);
+
+        /* If we got a cancel signal in parsing or prior command, quit */
+        CHECK_FOR_INTERRUPTS();
+
+        /*
+         * Set up a snapshot if parse analysis/planning will need one.
+         */
+        if (analyze_requires_snapshot(command)) {
+            PushActiveSnapshot(GetTransactionSnapshot());
+            snapshot_set = true;
+        }
+
+        /*
+         * We do the work for each parsetree in a short-lived context, to
+         * limit the memory used when there are many commands in the string.
+         */
+        per_parsetree_context =
+            AllocSetContextCreate(CurrentMemoryContext,
+                                  "execute_sql_string per-statement context",
+                                  ALLOCSET_DEFAULT_SIZES);
+        oldcontext = MemoryContextSwitchTo(per_parsetree_context);
+
+        querytree_list = pg_analyze_and_rewrite(command, ddl_command, NULL, 0);
+
+        plantree_list = pg_plan_queries(querytree_list, 0, NULL);
+
+        /* Done with the snapshot used for parsing/planning */
+        if (snapshot_set)
+            PopActiveSnapshot();
+
+        portal = CreatePortal("logical replication", true, true);
+
+        /*
+         * We don't have to copy anything into the portal, because everything
+         * we are passing here is in ApplyMessageContext or the
+         * per_parsetree_context, and so will outlive the portal anyway.
+         */
+        PortalDefineQuery(portal,
+                          NULL,
+                          ddl_command,
+                          commandTag,
+                          plantree_list,
+                          NULL);
+
+        /*
+         * Start the portal.  No parameters here.
+         */
+        PortalStart(portal, NULL, 0, InvalidSnapshot);
+
+        /*
+         * Switch back to transaction context for execution.
+         */
+        MemoryContextSwitchTo(oldcontext);
+
+        (void) PortalRun(portal,
+                         FETCH_ALL,
+                         true,
+                         receiver,
+                         receiver,
+                         NULL);
+
+        PortalDrop(portal, false);
+
+        CommandCounterIncrement();
+
+        /*
+         * Table created by DDL replication (database level) is automatically
+         * added to the subscription here.
+         */
+        handle_create_table(command);
+
+        /* Now we may drop the per-parsetree context, if one was created. */
+        MemoryContextDelete(per_parsetree_context);
+    }
+
+    if (t_thrd.applyworker_cxt.mySubscription->matchddlowner && owner) {
+        SetUserIdAndSecContext(saved_current_user, save_sec_context);
+    }
+
+    t_thrd.postgres_cxt.debug_query_string = save_debug_query_string;
+    end_replication_step();
+}
+
+/*
  * Logical replication protocol message dispatcher.
  */
 static void apply_dispatch(StringInfo s)
@@ -931,6 +1444,9 @@ static void apply_dispatch(StringInfo s)
             break;
         case 'S':
             apply_handle_conninfo(s);
+            break;
+        case LOGICAL_REP_MSG_DDL:
+            apply_handle_ddl(s);
             break;
         default:
             ereport(ERROR, (errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -1459,6 +1975,14 @@ void ApplyWorkerMain()
     gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
     (void)gs_signal_unblock_sigusr2();
 
+    if (!t_thrd.mem_cxt.mask_password_mem_cxt)
+        t_thrd.mem_cxt.mask_password_mem_cxt = AllocSetContextCreate(t_thrd.top_mem_cxt,
+        "MaskPasswordCtx",
+        ALLOCSET_DEFAULT_MINSIZE,
+        ALLOCSET_DEFAULT_INITSIZE,
+        ALLOCSET_DEFAULT_MAXSIZE);
+
+
     /*
      * If an exception is encountered, processing resumes here.
      *
@@ -1827,4 +2351,79 @@ static void UpdateConninfo(char* standbysInfo)
 bool IsLogicalWorker(void)
 {
     return t_thrd.applyworker_cxt.curWorker != NULL;
+}
+
+/*
+ * Start skipping changes of the transaction if the given LSN matches the
+ * LSN specified by subscription's skiplsn.
+ */
+static void IsSkippingChanges(XLogRecPtr finish_lsn)
+{
+    /*
+     * Quick return if it's not requested to skip this transaction. This
+     * function is called for every remote transaction and we assume that
+     * skipping the transaction is not used often.
+     */
+    if (likely(XLogRecPtrIsInvalid(t_thrd.applyworker_cxt.mySubscription->skiplsn) ||
+            t_thrd.applyworker_cxt.mySubscription->skiplsn != finish_lsn)) {
+        return;
+    }
+
+    t_thrd.applyworker_cxt.isSkipTransaction = true;
+}
+
+static void StopSkippingChanges()
+{
+    t_thrd.applyworker_cxt.isSkipTransaction = false;
+
+    /*
+     * Quick return if it's not requested to skip this transaction. This
+     * function is called for every remote transaction and we assume that
+     * skipping the transaction is not used often.
+     */
+    if (!IsTransactionState()) {
+        StartTransactionCommand();
+    }
+
+    HeapTuple tup;
+    Relation rel;
+    bool nulls[Natts_pg_subscription];
+    bool replaces[Natts_pg_subscription];
+    Datum values[Natts_pg_subscription];
+    errno_t rc = 0;
+
+    /*
+     * Protect subskiplsn of pg_subscription from being concurrently updated
+     * while clearing it.
+     */
+    LockSharedObject(SubscriptionRelationId, t_thrd.applyworker_cxt.mySubscription->oid, 0, AccessShareLock);
+    rel = heap_open(SubscriptionRelationId, RowExclusiveLock);
+
+    /* Fetch the existing tuple. */
+    tup = SearchSysCacheCopy1(SUBSCRIPTIONOID, ObjectIdGetDatum(t_thrd.applyworker_cxt.mySubscription->oid));
+
+    if (!HeapTupleIsValid(tup)) {
+        ereport(ERROR, (errmsg("subscription \"%s\" does not exist", t_thrd.applyworker_cxt.mySubscription->name)));
+    }
+
+    rc = memset_s(values, sizeof(values),0, sizeof(values));
+    securec_check_c(rc, "\0", "\0");
+    rc = memset_s(nulls, sizeof(nulls),false, sizeof(nulls));
+    securec_check_c(rc, "\0", "\0");
+    rc = memset_s(replaces, sizeof(replaces), false, sizeof(replaces));
+    securec_check_c(rc, "\0", "\0");
+
+    /* reset subskiplsn */
+    values[Anum_pg_subscription_subskiplsn - 1] = LsnGetTextDatum(InvalidXLogRecPtr);
+    replaces[Anum_pg_subscription_subskiplsn - 1] = true;
+
+    tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls, replaces);
+    /* Update the catalog. */
+    simple_heap_update(rel, &tup->t_self, tup);
+    CatalogUpdateIndexes(rel, tup);
+
+    heap_freetuple(tup);
+    heap_close(rel, NoLock);
+
+    CommitTransactionCommand();
 }

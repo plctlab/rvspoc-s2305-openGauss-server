@@ -1,6 +1,11 @@
 # ----------
 # Database security
 # ----------
+# --------------------------
+# usecases for improving coverage 
+# --------------------------
+test: heap_copytuple partition_cost_model fulljoin_rewrite_row_2 auto_analyze_test vec_sonic_hashjoin_string_spill vec_sonic_hashjoin_date_spill vec_sonic_hashjoin_string_nospill vec_sonic_hashjoin_date_nospill 
+
 test: hw_pwd_reuse
 #test: hw_auditadmin
 
@@ -119,7 +124,7 @@ test: fdw_audit
 test: gs_global_config_audit
 test: detail declare_multiple_variable
 # mysql_function_prepare must precede mysql_function/mysql_function_2, and mysql_function_clearup must follow mysql_function/mysql_function_2
-test: gs_dump_encrypt substr mysql_function_prepare
+test: gs_dump_encrypt substr mysql_function_prepare mysql_compatibility
 test: composite_datum_record mysql_function mysql_function_2 b_comments mysql_syntax mysql_condition mysql_delimiter mysql_delimiter_fix mysql_indexhint mysql_trigger
 
 test: join_test_alias alter_ctable_compress
@@ -130,7 +135,7 @@ test: mysql_function_clearup cost_model
 test: base_update
 test: seqscan_fusion
 
-test: union_null_01 fulljoin_rewrite
+test: union_null_01 fulljoin_rewrite test_union_all_orderby
 
 # var selectivity
 test: var_eq_const_selectivity
@@ -174,7 +179,7 @@ test: event_trigger object_address
 test: event_trigger_dump_restore
 
 # partition expression key
-test: partition_expr_key
+test: partition_expr_key instr_query_plan_threshold
 test: alter_foreign_schema
 
 # test for slow_sql

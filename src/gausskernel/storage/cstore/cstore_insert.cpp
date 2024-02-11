@@ -812,7 +812,7 @@ void CStoreInsert::BatchInsertCommon(bulkload_rows* batchRowPtr, int options)
     for (col = 0; col < attno; ++col) {
         if (!m_relation->rd_att->attrs[col].attisdropped) {
             m_cuPPtr[col] = FormCU(col, batchRowPtr, m_cuDescPPtr[col]);
-            m_cuCmprsOptions[col].m_sampling_fihished = true;
+            m_cuCmprsOptions[col].m_sampling_finished = true;
         }
     }
     if (m_isUpdate)
@@ -1530,7 +1530,7 @@ bool CStoreInsert::TryEncodeNumeric(int col, bulkload_rows* batchRowPtr, CUDesc*
 
         ptr = NumericCopyCompressedBatchValues(cuPtr->m_srcData, &phase1_out, &phase2_out);
 
-        if (!m_cuCmprsOptions[col].m_sampling_fihished) {
+        if (!m_cuCmprsOptions[col].m_sampling_finished) {
             /* get adopted compression methods from the first CU sample */
             m_cuCmprsOptions[col].set_numeric_flags(*(uint16*)cuPtr->m_srcData);
         }
@@ -1861,7 +1861,7 @@ void CStoreInsert::FormCUTNumeric(int col, bulkload_rows* batchRowPtr, CUDesc* c
     /* change m_formCUFuncArray[col] to FormCUTCommon()
      * if the first time of encoding-numeric fails
      */
-    if (!this->m_cuCmprsOptions[col].m_sampling_fihished) {
+    if (!this->m_cuCmprsOptions[col].m_sampling_finished) {
         this->m_formCUFuncArray[col].colFormCU[FORMCU_IDX_NONE_NULL] = &CStoreInsert::FormCUT<false>;
         this->m_formCUFuncArray[col].colFormCU[FORMCU_IDX_HAVE_NULL] = &CStoreInsert::FormCUT<true>;
     }
@@ -1893,7 +1893,7 @@ void CStoreInsert::FormCUTNumString(int col, bulkload_rows* batchRowPtr, CUDesc*
 
     this->FormCUTCopyMem(cuPtr, batchRowPtr, cuDescPtr, dataSize, col, hasNull);
     /* change m_formCUFuncArray[col] to FormCUTCommon()	if the first time of encoding-number-string fails */
-    if (!this->m_cuCmprsOptions[col].m_sampling_fihished) {
+    if (!this->m_cuCmprsOptions[col].m_sampling_finished) {
         this->m_formCUFuncArray[col].colFormCU[FORMCU_IDX_NONE_NULL] = &CStoreInsert::FormCUT<false>;
         this->m_formCUFuncArray[col].colFormCU[FORMCU_IDX_HAVE_NULL] = &CStoreInsert::FormCUT<true>;
     }
@@ -2486,17 +2486,17 @@ void CStorePartitionInsert::MoveBatchRowToPartitionValueCache(int partitionidx)
 void CStorePartitionInsert::BatchInsert(_in_ Datum* values, _in_ const bool* nulls, _in_ int options)
 {
     Relation partitionedRel = m_relation;
-    Const consts[RANGE_PARTKEYMAXNUM];
-    Const* partKeyValues[RANGE_PARTKEYMAXNUM] = {};
+    Const consts[MAX_RANGE_PARTKEY_NUMS];
+    Const* partKeyValues[MAX_RANGE_PARTKEY_NUMS] = {};
     PartitionIdentifier matchPartition;
 
     CHECK_FOR_INTERRUPTS();
     // Step 1: We need know this batchrow should be which partition and then
     // store into m_batchrows for each partition
-    int2vector* partKeyColumn = ((RangePartitionMap*)(partitionedRel)->partMap)->partitionKey;
+    int2vector* partKeyColumn = ((RangePartitionMap*)(partitionedRel)->partMap)->base.partitionKey;
     int partkeyColNum = partKeyColumn->dim1;
 
-    Assert(partkeyColNum <= RANGE_PARTKEYMAXNUM);
+    Assert(partkeyColNum <= MAX_RANGE_PARTKEY_NUMS);
     for (int i = 0; i < partkeyColNum; i++) {
         int col_location = partKeyColumn->values[i];
         partKeyValues[i] = transformDatum2Const(

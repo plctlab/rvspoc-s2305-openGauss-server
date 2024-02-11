@@ -153,6 +153,11 @@ DestReceiver* CreateDestReceiver(CommandDest dest)
         case DestTupleLocalRedistribute:
         case DestTupleLocalRoundRobin:
         case DestTupleHybrid:
+#ifdef USE_SPQ
+        case DestTupleRoundRobin:
+        case DestBatchRoundRobin:
+        case DestTupleDML:
+#endif
         case DestBatchBroadCast:
         case DestBatchLocalBroadCast:
         case DestBatchRedistribute:
@@ -187,14 +192,19 @@ void EndCommand(const char* commandTag, CommandDest dest)
         case DestTupleRedistribute:
         case DestBatchBroadCast:
         case DestBatchLocalBroadCast:
-        case DestBatchRedistribute:
-            /*
-             * We assume the commandTag is plain ASCII and therefore requires
-             * no encoding conversion.
-             */
-            pq_putmessage('C', commandTag, strlen(commandTag) + 1);
+        case DestBatchRedistribute: {
+            Port *MyPort = u_sess->proc_cxt.MyProcPort; 
+            if (MyPort && MyPort->protocol_config && MyPort->protocol_config->fn_end_command) {
+                MyPort->protocol_config->fn_end_command(commandTag);
+            } else {
+                /*
+                * We assume the commandTag is plain ASCII and therefore requires
+                * no encoding conversion.
+                */
+                pq_putmessage('C', commandTag, strlen(commandTag) + 1);
+            }
             break;
-
+        }
         case DestNone:
         case DestDebug:
         case DestSPI:

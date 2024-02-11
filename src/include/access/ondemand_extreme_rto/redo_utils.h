@@ -26,15 +26,32 @@
 
 #include "access/xlogproc.h"
 
+typedef enum {
+    PARSE_TYPE_DATA = 0,
+    PARSE_TYPE_DDL,
+    PARSE_TYPE_SEG,
+} XLogRecParseType;
+
 Size OndemandRecoveryShmemSize(void);
 void OndemandRecoveryShmemInit(void);
+void OndemandXlogFileIdCacheInit(void);
 void OndemandXLogParseBufferInit(RedoParseManager *parsemanager, int buffernum, RefOperate *refOperate,
     InterruptFunc interruptOperte);
 void OndemandXLogParseBufferDestory(RedoParseManager *parsemanager);
 XLogRecParseState *OndemandXLogParseBufferAllocList(RedoParseManager *parsemanager, XLogRecParseState *blkstatehead,
     void *record);
 void OndemandXLogParseBufferRelease(XLogRecParseState *recordstate);
+XLogRecParseState *OndemandRedoReloadXLogRecord(XLogRecParseState *redoblockstate);
+void OndemandRedoReleaseXLogRecord(XLogRecParseState *reloadBlockState);
 void OnDemandSendRecoveryEndMarkToWorkersAndWaitForReach(int code);
 void OnDemandWaitRedoFinish();
+void OnDemandWaitRealtimeBuildShutDownInSwitchoverPromoting();
+void OnDemandWaitRealtimeBuildShutDownInPartnerFailover();
+void OnDemandWaitRealtimeBuildShutDown();
+void OnDemandBackupControlFile(ControlFileData* controlFile);
+XLogRecPtr GetRedoLocInCheckpointRecord(XLogReaderState *record);
+void OnDemandUpdateRealtimeBuildPrunePtr();
+XLogRecParseType GetCurrentXLogRecParseType(XLogRecParseState *preState);
+void WaitUntilRealtimeBuildStatusToFailoverAndUpdatePrunePtr();
 
 #endif /* ONDEMAND_EXTREME_RTO_REDO_UTILS_H */

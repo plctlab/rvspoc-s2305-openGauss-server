@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 
 #include "tool_common.h"
 #include "getopt_long.h"
@@ -70,7 +71,8 @@ char* basedir = NULL;
 static TablespaceList tablespacee_dirs = {NULL, NULL};
 char format = 'p'; /* p(lain)/t(ar) */
 char *label = "gs_basebackup base backup";
-bool showprogress = false;
+/* We hope always print progress here. To maitain compatibility, we don't remove this parameter. */
+bool showprogress = true;
 int verbose = 0;
 int compresslevel = 0;
 bool includewal = true;
@@ -88,6 +90,10 @@ extern int standby_message_timeout; /* 10 sec = default */
 /* Progress counters */
 static uint64 totalsize;
 static uint64 totaldone;
+static int g_tablespacenum;
+static volatile bool g_progressFlag = false;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int standby_message_timeout_local = 10 ; /* 10 sec = default */
 
@@ -112,7 +118,7 @@ static volatile LONG has_xlogendptr = 0;
 static void usage(void);
 static void GsTarUsage(void);
 static void verify_dir_is_empty_or_create(char* dirname);
-static void progress_report(int tablespacenum, const char* filename);
+static void *ProgressReport(void *arg);
 
 static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum);
 static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum);
@@ -126,6 +132,43 @@ static int GsTar(int argc, char** argv);
 static int GsBaseBackup(int argc, char** argv);
 
 static const char* get_tablespace_mapping(const char* dir);
+
+/*
+ * Replace the actual password with *'s.
+ */
+void replace_password(int argc, char** argv, const char* optionName)
+{
+    int count = 0;
+    char* pchPass = NULL;
+    char* pchTemp = NULL;
+    
+    // Check if password option is specified in command line
+    for (count = 0; count < argc; count++) {
+        // Password can be specified by optionName
+        if (strncmp(optionName, argv[count], strlen(optionName)) == 0) {
+            pchTemp = strchr(argv[count], '=');
+            if (pchTemp != NULL) {
+                pchPass = pchTemp + 1;
+            } else if ((NULL != strstr(argv[count], optionName)) && (strlen(argv[count]) > strlen(optionName))) {
+                pchPass = argv[count] + strlen(optionName);
+            } else {
+                pchPass = argv[(int)(count + 1)];
+            }
+
+            // Replace first char of password with * and rest clear it
+            if (strlen(pchPass) > 0) {
+                *pchPass = '*';
+                pchPass = pchPass + 1;
+                while ('\0' != *pchPass) {
+                    *pchPass = '\0';
+                    pchPass++;
+                }
+            }
+
+            break;
+        }
+    }
+}
 
 static void TablespaceValueCheck(TablespaceListCell* cell, const char* arg)
 {
@@ -236,33 +279,33 @@ static void usage(void)
     printf(_("Usage:\n"));
     printf(_("  %s [OPTION]...\n"), progname);
     printf(_("\nOptions controlling the output:\n"));
-    printf(_("  -D, --pgdata=DIRECTORY receive base backup into directory\n"));
-    printf(_("  -F, --format=p|t       output format (plain (default), tar)\n"));
+    printf(_("  -D, --pgdata=DIRECTORY           receive base backup into directory\n"));
+    printf(_("  -F, --format=p|t                 output format (plain (default), tar)\n"));
     printf(_("  -T, --tablespace-mapping=OLDDIR=NEWDIR\n"
-             "                         relocate tablespace in OLDDIR to NEWDIR\n"));
-    printf(_("  -x, --xlog             include required WAL files in backup (fetch mode)\n"));
+             "                                   relocate tablespace in OLDDIR to NEWDIR\n"));
+    printf(_("  -x, --xlog                       include required WAL files in backup (fetch mode)\n"));
     printf(_("  -X, --xlog-method=fetch|stream\n"
-             "                         include required WAL files with specified method\n"));
-    printf(_("  -z, --gzip             compress tar output\n"));
-    printf(_("  -Z, --compress=0-9     compress tar output with given compression level\n"));
+             "                                   include required WAL files with specified method\n"));
+    printf(_("  -z, --gzip                       compress tar output\n"));
+    printf(_("  -Z, --compress=0-9               compress tar output with given compression level\n"));
     printf(_("\nGeneral options:\n"));
     printf(_("  -c, --checkpoint=fast|spread\n"
-             "                         set fast or spread checkpointing\n"));
-    printf(_("  -l, --label=LABEL      set backup label\n"));
-    printf(_("  -P, --progress         show progress information\n"));
-    printf(_("  -v, --verbose          output verbose messages\n"));
-    printf(_("  -V, --version          output version information, then exit\n"));
-    printf(_("  -?, --help             show this help, then exit\n"));
+             "                                   set fast or spread checkpointing\n"));
+    printf(_("  -l, --label=LABEL                set backup label\n"));
+    printf(_("  -P, --progress                   show progress information\n"));
+    printf(_("  -v, --verbose                    output verbose messages\n"));
+    printf(_("  -V, --version                    output version information, then exit\n"));
+    printf(_("  -?, --help                       show this help, then exit\n"));
     printf(_("\nConnection options:\n"));
-    printf(_("  -h, --host=HOSTNAME    database server host or socket directory\n"));
-    printf(_("  -p, --port=PORT        database server port number\n"));
+    printf(_("  -h, --host=HOSTNAME              database server host or socket directory\n"));
+    printf(_("  -p, --port=PORT                  database server port number\n"));
     printf(_("  -s, --status-interval=INTERVAL\n"
-             "                         time between status packets sent to server (in seconds)\n"));
+             "                                   time between status packets sent to server (in seconds)\n"));
     printf(_("  -t, --rw-timeout=RW_TIMEOUT\n"
-             "                         read-write timeout during idle connection.(in seconds)\n"));
-    printf(_("  -U, --username=NAME    connect as specified database user\n"));
-    printf(_("  -w, --no-password      never prompt for password\n"));
-    printf(_("  -W, --password         force password prompt (should happen automatically)\n"));
+             "                                   read-write timeout during idle connection.(in seconds)\n"));
+    printf(_("  -U, --username=NAME              connect as specified database user\n"));
+    printf(_("  -w, --no-password                never prompt for password\n"));
+    printf(_("  -W, --password=password          the password of specified database user\n"));
 
 #if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
     printf(_("\nReport bugs to GaussDB support.\n"));
@@ -461,7 +504,11 @@ static void StartLogStreamer(const char *startpos, uint32 timeline, char *syside
 #ifndef WIN32
     bgchild = fork();
     if (bgchild == 0) {
-        /* in child process */
+        /*
+         * In child process.
+         * Receive SIGKILL when main process exits.
+         */
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
         exit(LogStreamerMain(g_childParam));
     } else if (bgchild < 0) {
         fprintf(stderr, _("%s: could not create background process: %s\n"), progname, strerror(errno));
@@ -527,66 +574,79 @@ static void verify_dir_is_empty_or_create(char *dirname)
     }
 }
 
+
 /*
- * Print a progress report based on the global variables. If verbose output
- * is enabled, also print the current file name.
+ * Print a progress report based on the global variables.
+ * Execute this function in another thread and print the progress periodically.
  */
-static void progress_report(int tablespacenum, const char *filename)
+static void *ProgressReport(void *arg)
 {
-    int percent = (int)((totaldone / 1024) * 100 / totalsize);
+    if (totalsize == 0) {
+        return nullptr;
+    }
+    char progressBar[53];
     char totaldone_str[32];
     char totalsize_str[32];
     errno_t errorno = EOK;
-
-    /*
-     * Avoid overflowing past 100% or the full size. This may make the total
-     * size number change as we approach the end of the backup (the estimate
-     * will always be wrong if WAL is included), but that's better than having
-     * the done column be bigger than the total.
-     */
-    if (percent > 100) {
-        percent = 100;
-    }
-
-    if (totaldone / 1024 > totalsize) {
-        totalsize = totaldone / 1024;
-    }
-
-    /*
-     * Separate step to keep platform-dependent format code out of
-     * translatable strings.  And we only test for INT64_FORMAT availability
-     * in snprintf, not fprintf.
-     */
-    errorno =
-        snprintf_s(totaldone_str, sizeof(totalsize_str), sizeof(totaldone_str) - 1, INT64_FORMAT, totaldone / 1024);
-    securec_check_ss_c(errorno, "", "");
-
-    errorno = snprintf_s(totalsize_str, sizeof(totalsize_str), sizeof(totalsize_str) - 1, INT64_FORMAT, (int64)totalsize);
-    securec_check_ss_c(errorno, "", "");
-
-    if (verbose) {
-        if (NULL == filename) {
-            /*
-             * No filename given, so clear the status line (used for last
-             * call)
-             */
-            fprintf(stderr,
-                ngettext("%s/%s kB (100%%), %d/%d tablespace %35s", "%s/%s kB (100%%), %d/%d tablespaces %35s",
-                tblspaceCount),
-                totaldone_str, totalsize_str, tablespacenum, tblspaceCount, "");
-        } else {
-            fprintf(stderr,
-                ngettext("%s/%s kB (%d%%), %d/%d tablespace (%-30.30s)",
-                "%s/%s kB (%d%%), %d/%d tablespaces (%-30.30s)", tblspaceCount),
-                totaldone_str, totalsize_str, percent, tablespacenum, tblspaceCount, filename);
+    int percent;
+    do {
+        percent = (int)((totaldone / 1024) * 100 / totalsize);
+        /*
+        * Avoid overflowing past 100% or the full size. This may make the total
+        * size number change as we approach the end of the backup (the estimate
+        * will always be wrong if WAL is included), but that's better than having
+        * the done column be bigger than the total.
+        */
+        if (percent > 100) {
+            percent = 100;
         }
-    } else {
-        fprintf(stderr,
-            ngettext("%s/%s kB (%d%%), %d/%d tablespace", "%s/%s kB (%d%%), %d/%d tablespaces", tblspaceCount),
-            totaldone_str, totalsize_str, percent, tablespacenum, tblspaceCount);
-    }
+        GenerateProgressBar(percent, progressBar);
 
-    fprintf(stderr, "\r");
+        if (totaldone / 1024 > totalsize) {
+            totalsize = totaldone / 1024;
+        }
+
+        /*
+        * Separate step to keep platform-dependent format code out of
+        * translatable strings.  And we only test for INT64_FORMAT availability
+        * in snprintf, not fprintf.
+        */
+        errorno =
+            snprintf_s(totaldone_str, sizeof(totalsize_str), sizeof(totaldone_str) - 1, INT64_FORMAT, totaldone / 1024);
+        securec_check_ss_c(errorno, "", "");
+
+        errorno =
+            snprintf_s(totalsize_str, sizeof(totalsize_str), sizeof(totalsize_str) - 1, INT64_FORMAT, (int64)totalsize);
+        securec_check_ss_c(errorno, "", "");
+
+        fprintf(stdout,
+            ngettext("Progress: %s %s/%s kB (%d%%), %d/%d tablespace\r",
+            "Progress: %s %s/%s kB (%d%%), %d/%d tablespaces\r", tblspaceCount),
+            progressBar, totaldone_str, totalsize_str, percent, g_tablespacenum, tblspaceCount);
+        pthread_mutex_lock(&g_mutex);
+        timespec timeout;
+        timeval now;
+        gettimeofday(&now, nullptr);
+        timeout.tv_sec = now.tv_sec + 1;
+        timeout.tv_nsec = 0;
+        int ret = pthread_cond_timedwait(&g_cond, &g_mutex, &timeout);
+        pthread_mutex_unlock(&g_mutex);
+        if (ret == ETIMEDOUT) {
+            continue;
+        } else {
+            break;
+        }
+    } while (((totaldone / 1024) < totalsize) && !g_progressFlag);
+    percent = 100;
+    GenerateProgressBar(percent, progressBar);
+    errorno =
+        snprintf_s(totalsize_str, sizeof(totalsize_str), sizeof(totalsize_str) - 1, INT64_FORMAT, (int64)totalsize);
+        securec_check_ss_c(errorno, "", "");
+    fprintf(stdout,
+        ngettext("Progress: %s %s/%s kB (%d%%), %d/%d tablespace\n",
+        "Progress: %s %s/%s kB (%d%%), %d/%d tablespaces\n", tblspaceCount),
+        progressBar, totalsize_str, totalsize_str, percent, g_tablespacenum, tblspaceCount);
+    return nullptr;
 }
 
 /*
@@ -635,8 +695,6 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                     duplicatedfd = -1;
                     disconnect_and_exit(1);
                 }
-                close(duplicatedfd);
-                duplicatedfd = -1;
             } else
 #endif
                 tarfile = stdout;
@@ -692,6 +750,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
             /* Compression is in use */
             pg_log(stderr, _("%s: could not create compressed file \"%s\": %s\n"), progname, filename,
                 get_gz_error(ztarfile));
+            if(duplicatedfd != -1) {
+                close(duplicatedfd);
+                duplicatedfd = -1;
+            }
             disconnect_and_exit(1);
         }
     } else
@@ -734,6 +796,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                         progname,
                         filename,
                         get_gz_error(ztarfile));
+                    if (duplicatedfd != -1) {
+                        close(duplicatedfd);
+                        duplicatedfd = -1;
+                    }
                     disconnect_and_exit(1);
                 }
             } else
@@ -764,6 +830,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                     progname,
                     filename,
                     get_gz_error(ztarfile));
+                if (duplicatedfd != -1) {
+                    close(duplicatedfd);
+                    duplicatedfd = -1;
+                }
                 disconnect_and_exit(1);
             }
         } else
@@ -775,10 +845,14 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
             }
         }
         totaldone += r;
-        if (showprogress)
-            progress_report(rownum, filename);
     } /* while (1) */
 
+#ifdef HAVE_LIBZ
+    if (duplicatedfd != -1) {
+        close(duplicatedfd);
+        duplicatedfd = -1;
+    }
+#endif
     if (copybuf != NULL) {
         PQfreemem(copybuf);
         copybuf = NULL;
@@ -950,7 +1024,7 @@ static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
             /*
              * All files are padded up to 512 bytes
              */
-            if (current_len_left < 0 || current_len_left > INT_MAX - 511) {
+            if (current_len_left > INT_MAX - 511) {
                 pg_log(stderr, _("%s: the file '%s' is too big or file size is invalid\n"), progname, copybuf);
                 disconnect_and_exit(1);
             }
@@ -1099,8 +1173,6 @@ static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
                 disconnect_and_exit(1);
             }
             totaldone += r;
-            if (showprogress)
-                progress_report(rownum, filename);
 
             current_len_left -= r;
             if (current_len_left == 0 && current_padding == 0) {
@@ -1338,21 +1410,30 @@ static void BaseBackup(void)
     PQfreemem(sysidentifier);
     sysidentifier = NULL;
 
+    fprintf(stdout, "Start receiving chunks\n");
+    /* Print the progress of the tool execution through a new thread. */
+    pthread_t progressThread;
+    pthread_create(&progressThread, NULL, ProgressReport, NULL);
+
+
     /*
      * Start receiving chunks
      */
     for (i = 0; i < PQntuples(res); i++) {
+        g_tablespacenum = i + 1;
         if (format == 't')
             ReceiveTarFile(conn, res, i);
         else
             ReceiveAndUnpackTarFile(conn, res, i);
     } /* Loop over all tablespaces */
 
-    if (showprogress) {
-        progress_report(PQntuples(res), NULL);
-        fprintf(stderr, "\n"); /* Need to move to next line */
-    }
     PQclear(res);
+    g_progressFlag = true;
+    pthread_mutex_lock(&g_mutex);
+    pthread_cond_signal(&g_cond);
+    pthread_mutex_unlock(&g_mutex);
+    pthread_join(progressThread, NULL);
+    fprintf(stdout, "Finish receiving chunks\n");
 
     /*
      * Get the stop position
@@ -1918,7 +1999,7 @@ static int GsBaseBackup(int argc, char** argv)
                                            {"port", required_argument, NULL, 'p'},
                                            {"username", required_argument, NULL, 'U'},
                                            {"no-password", no_argument, NULL, 'w'},
-                                           {"password", no_argument, NULL, 'W'},
+                                           {"password", required_argument, NULL, 'W'},
                                            {"status-interval", required_argument, NULL, 's'},
                                            {"rw-timeout", required_argument, NULL, 't'},
                                            {"verbose", no_argument, NULL, 'v'},
@@ -1939,18 +2020,16 @@ static int GsBaseBackup(int argc, char** argv)
         }
     }
 
-    char optstring[] = "D:l:c:h:p:U:s:X:F:T:Z:t:wWvPxz";
+    char optstring[] = "D:l:c:h:p:U:s:X:F:T:Z:t:wW:vPxz";
     /* check if a required_argument option has a void argument */
     int i;
     for (i = 0; i < argc; i++) {
         char *optstr = argv[i];
-        int is_only_shortbar;
-        if (strlen(optstr) == 1) {
-            is_only_shortbar = optstr[0] == '-' ? 1 : 0;
-        } else {
-            is_only_shortbar = 0;
-        }
-        if (is_only_shortbar) {
+        if (strlen(optstr) == 1 && optstr[0] == '-') {
+            /* ignore the case of redirecting output like "gs_probackup ... -D -> xxx.tar.gz" */
+            if (i > 0 && strcmp(argv[i - 1], "-D") == 0) {
+                continue;
+            }
             fprintf(stderr, _("%s: The option '-' is not a valid option.\n"), progname);
             exit(1);
         }
@@ -1970,26 +2049,33 @@ static int GsBaseBackup(int argc, char** argv)
             }
 
             char *next_optstr = argv[i + 1];
+            if (strcmp(optstr, "-D") == 0 && strcmp(next_optstr, "-") == 0) {
+                continue;
+            }
             char *next_oli = strchr(optstring, next_optstr[1]);
-            int is_arg_optionform = next_optstr[0] == '-' && next_oli != NULL;
-            if (is_arg_optionform) {
+            if (next_optstr[0] == '-' && next_oli != NULL) {
                 fprintf(stderr, _("%s: The option '-%c' need a parameter.\n"), progname, optstr[1]);
                 exit(1);
             }
         }
     }
 
-    while ((c = getopt_long(argc, argv, "D:l:c:h:p:U:s:X:F:T:Z:t:wWvPxz", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, optstring, long_options, &option_index)) != -1) {
         switch (c) {
             case 'D': {
                 GS_FREE(basedir);
                 check_env_value_c(optarg);
                 char realDir[PATH_MAX] = {0};
-                if (realpath(optarg, realDir) == nullptr) {
+                bool argIsMinus = (strcmp(optarg, "-") == 0);
+                if (!argIsMinus && realpath(optarg, realDir) == nullptr) {
                     pg_log(stderr, _("%s: realpath dir \"%s\" failed: %m\n"), progname, optarg);
                     exit(1);
                 }
-                basedir = xstrdup(realDir);
+                if (argIsMinus) {
+                    basedir = xstrdup(optarg);
+                } else {
+                    basedir = xstrdup(realDir);
+                }
                 break;
             }
             case 'F':
@@ -2085,7 +2171,12 @@ static int GsBaseBackup(int argc, char** argv)
                 dbgetpassword = -1;
                 break;
             case 'W':
-                dbgetpassword = 1;
+                dbpassword = strdup(optarg);
+                if (NULL == dbpassword) {
+                    fprintf(stderr, _("%s: out of memory\n"), progname);
+                    exit(1);
+                }
+                replace_password(argc, argv, "-W");
                 break;
             case 's':
                 if ((atoi(optarg)) < 0 || (atoi(optarg) * 1000) > PG_INT32_MAX) {

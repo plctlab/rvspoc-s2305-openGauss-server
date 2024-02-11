@@ -15,7 +15,9 @@
  */
 #include "postgres.h"
 #include "knl/knl_variable.h"
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 #include "storage/buf/bufmgr.h"
 #include "storage/buf/buf_internals.h"
 #include "storage/nvm/nvm.h"
@@ -108,10 +110,12 @@ void InitBufferPool(void)
         nvm_init();
     }
 
+#ifdef ENABLE_BBOX
     if (BBOX_BLACKLIST_SHARE_BUFFER) {
         /* Segment Buffer is exclued from the black list, as it contains many critical information for debug */
         bbox_blacklist_add(SHARED_BUFFER, t_thrd.storage_cxt.BufferBlocks, NORMAL_SHARED_BUFFER_NUM * (Size)BLCKSZ);
     }
+#endif
 
     /*
      * The array used to sort to-be-checkpointed buffer ids is located in
@@ -166,7 +170,7 @@ void InitBufferPool(void)
             BufferDesc *buf = GetBufferDescriptor(i);
             CLEAR_BUFFERTAG(buf->tag);
 
-            pg_atomic_init_u32(&buf->state, 0);
+            pg_atomic_init_u64(&buf->state, 0);
             buf->wait_backend_pid = 0;
 
             buf->extra = &extra[i];

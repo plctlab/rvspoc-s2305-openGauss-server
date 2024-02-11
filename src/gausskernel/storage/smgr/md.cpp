@@ -25,6 +25,7 @@
 #include "miscadmin.h"
 #include "access/transam.h"
 #include "access/xlog.h"
+#include "access/extreme_rto/standby_read/standby_read_base.h"
 #include "catalog/catalog.h"
 #include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
@@ -211,7 +212,7 @@ int openrepairfile(char* path, RelFileNodeForkNum filenode)
     ADIO_END();
     fd = DataFileIdOpenFile(temppath, filenode, (int)repair_flags, 0600);
     if (fd < 0) {
-        ereport(WARNING, (errmsg("[file repair] could not open repair file %s: %m", temppath)));
+        ereport(WARNING, (errmsg("[file repair] could not open repair file %s: %s", temppath, TRANSLATE_ERRNO)));
     }
     pfree(temppath);
     return fd;
@@ -712,7 +713,7 @@ static File mdopenagain(SMgrRelation reln, ForkNumber forknum, ExtensionBehavior
             CheckFileRepairHashTbl(reln->smgr_rnode.node, forknum, 0)) {
             fd = openrepairfile(path, filenode);
             if (fd < 0) {
-                ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file %s.repair: %m", path)));
+                ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file %s.repair: %s", path, TRANSLATE_ERRNO)));
             } else {
                 ereport(LOG, (errmsg("[file repair] open repair file %s.repair", path)));
             }
@@ -1307,7 +1308,7 @@ SMGR_READ_STATUS mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber block
         } else {
             check_file_stat(FilePathName(v->mdfd_vfd));
             force_backtrace_messages = true;
-
+            extreme_rto_standby_read::dump_error_all_info(reln->smgr_rnode.node, forknum, blocknum);
             ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
                             errmsg("could not read block %u in file \"%s\": read only %d of %d bytes", blocknum,
                                    FilePathName(v->mdfd_vfd), nbytes, BLCKSZ)));
@@ -1323,6 +1324,52 @@ SMGR_READ_STATUS mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber block
         return SMGR_RD_OK;
     } else {
         return SMGR_RD_CRC_ERROR;
+    }
+}
+
+/*
+ *  mdreadbatch() -- It will bulk read many pages;
+ *  It will not return any error code, because it will check in page devided.
+ */
+void mdreadbatch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, int blockCount,char *buffer)
+{
+    off_t seekpos;
+    int nbytes;
+    MdfdVec *v = NULL;
+    int amount = blockCount * BLCKSZ;
+    v = _mdfd_getseg(reln, forknum, blocknum, false, EXTENSION_FAIL);
+
+    seekpos = (off_t)BLCKSZ * (blocknum % ((BlockNumber)RELSEG_SIZE));
+
+    Assert(seekpos < (off_t) BLCKSZ * RELSEG_SIZE);
+    Assert(seekpos + (off_t) amount <= (off_t) BLCKSZ * RELSEG_SIZE);
+
+    nbytes = FilePRead(v->mdfd_vfd, buffer, amount, seekpos, WAIT_EVENT_DATA_FILE_READ);
+
+    if (nbytes != amount) {
+        if (nbytes < 0) {
+            ereport(ERROR, (errcode_for_file_access(),
+                            errmsg("could not read block %u in file \"%s\": %m", blocknum, FilePathName(v->mdfd_vfd))));
+        }
+        /*
+         * Short read: we are at or past EOF, or we read a partial block at
+         * EOF.  Normally this is an error; upper levels should never try to
+         * read a nonexistent block.  However, if zero_damaged_pages is ON or
+         * we are InRecovery, we should instead return zeroes without
+         * complaining.  This allows, for example, the case of trying to
+         * update a block that was later truncated away.
+         */
+        if (u_sess->attr.attr_security.zero_damaged_pages || t_thrd.xlog_cxt.InRecovery) {
+            int damaged_pages_start_offset = nbytes - nbytes % BLCKSZ;
+            MemSet((char*)buffer + damaged_pages_start_offset, 0, amount - damaged_pages_start_offset);
+        } else {
+            check_file_stat(FilePathName(v->mdfd_vfd));
+            force_backtrace_messages = true;
+            extreme_rto_standby_read::dump_error_all_info(reln->smgr_rnode.node, forknum, blocknum);//standby节点
+            ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+                            errmsg("could not read block %u in file \"%s\": read only %d of %d bytes", blocknum,
+                                   FilePathName(v->mdfd_vfd), nbytes, BLCKSZ)));
+        }
     }
 }
 

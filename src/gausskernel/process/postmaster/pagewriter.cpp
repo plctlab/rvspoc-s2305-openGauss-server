@@ -426,6 +426,7 @@ bool is_dirty_page_queue_full(BufferDesc* buf)
     return false;
 }
 
+#if (defined(__x86_64__) || defined(__aarch64__)) && !defined(__USE_SPINLOCK)
 bool atomic_push_pending_flush_queue(XLogRecPtr* queue_head_lsn, uint64* new_tail_loc)
 {
     uint128_u compare;
@@ -458,6 +459,7 @@ loop:
     *new_tail_loc -= 1;
     return true;
 }
+#endif
 
 bool push_pending_flush_queue(Buffer buffer)
 {
@@ -465,10 +467,10 @@ bool push_pending_flush_queue(Buffer buffer)
     uint64 actual_loc;
     XLogRecPtr queue_head_lsn = InvalidXLogRecPtr;
     BufferDesc* buf_desc = GetBufferDescriptor(buffer - 1);
-    bool push_finish = false;
 
     Assert(XLogRecPtrIsInvalid(pg_atomic_read_u64(&buf_desc->extra->rec_lsn)));
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
+    bool push_finish = false;
     push_finish = atomic_push_pending_flush_queue(&queue_head_lsn, &new_tail_loc);
     if (!push_finish) {
         return false;
@@ -476,11 +478,15 @@ bool push_pending_flush_queue(Buffer buffer)
 #else
     SpinLockAcquire(&g_instance.ckpt_cxt_ctl->queue_lock);
 
-    if ((uint64)(get_dirty_page_num() + PAGE_QUEUE_SLOT_MIN_RESERVE_NUM) >=
+    if ((uint64)(g_instance.ckpt_cxt_ctl->dirty_page_queue_tail
+                  - g_instance.ckpt_cxt_ctl->dirty_page_queue_head
+                  + PAGE_QUEUE_SLOT_MIN_RESERVE_NUM) >=
         g_instance.ckpt_cxt_ctl->dirty_page_queue_size) {
         SpinLockRelease(&g_instance.ckpt_cxt_ctl->queue_lock);
         return false;
     }
+
+    queue_head_lsn = g_instance.ckpt_cxt_ctl->dirty_page_queue_reclsn;
     new_tail_loc = g_instance.ckpt_cxt_ctl->dirty_page_queue_tail;
     g_instance.ckpt_cxt_ctl->dirty_page_queue_tail++;
     SpinLockRelease(&g_instance.ckpt_cxt_ctl->queue_lock);
@@ -509,7 +515,7 @@ uint64 get_dirty_page_queue_tail()
 {
     uint64 tail = 0;
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     tail = pg_atomic_barrier_read_u64(&g_instance.ckpt_cxt_ctl->dirty_page_queue_tail);
 #else
     SpinLockAcquire(&g_instance.ckpt_cxt_ctl->queue_lock);
@@ -603,7 +609,7 @@ static uint32 ckpt_qsort_dirty_page_for_flush(bool *is_new_relfilenode, uint32 f
     scan_end = MIN(MAX_SCAN_NUM, dirty_page_num);
 
     for (i = 0; i < scan_end; i++) {
-        uint32 buf_state;
+        uint64 buf_state;
         Buffer buffer;
         BufferDesc* buf_desc = NULL;
         CkptSortItem* item = NULL;
@@ -1602,7 +1608,7 @@ static void SetupPageWriterSignalHook(void)
 
 static void logSnapshotForLogicalDecoding()
 {
-    if (XLogLogicalInfoActive() && !RecoveryInProgress()) {
+    if (!SS_SINGLE_CLUSTER && XLogLogicalInfoActive() && !RecoveryInProgress()) {
         TimestampTz timeout = 0;
         TimestampTz currentTime = GetCurrentTimestamp();
         timeout = TimestampTzPlusMilliseconds(g_last_snapshot_ts, LOG_SNAPSHOT_INTERVAL_MS);
@@ -1902,7 +1908,7 @@ static void ckpt_try_prune_dirty_page_queue()
     if (can_found) {
         uint64 temp_loc;
         uint64 move_loc;
-        uint32 buf_state;
+        uint64 buf_state;
         volatile DirtyPageQueueSlot* slot = NULL;
         volatile DirtyPageQueueSlot* move_slot = NULL;
         BufferDesc* bufhdr = NULL;
@@ -2010,7 +2016,7 @@ static uint32 incre_ckpt_pgwr_flush_dirty_page(WritebackContext *wb_context,
     const CkptSortItem *dirty_buf_list, int start, int batch_num)
 {
     uint32 num_actual_flush = 0;
-    uint32 buf_state;
+    uint64 buf_state;
     uint32 sync_state;
     BufferDesc *buf_desc = NULL;
     int buf_id;
@@ -2164,7 +2170,7 @@ static bool check_buffer_dirty_flag(BufferDesc* buf_desc)
     
     bool segment_buf = (buf_desc->buf_id >= SegmentBufferStartID);
     Block tmpBlock = BufHdrGetBlock(buf_desc);
-    uint32 local_buf_state = pg_atomic_read_u32(&buf_desc->state);
+    uint64 local_buf_state = pg_atomic_read_u64(&buf_desc->state);
     bool check_lsn_not_match = (local_buf_state & BM_VALID) && !(local_buf_state & BM_DIRTY) &&
         XLByteLT(buf_desc->extra->lsn_on_disk, PageGetLSN(tmpBlock)) && RecoveryInProgress() && !segment_buf;
 
@@ -2178,7 +2184,7 @@ static bool check_buffer_dirty_flag(BufferDesc* buf_desc)
         PinBuffer(buf_desc, NULL);
         if (LWLockConditionalAcquire(buf_desc->content_lock, LW_SHARED)) {
             pg_memory_barrier();
-            local_buf_state = pg_atomic_read_u32(&buf_desc->state);
+            local_buf_state = pg_atomic_read_u64(&buf_desc->state);
             check_lsn_not_match = (local_buf_state & BM_VALID) && !(local_buf_state & BM_DIRTY) &&
                 XLByteLT(buf_desc->extra->lsn_on_disk, PageGetLSN(tmpBlock)) && RecoveryInProgress();
             if (check_lsn_not_match) {
@@ -2187,7 +2193,7 @@ static bool check_buffer_dirty_flag(BufferDesc* buf_desc)
                 UnpinBuffer(buf_desc, true);
                 const uint32 shiftSize = 32;
                 ereport(DEBUG1, (errmodule(MOD_INCRE_BG),
-                    errmsg("check lsn is not matched on disk:%X/%X on page %X/%X, relnode info:%u/%u/%u %u %u stat:%u",
+                    errmsg("check lsn is not matched on disk:%X/%X on page %X/%X, relnode info:%u/%u/%u %u %u stat:%lu",
                         (uint32)(buf_desc->extra->lsn_on_disk >> shiftSize), (uint32)(buf_desc->extra->lsn_on_disk),
                         (uint32)(PageGetLSN(tmpBlock) >> shiftSize), (uint32)(PageGetLSN(tmpBlock)),
                         buf_desc->tag.rnode.spcNode, buf_desc->tag.rnode.dbNode, buf_desc->tag.rnode.relNode,
@@ -2373,7 +2379,7 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
     uint32 need_flush_num = 0;
     uint32 candidates = 0;
     BufferDesc *buf_desc = NULL;
-    uint32 local_buf_state;
+    uint64 local_buf_state;
     CkptSortItem* item = NULL;
     bool check_not_need_flush = false;
     bool check_usecount = false;
@@ -2387,7 +2393,7 @@ static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 
 
     for (uint32 buf_id = start; buf_id < end; buf_id++) {
         buf_desc = GetBufferDescriptor(buf_id);
-        local_buf_state = pg_atomic_read_u32(&buf_desc->state);
+        local_buf_state = pg_atomic_read_u64(&buf_desc->state);
 
         /* during recovery, check the data page whether not properly marked as dirty */
         if (RecoveryInProgress() && check_buffer_dirty_flag(buf_desc)) {
@@ -2466,7 +2472,7 @@ static void push_to_candidate_list(BufferDesc *buf_desc)
     uint32 thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
     PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
     int buf_id = buf_desc->buf_id;
-    uint32 buf_state = pg_atomic_read_u32(&buf_desc->state);
+    uint64 buf_state = pg_atomic_read_u64(&buf_desc->state);
     bool emptyUsageCount = (!NEED_CONSIDER_USECOUNT || BUF_STATE_GET_USAGECOUNT(buf_state) == 0);
 
     if (BUF_STATE_GET_REFCOUNT(buf_state) > 0 || !emptyUsageCount) {

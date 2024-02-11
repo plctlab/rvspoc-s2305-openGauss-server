@@ -37,10 +37,12 @@
 /*****************************************************************************
  *	  Backend version and inplace upgrade staffs
  *****************************************************************************/
+extern const uint32 SUPPORT_GS_DEPENDENCY_VERSION_NUM;
+extern const uint32 TXNSTATUS_CACHE_DFX_VERSION_NUM;
+extern const uint32 PARAM_MARK_VERSION_NUM;
 extern const uint32 TIMESCALE_DB_VERSION_NUM;
 extern const uint32 NBTREE_INSERT_OPTIMIZATION_VERSION_NUM;
 extern const uint32 NBTREE_DEDUPLICATION_VERSION_NUM;
-extern const uint32 ONDEMAND_REDO_VERSION_NUM;
 extern const uint32 MULTI_CHARSET_VERSION_NUM;
 extern const uint32 SRF_FUSION_VERSION_NUM;
 extern const uint32 INNER_UNIQUE_VERSION_NUM;
@@ -133,10 +135,14 @@ extern const uint32 CREATE_INDEX_IF_NOT_EXISTS_VERSION_NUM;
 extern const uint32 SLOW_SQL_VERSION_NUM;
 extern const uint32 INDEX_HINT_VERSION_NUM;
 extern const uint32 CREATE_TABLE_AS_VERSION_NUM;
+extern const uint32 GB18030_2022_VERSION_NUM;
+extern const uint32 PARTITION_ACCESS_EXCLUSIVE_LOCK_UPGRADE_VERSION;
+extern const uint32 SPQ_VERSION_NUM;
+extern const uint32 UPSERT_ALIAS_VERSION_NUM;
+extern const uint32 SELECT_STMT_HAS_USERVAR;
 
 extern void register_backend_version(uint32 backend_version);
 extern bool contain_backend_version(uint32 version_number);
-extern void SSUpgradeFileBeforeCommit();
 
 #define INPLACE_UPGRADE_PRECOMMIT_VERSION 1
 
@@ -177,7 +183,7 @@ extern void SSUpgradeFileBeforeCommit();
 #define OPT_UNBIND_DIVIDE_BOUND 64
 #define OPT_CORRECT_TO_NUMBER 128
 #define OPT_CONCAT_VARIADIC 256
-#define OPT_MEGRE_UPDATE_MULTI 512
+#define OPT_MERGE_UPDATE_MULTI 512
 #define OPT_CONVERT_TO_NUMERIC 1024
 #define OPT_PLSTMT_IMPLICIT_SAVEPOINT 2048
 #define OPT_HIDE_TAILING_ZERO 4096
@@ -195,7 +201,10 @@ extern void SSUpgradeFileBeforeCommit();
 #define OPT_TRUNC_NUMERIC_TAIL_ZERO 16777216
 #define OPT_ALLOW_ORDERBY_UNDISTINCT_COLUMN 33554432
 #define OPT_SELECT_INTO_RETURN_NULL 67108864
-#define OPT_MAX 27
+#define OPT_ACCEPT_EMPTY_STR 134217728
+#define OPT_PLPGSQL_DEPENDENCY 268435456
+#define OPT_PROC_UNCHECK_DEFAULT_PARAM 536870912
+#define OPT_MAX 30
 
 #define PLPSQL_OPT_FOR_LOOP 1
 #define PLPSQL_OPT_OUTPARAM 2
@@ -209,11 +218,12 @@ extern void SSUpgradeFileBeforeCommit();
 #define RETURN_NS (u_sess->utils_cxt.behavior_compat_flags & OPT_RETURN_NS_OR_NULL)
 #define CORRECT_TO_NUMBER (u_sess->utils_cxt.behavior_compat_flags & OPT_CORRECT_TO_NUMBER)
 #define SUPPORT_BIND_SEARCHPATH (u_sess->utils_cxt.behavior_compat_flags & OPT_BIND_SEARCHPATH)
+#define ACCEPT_EMPTY_STR (u_sess->utils_cxt.behavior_compat_flags & OPT_ACCEPT_EMPTY_STR)
 /*CONCAT_VARIADIC controls 1.the variadic type process, and 2. td mode null return process in concat. By default, the
  * option is blank and the behavior is new and compatible with current A and C mode, if the option is set, the
  * behavior is old and the same as previous GAUSSDB kernel. */
 #define CONCAT_VARIADIC (!(u_sess->utils_cxt.behavior_compat_flags & OPT_CONCAT_VARIADIC))
-#define MEGRE_UPDATE_MULTI (u_sess->utils_cxt.behavior_compat_flags & OPT_MEGRE_UPDATE_MULTI)
+#define MERGE_UPDATE_MULTI (u_sess->utils_cxt.behavior_compat_flags & OPT_MERGE_UPDATE_MULTI)
 #define CONVERT_STRING_DIGIT_TO_NUMERIC (u_sess->utils_cxt.behavior_compat_flags & OPT_CONVERT_TO_NUMERIC)
 #define PLSTMT_IMPLICIT_SAVEPOINT (u_sess->utils_cxt.behavior_compat_flags & OPT_PLSTMT_IMPLICIT_SAVEPOINT)
 #define HIDE_TAILING_ZERO (u_sess->utils_cxt.behavior_compat_flags & OPT_HIDE_TAILING_ZERO)
@@ -236,6 +246,8 @@ extern void SSUpgradeFileBeforeCommit();
 #define PLSQL_COMPILE_OUTPARAM (u_sess->utils_cxt.plsql_compile_behavior_compat_flags & PLPSQL_OPT_OUTPARAM)
 
 #define SELECT_INTO_RETURN_NULL (u_sess->utils_cxt.behavior_compat_flags & OPT_SELECT_INTO_RETURN_NULL)
+#define PLPGSQL_DEPENDENCY (u_sess->utils_cxt.behavior_compat_flags & OPT_PLPGSQL_DEPENDENCY)
+#define PROC_UNCHECK_DEFAULT_PARAM (u_sess->utils_cxt.behavior_compat_flags & OPT_PROC_UNCHECK_DEFAULT_PARAM)
 
 /* define database compatibility Attribute */
 typedef struct {
@@ -416,7 +428,7 @@ extern bool stack_is_too_deep(void);
 /* in tcop/utility.c */
 extern void PreventCommandIfReadOnly(const char* cmdname);
 extern void PreventCommandDuringRecovery(const char* cmdname);
-extern void PreventCommandDuringSSOndemandRecovery(Node* parseTree);
+extern void PreventCommandDuringSSOndemandRedo(Node* parseTree);
 
 extern int trace_recovery(int trace_level);
 
@@ -560,6 +572,8 @@ typedef enum {
     TsCompactionAuxiliaryProcess,
     XlogCopyBackendProcess,
     BarrierPreParseBackendProcess,
+    DmsAuxiliaryProcess,
+    ExrtoRecyclerProcess,
     NUM_SINGLE_AUX_PROC, /* Sentry for auxiliary type with single thread. */
 
     /*
@@ -604,6 +618,9 @@ typedef enum {
 #define AmTsCompactionAuxiliaryProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == TsCompactionAuxiliaryProcess)
 #define AmPageRedoWorker() (t_thrd.bootstrap_cxt.MyAuxProcType == PageRedoProcess)
 #define AmDmsReformProcProcess() (t_thrd.role == DMS_WORKER && t_thrd.dms_cxt.is_reform_proc)
+#define AmDmsProcess() (t_thrd.role == DMS_WORKER)
+#define AmErosRecyclerProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == ExrtoRecyclerProcess)
+#define AmDmsAuxiliaryProcess() (t_thrd.role == DMS_AUXILIARY_THREAD)
 
 
 

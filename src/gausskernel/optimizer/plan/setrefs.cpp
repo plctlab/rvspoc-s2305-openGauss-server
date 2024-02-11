@@ -41,6 +41,10 @@
 #include "optimizer/streamplan.h"
 #include "optimizer/stream_remove.h"
 
+#ifdef USE_SPQ
+#include "optimizer/planmem_walker.h"
+#endif
+
 typedef struct {
     Index varno;         /* RT index of Var */
     AttrNumber varattno; /* attr number of Var */
@@ -309,6 +313,9 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
      */
     switch (nodeTag(plan)) {
         case T_SeqScan:
+#ifdef USE_SPQ
+        case T_SpqSeqScan:
+#endif
 #ifdef ENABLE_MULTIPLE_NODES
         case T_TsStoreScan:
 #endif   /* ENABLE_MULTIPLE_NODES */
@@ -324,6 +331,9 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
                 splan->tablesample = (TableSampleClause*)fix_scan_expr(root, (Node*)splan->tablesample, rtoffset);
             }
         } break;
+#ifdef USE_SPQ
+        case T_SpqIndexScan:
+#endif
         case T_IndexScan: {
             IndexScan* splan = (IndexScan*)plan;
 
@@ -338,6 +348,9 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
             splan->indexorderby = fix_scan_list(root, splan->indexorderby, rtoffset);
             splan->indexorderbyorig = fix_scan_list(root, splan->indexorderbyorig, rtoffset);
         } break;
+#ifdef USE_SPQ
+        case T_SpqIndexOnlyScan:
+#endif
         case T_IndexOnlyScan: {
             IndexOnlyScan* splan = (IndexOnlyScan*)plan;
             if (splan->scan.plan.distributed_keys != NIL) {
@@ -362,6 +375,9 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
             splan->baserelcstorequal = fix_scan_list(root, splan->baserelcstorequal, rtoffset);
             splan->indextlist = fix_scan_list(root, splan->indextlist, rtoffset);
         } break;
+#ifdef USE_SPQ
+        case T_SpqBitmapHeapScan:
+#endif
         case T_BitmapIndexScan: {
             BitmapIndexScan* splan = (BitmapIndexScan*)plan;
 
@@ -647,6 +663,20 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
             /* resconstantqual can't contain any subplan variable refs */
             splan->resconstantqual = fix_scan_expr(root, splan->resconstantqual, rtoffset);
         } break;
+#ifdef USE_SPQ
+        case T_Result: {
+            Result* splan = (Result*)plan;
+
+            if (splan->plan.lefttree != NULL)
+                set_upper_references(root, plan, rtoffset);
+            else {
+                splan->plan.targetlist = fix_scan_list(root, splan->plan.targetlist, rtoffset);
+                splan->plan.qual = fix_scan_list(root, splan->plan.qual, rtoffset);
+            }
+            /* resconstantqual can't contain any subplan variable refs */
+            splan->resconstantqual = fix_scan_expr(root, splan->resconstantqual, rtoffset);
+        }
+#endif
         case T_ProjectSet:
             set_upper_references(root, plan, rtoffset);
             break;
@@ -2345,27 +2375,6 @@ void extract_query_dependencies(
     *hasHdfs = glob.vectorized;
 }
 
-static List *get_partition_indexoid_list(List *partitionOidList)
-{
-    if (partitionOidList == NULL) {
-        return NULL;
-    }
-    ListCell *cell = NULL;
-    List *indexOidList = NIL;
-    foreach (cell, partitionOidList) {
-        Oid partOid = (Oid)lfirst_oid(cell);
-        List *partIndexlist = searchPartitionIndexesByblid(partOid);
-        ListCell *indexCell = NULL;
-        foreach (indexCell, partIndexlist) {
-            HeapTuple partIndexTuple = (HeapTuple)lfirst(indexCell);
-            Oid indexOid = HeapTupleGetOid(partIndexTuple);
-            indexOidList = lappend_oid(indexOidList, indexOid);
-        }
-        freePartList(partIndexlist);
-    }
-    return indexOidList;
-}
-
 /*
  * Tree walker for extract_query_dependencies.
  *
@@ -2409,39 +2418,6 @@ static bool extract_query_dependencies_walker(Node* node, PlannerInfo* context)
                 /* use glob.vectorized here to mark if we contain hdfs table */
                 if (REL_PAX_ORIENTED == rte->orientation)
                     context->glob->vectorized = true;
-
-                /* To partition table, need append all partition Oids to relationOids.
-                 * When partition tables are altered, partitionId will be append to transInvalInfo in
-                 * function RegisterPartcacheInvalidation.
-                 * On transaction start, if this table has been altered. Plansource->is_valid will be set
-                 * to false.
-                 */
-                if (rte->ispartrel) {
-                    List *partitionOid = getPartitionObjectIdList(rte->relid, PART_OBJ_TYPE_TABLE_PARTITION);
-                    Relation partTableRel = relation_open(rte->relid, AccessShareLock);
-                    if (RelationIsSubPartitioned(partTableRel)) {
-                        ListCell *cell = NULL;
-                        foreach (cell, partitionOid) {
-                            Oid partOid = (Oid)lfirst_oid(cell);
-                            List *subPartitionOidList =
-                                getPartitionObjectIdList(partOid, PART_OBJ_TYPE_TABLE_SUB_PARTITION);
-                            List *subPartIndexOidList = get_partition_indexoid_list(subPartitionOidList);
-                            // add subpartition index oid
-                            context->glob->relationOids = list_concat(context->glob->relationOids, subPartIndexOidList);
-                            // add subpartition oid
-                            context->glob->relationOids = list_concat(context->glob->relationOids, subPartitionOidList);
-                        }
-                        // add partition oid
-                        context->glob->relationOids = list_concat(context->glob->relationOids, partitionOid);
-                    } else {
-                        List *partIndexOidList = get_partition_indexoid_list(partitionOid);
-                        // add partition index oid
-                        context->glob->relationOids = list_concat(context->glob->relationOids, partIndexOidList);
-                        // add partition oid
-                        context->glob->relationOids = list_concat(context->glob->relationOids, partitionOid);
-                    }
-                    relation_close(partTableRel, AccessShareLock);
-                }
             }
         }
 
@@ -2791,3 +2767,47 @@ static void set_foreignscan_references(PlannerInfo *root, ForeignScan *fscan, in
         fix_dfs_private_item(root, rtoffset, item);
     }
 }
+
+#ifdef USE_SPQ
+typedef struct {
+    PlannerInfo *root;
+    plan_tree_base_prefix base;
+} spq_extract_plan_dependencies_context;
+ 
+static bool spq_extract_plan_dependencies_walker(Node *node, spq_extract_plan_dependencies_context *context)
+{
+    if (node == NULL)
+        return false;
+    /* Extract function dependencies and check for regclass Consts */
+    fix_expr_common(context->root, node);
+ 
+    return plan_tree_walker(node, (MethodWalker)spq_extract_plan_dependencies_walker, (void *)context);
+}
+ 
+/*
+ * spq_extract_plan_dependencies()
+ *              Given a fully built Plan tree, extract their dependencies just as
+ *              set_plan_references_ would have done.
+ *
+ * This is used to extract dependencies from a plan that has been created
+ * by ORCA (set_plan_references() does this usually, but ORCA doesn't use
+ * it). This adds the new entries directly to PlannerGlobal.relationOids
+ * and invalItems.
+ *
+ * Note: This recurses into SubPlans. You better still call this for
+ * every subplan in a overall plan, to make sure you capture dependencies
+ * from subplans that are not referenced from the main plan, because
+ * changes to the relations in eliminated subplans might require
+ * re-planning, too. (XXX: it would be better to not recurse into SubPlans
+ * here, as that's a waste of time.)
+ */
+void spq_extract_plan_dependencies(PlannerInfo *root, Plan *plan)
+{
+    spq_extract_plan_dependencies_context context;
+ 
+    context.base.node = (Node *)(root->glob);
+    context.root = root;
+ 
+    (void)spq_extract_plan_dependencies_walker((Node *)plan, &context);
+}
+#endif

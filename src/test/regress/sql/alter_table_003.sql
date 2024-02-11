@@ -3256,5 +3256,260 @@ alter table t1 modify f1 int after f3, modify f5 bool first, modify f3 timestamp
 SELECT pg_get_tabledef('t1');
 drop table if exists t1 cascade;
 
+-- test about setting schema by RenameStmt
+CREATE SCHEMA test1;
+CREATE SCHEMA test2;
+CREATE TABLE test1.test(a int primary key, b int not null);
+CREATE INDEX ON test1.test using btree(b);
+INSERT INTO test1.test VALUES (1, 1);
+\d+ test1.test
+SELECT n.nspname, c.relname from pg_class c, pg_namespace n where n.oid = c.relnamespace and c.relname in ('test', 'test_pkey', 'test_b_idx', 'tttt') order by c.relname;
+SELECT * FROM test1.test;
+-- check about type
+SELECT n.nspname, t.typname FROM pg_type t, pg_namespace n where t.typnamespace = n.oid and t.typname in ('test','tttt');
+ALTER TABLE test1.test RENAME TO test2.tttt;
+\d+ test1.test
+\d+ test2.tttt
+SELECT n.nspname, c.relname from pg_class c, pg_namespace n where n.oid = c.relnamespace and c.relname in ('test', 'test_pkey', 'test_b_idx', 'tttt') order by c.relname;
+INSERT INTO test2.tttt VALUES (2, 2);
+SELECT * FROM test1.test;
+SELECT * FROM test2.tttt;
+-- check about type
+SELECT n.nspname, t.typname FROM pg_type t, pg_namespace n where t.typnamespace = n.oid and t.typname in ('test','tttt');
+
+-- just rename
+ALTER TABLE test2.tttt RENAME TO test2.ttt;
+SELECT * FROM test2.tttt;
+SELECT * FROM test2.ttt;
+-- check about type
+SELECT n.nspname, t.typname FROM pg_type t, pg_namespace n where t.typnamespace = n.oid and t.typname = 'ttt';
+
+-- just move to other schema
+CREATE TABLE test1.t1 (a int);
+\d+ test1.t1
+ALTER TABLE test1.t1 RENAME TO test2.t1;
+\d+ test1.t1
+\d+ test2.t1
+-- check about type
+SELECT n.nspname, t.typname FROM pg_type t, pg_namespace n where t.typnamespace = n.oid and t.typname = 't1';
+
+-- test about partition table
+CREATE TABLE test1.sales_table1
+(
+    order_no INTEGER NOT NULL,
+    goods_name CHAR(20) NOT NULL,
+    sales_date DATE NOT NULL,
+    sales_volume INTEGER,
+    sales_store CHAR(20)
+)
+PARTITION BY RANGE(sales_date)
+(
+    PARTITION sales_table1_season1 VALUES LESS THAN('2021-04-01 00:00:00'),
+    PARTITION sales_table1_season2 VALUES LESS THAN('2021-07-01 00:00:00'),
+    PARTITION sales_table1_season3 VALUES LESS THAN('2021-10-01 00:00:00'),
+    PARTITION sales_table1_season4 VALUES LESS THAN(MAXVALUE)
+);
+
+CREATE TABLE test1.sales_table2
+(
+    order_no INTEGER NOT NULL,
+    goods_name CHAR(20) NOT NULL,
+    sales_date DATE NOT NULL,
+    sales_volume INTEGER,
+    sales_store CHAR(20)
+)
+PARTITION BY RANGE(sales_date)
+(
+    PARTITION sales_table2_season1 VALUES LESS THAN('2021-04-01 00:00:00'),
+    PARTITION sales_table2_season2 VALUES LESS THAN('2021-07-01 00:00:00'),
+    PARTITION sales_table2_season3 VALUES LESS THAN('2021-10-01 00:00:00'),
+    PARTITION sales_table2_season4 VALUES LESS THAN(MAXVALUE)
+);
+
+CREATE TABLE test1.sales_table3
+(
+    order_no INTEGER NOT NULL,
+    goods_name CHAR(20) NOT NULL,
+    sales_date DATE NOT NULL,
+    sales_volume INTEGER,
+    sales_store CHAR(20)
+)
+PARTITION BY RANGE(sales_date)
+(
+    PARTITION sales_table3_season1 VALUES LESS THAN('2021-04-01 00:00:00'),
+    PARTITION sales_table3_season2 VALUES LESS THAN('2021-07-01 00:00:00'),
+    PARTITION sales_table3_season3 VALUES LESS THAN('2021-10-01 00:00:00'),
+    PARTITION sales_table3_season4 VALUES LESS THAN(MAXVALUE)
+);
+SELECT n.nspname, c.relname, p.relname AS partition_name
+FROM pg_class c, pg_namespace n, pg_partition p 
+WHERE n.oid = c.relnamespace and c.oid = p.parentid and c.relname like '%sales_table%' ORDER BY 1, 2, 3;
+ALTER TABLE test1.sales_table1 RENAME TO test2.sales_table1;
+ALTER TABLE test1.sales_table2 RENAME TO test2.sales_table3;
+ALTER TABLE test1.sales_table3 RENAME TO test1.sales_table4;
+SELECT n.nspname, c.relname, p.relname AS partition_name
+FROM pg_class c, pg_namespace n, pg_partition p 
+WHERE n.oid = c.relnamespace and c.oid = p.parentid and c.relname like '%sales_table%' ORDER BY 1, 2, 3;
+
+-- rename table with view or matview
+CREATE TABLE test1.test_table_view1 (a int);
+CREATE TABLE test1.test_table_view2 (a int);
+CREATE TABLE test1.test_table_matview1 (a int);
+CREATE TABLE test1.test_table_matview2 (a int);
+
+CREATE VIEW test1.test_view1 AS SELECT * FROM test1.test_table_view1;
+CREATE VIEW test1.test_view2 AS SELECT * FROM test1.test_table_view2;
+CREATE MATERIALIZED VIEW test1.test_matview1 AS SELECT * FROM test1.test_table_matview1;
+CREATE MATERIALIZED VIEW test1.test_matview2 AS SELECT * FROM test1.test_table_matview2;
+
+ALTER TABLE test1.test_table_view1 RENAME TO test2.test_table_view1; -- just move to other schema
+ALTER TABLE test1.test_table_view2 RENAME TO test2.test_table_view3; -- rename and move to other schema
+SELECT * FROM test1.test_view1;
+SELECT pg_get_viewdef('test1.test_view1');
+SELECT * FROM test1.test_view2;
+SELECT pg_get_viewdef('test1.test_view2');
+
+ALTER TABLE test1.test_table_matview1 RENAME TO test2.test_table_matview1; -- just move to other schema
+ALTER TABLE test1.test_table_matview2 RENAME TO test2.test_table_matview3; -- rename and move to other schema
+SELECT * FROM test1.test_matview1;
+SELECT pg_get_viewdef('test1.test_matview1');
+SELECT * FROM test1.test_matview2;
+SELECT pg_get_viewdef('test1.test_matview2');
+
+-- rename to a existed table
+CREATE TABLE test1.name1 (a int);
+CREATE TABLE test2.name1 (a int);
+CREATE TABLE test2.name2 (a int);
+ALTER TABLE test1.name1 RENAME TO test2.name1;
+ALTER TABLE test1.name1 RENAME TO test2.name2;
+ALTER TABLE test2.name1 RENAME TO test2.name2;
+
+CREATE TABLE t_after_first ( c4 INT , c5 INT ) ;
+INSERT INTO t_after_first VALUES ( 1 , 2 ) , ( 3 , 4 ) ;
+ALTER TABLE t_after_first ADD COLUMN c11 VARCHAR ( 2 ) , ADD COLUMN c22 VARCHAR ( 2 ) AFTER c11 , ADD COLUMN c57 INT FIRST;
+select * from t_after_first;
+
+drop table if exists test_dts;
+create table test_dts(
+        f1 int primary key,
+        f2 varchar(8),
+        f3 timestamp
+);
+insert into test_dts(f1, f2, f3) values(1, 'data1', '2023-07-31 12:34:56'), (2, 'date2', '2023-07-31 13:45:30'),
+(3, 'data3', '2023-07-31 14:56:15'), (4, 'data1', '2023-07-31 12:34:56'), (5, 'date2', '2023-07-31 13:45:30'),
+(6, 'data3', '2023-07-31 14:56:15');
+analyze test_dts;
+analyze test_dts((f1, f3));
+select staattnum, stavalues1 from pg_statistic where starelid = 'test_dts'::regclass order by staattnum;
+select stakey from pg_statistic_ext where starelid = 'test_dts'::regclass;
+alter table test_dts add column f4 int default 0 after f1;
+select staattnum, stavalues1 from pg_statistic where starelid = 'test_dts'::regclass order by staattnum;
+select stakey from pg_statistic_ext where starelid = 'test_dts'::regclass;
+alter table test_dts add column f5 varchar(20) default 'f5' first;
+select staattnum, stavalues1 from pg_statistic where starelid = 'test_dts'::regclass order by staattnum;
+select stakey from pg_statistic_ext where starelid = 'test_dts'::regclass;
+alter table test_dts modify f5 varchar(20) after f4;
+select staattnum, stavalues1 from pg_statistic where starelid = 'test_dts'::regclass order by staattnum;
+select stakey from pg_statistic_ext where starelid = 'test_dts'::regclass;
+alter table test_dts modify f1 int first;
+select staattnum, stavalues1 from pg_statistic where starelid = 'test_dts'::regclass order by staattnum;
+select stakey from pg_statistic_ext where starelid = 'test_dts'::regclass;
+drop table if exists test_dts;
+
+drop table if exists t_after_first;
+create table t_after_first(c4 int, c5 int);
+insert into t_after_first values(1, 2), (3, 4);
+alter table t_after_first add column c11 varchar(2), add column c22 varchar(2) after c11, add column c57 int first;
+select * from t_after_first;
+drop table if exists t_after_first;
+
+-- test for modify type
+drop table if exists fat0;
+create table fat0(c41 int, c17 int);
+insert into fat0 values(-104 not in (58, -123, -109), -49), (64, -28);
+alter table fat0 modify column c17 int first, modify column c41 text, add column c4 int after c17, add column c61 int after c41, add constraint cc0 unique fai0(c17);
+insert into fat0 values(-51, 2, -20, default), (-34, 81, -24, default);
+select * from fat0;
+drop table if exists fat0;
+
+create table fat0(c41 int, c17 text);
+insert into fat0 values(-104 not in(58, -123, -109), -49), (64, -28);
+alter table fat0 modify c17 int first, modify column c41 int, add column c4 int after c17;
+select * from fat0;
+drop table if exists fat0;
+
+create table fat0(c41 int, c17 int, c21 int);
+insert into fat0 values(-104 not in(58, -123, -109), -49, -12),(64, -28, 20);
+alter table fat0 modify column c17 text, modify column c41 text, add column c21 int after c41;
+insert into fat0 values(-51, 2, -20), (-34, 81, -24);
+select * from fat0;
+drop table if exists fat0;
+
+create table fat0(c41 int, c17 int, c21 int);
+insert into fat0 values(-104 not in (58, -123, -109), -49, -12), (64, -28, 20);
+alter table fat0 modify column c17 text first, modify column c41 text, add column c21 int after c41;
+insert into fat0 values(-51, 2, -20), (-34, 81, -24);
+select * from fat0;
+drop table if exists fat0;
+
+-- test for modify type not has column
+create table fat0(c41 int, c17 int);
+insert into fat0 values(-104 not in(58, -123, -109), -49), (64, -28);
+alter table fat0 modify c17 int first, modify c41 text, add c4 int after c17, add c61 int after c41, add constraint cc0 unique fai0(c17);
+select * from fat0;
+drop table if exists fat0;
+
+create table fat0(c41 int, c17 int);
+insert into fat0 values(-104 not in (58, -123, -109), -49), (64, -28);
+alter table fat0 modify column c17 int first, modify column c41 text;
+drop table if exists fat0;
+
+create table fat0(c41 int, c17 int);
+insert into fat0 values(-104 not in (58, -123, -109), -49), (64, -28);
+alter table fat0 modify c17 int first, modify c41 text;
+drop table if exists fat0;
+
+drop table if exists t0;
+create table t0(c32 int, c6 text default (substring (-108, true) is null));
+insert into t0 values (55, -34), (-123, -49);
+alter table t0 change column c32 c59 int after c6, modify column c59 bigint;
+select * from t0;
+
+drop table if exists t0;
+create table t0(c32 int, c6 text default (substring (-108, true) is null));
+insert into t0 values(55, -34), (-123, -49);
+alter table t0 change column c32 c59 int after c6, modify column c59 bigint;
+select * from t0;
+alter table t0 change column c6 c int first, add x int default 11 first, modify column c text;
+select * from t0;
+
+drop table if exists t0;
+create table t0(c32 int, c6 text default (substring (-108, true) is null));
+insert into t0 values(55, -34), (-123, -49);
+alter table t0 change column c32 c59 int after c6, modify c59 bigint;
+select * from t0;
+alter table t0 add x int default 11 first, change column c6 c int first, modify c text;
+select * from t0;
+drop table if exists t0;
+
+drop table if exists t0;
+create table t0(c32 int, c6 text default (substring(-108, true) is null));
+insert into t0 values(55, -34), (-123, -49);
+alter table t0 change column c32 c59 int after c6, modify c59 bigint;
+select * from t0;
+alter table t0 change column c6 c int first, add x int default 11 first, modify c text;
+select * from t0;
+drop table if exists t0;
+
+drop table if exists t0;
+create table t0(c32 int, c6 text default (substring (-108, true) is null));
+insert into t0 change column c32 c59 int after c6, modify c59 bigint;
+select * from t0;
+alter table t0 add x int default 11 first;
+select * from t0;
+alter table t0 change column c6 c int first, modify c text after x, change column c59 c32 bigint first, modify column c32 text after c;
+select * from t0;
+drop table if exists t0;
+
 \c postgres
 drop database test_first_after_B;

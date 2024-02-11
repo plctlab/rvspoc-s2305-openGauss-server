@@ -75,17 +75,25 @@ bool will_shutdown = false;
  *       NEXT   |  92899   |     ?      |     ?     
  *
  ********************************************/
-const uint32 GRAND_VERSION_NUM = 92904;
+const uint32 GRAND_VERSION_NUM = 92925;
 
 /********************************************
  * 2.VERSION NUM FOR EACH FEATURE
  *   Please write indescending order.
  ********************************************/
+const uint32 PUBLICATION_DDL_VERSION_NUM = 92921;
+const uint32 UPSERT_ALIAS_VERSION_NUM = 92920;
+const uint32 SUPPORT_GS_DEPENDENCY_VERSION_NUM = 92916;
+const uint32 SPQ_VERSION_NUM = 92915;
+const uint32 PARTITION_ACCESS_EXCLUSIVE_LOCK_UPGRADE_VERSION = 92913;
+const uint32 PAGE_DIST_VERSION_NUM = 92912;
+const uint32 NODE_REFORM_INFO_VERSION_NUM = 92911;
+const uint32 GB18030_2022_VERSION_NUM = 92908;
+const uint32 PARAM_MARK_VERSION_NUM = 92907;
 const uint32 TIMESCALE_DB_VERSION_NUM = 92904;
 const uint32 MULTI_CHARSET_VERSION_NUM = 92903;
 const uint32 NBTREE_INSERT_OPTIMIZATION_VERSION_NUM = 92902;
 const uint32 NBTREE_DEDUPLICATION_VERSION_NUM = 92902;
-const uint32 ONDEMAND_REDO_VERSION_NUM = 92901;
 const uint32 SRF_FUSION_VERSION_NUM = 92847;
 const uint32 INDEX_HINT_VERSION_NUM = 92845;
 const uint32 INNER_UNIQUE_VERSION_NUM = 92845;
@@ -113,6 +121,7 @@ const uint32 PLAN_SELECT_VERSION_NUM = 92826;
 const uint32 MULTI_PARTITIONS_VERSION_NUM = 92825;
 const uint32 MULTI_MODIFY_VERSION_NUM = 92814;
 const uint32 CSN_TIME_BARRIER_VERSION = 92801;
+const uint32 SELECT_STMT_HAS_USERVAR = 92924;
 
 const uint32 SQL_PATCH_VERSION_NUM = 92675;
 const uint32 SWITCH_ROLE_VERSION_NUM = 92668;

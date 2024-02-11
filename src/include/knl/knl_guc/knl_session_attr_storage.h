@@ -266,6 +266,18 @@ typedef struct knl_session_attr_storage {
     int logical_sender_timeout;
     int ignore_standby_lsn_window;
     int ignore_feedback_xmin_window;
+    int subscription_conflict_resolution;
+
+    /* extreme-rto standby read */
+    int64 max_standby_base_page_size;
+    int64 max_standby_lsn_info_size;
+    
+    bool enable_uwal;
+    char* uwal_path;
+
+    /* pre-read parms */
+    int heap_bulk_read_size;
+    int vacuum_bulk_read_size;
 } knl_session_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_SESSION_ATTR_STORAGE */

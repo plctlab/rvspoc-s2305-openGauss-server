@@ -54,6 +54,7 @@
 #include "executor/exec/execdebug.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
+#include "parser/parse_expr.h"
 #include "storage/lmgr.h"
 #include "storage/tcap.h"
 #include "utils/memutils.h"
@@ -203,6 +204,8 @@ EState* CreateExecutorState()
 
     estate->pruningResult = NULL;
     estate->first_autoinc = 0;
+    estate->cur_insert_autoinc = 0;
+    estate->next_autoinc = 0;
     estate->es_is_flt_frame = (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1);
     /*
      * Return the executor state structure
@@ -307,7 +310,10 @@ ExprContext* CreateExprContext(EState* estate)
     econtext->ecxt_callbacks = NULL;
     econtext->plpgsql_estate = NULL;
     econtext->hasSetResultStore = false;
-
+#ifdef USE_SPQ
+    memset(econtext->cached_root_offsets, 0, sizeof(econtext->cached_root_offsets));
+    econtext->cached_blkno = InvalidBlockNumber;
+#endif
     /*
      * Link the ExprContext into the EState to ensure it is shut down when the
      * EState is freed.  Because we use lcons(), shutdowns will occur in
@@ -1294,11 +1300,14 @@ void ExecCloseIndices(ResultRelInfo* resultRelInfo)
         /* Drop lock acquired by ExecOpenIndices */
         index_close(indexDescs[i], RowExclusiveLock);
     }
+    pfree_ext(resultRelInfo->ri_IndexRelationDescs);
 
-    /*
-     * XXX should free indexInfo array here too?  Currently we assume that
-     * such stuff will be cleaned up automatically in FreeExecutorState.
-     */
+    if (resultRelInfo->ri_IndexRelationInfo) {
+        for (i = 0; i < numIndices; i++) {
+            pfree_ext(resultRelInfo->ri_IndexRelationInfo[i]);
+        }
+        pfree_ext(resultRelInfo->ri_IndexRelationInfo);
+    }
 }
 
 /*
@@ -1550,8 +1559,15 @@ Tuple ExecAutoIncrement(Relation rel, EState* estate, TupleTableSlot* slot, Tupl
         if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP) {
             autoinc = tmptable_autoinc_nextval(rel->rd_rel->relfilenode, cons_autoinc->next);
         } else {
-            autoinc = nextval_internal(cons_autoinc->seqoid);
+            if (estate->next_autoinc > 0) {
+                autoinc = estate->next_autoinc;
+                estate->next_autoinc = 0;
+            } else {
+                autoinc = nextval_internal(cons_autoinc->seqoid);
+            }
         }
+
+        estate->cur_insert_autoinc = autoinc;
         if (estate->first_autoinc == 0) {
             estate->first_autoinc = autoinc;
         }
@@ -1583,6 +1599,26 @@ static void UpdateAutoIncrement(Relation rel, Tuple tuple, EState* estate)
 
     if (estate->first_autoinc != 0 && u_sess->cmd_cxt.last_insert_id != estate->first_autoinc) {
         u_sess->cmd_cxt.last_insert_id = estate->first_autoinc;
+    }
+}
+
+void RestoreAutoIncrement(Relation rel, EState* estate, Tuple tuple)
+{
+    bool isnull = false;
+    ConstrAutoInc* cons_autoinc = rel->rd_att->constr->cons_autoinc;
+    Datum datum = tableam_tops_tuple_fast_getattr(tuple, cons_autoinc->attnum, rel->rd_att, &isnull);
+
+    if (!isnull) {
+        int128 autoinc = datum2autoinc(cons_autoinc, datum);
+        if (autoinc >= estate->cur_insert_autoinc) {
+            return;
+        }
+    }
+
+    if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP) {
+        *cons_autoinc->next = estate->cur_insert_autoinc;
+    } else {
+        estate->next_autoinc = estate->cur_insert_autoinc;
     }
 }
 
@@ -2626,6 +2662,9 @@ void PthreadRwLockInit(pthread_rwlock_t* rwlock, pthread_rwlockattr_t *attr)
  */
 Datum GetTypeZeroValue(Form_pg_attribute att_tup)
 {
+    if (u_sess->hook_cxt.getTypeZeroValueHook != NULL) {
+        return ((getTypeZeroValueFunc)(u_sess->hook_cxt.getTypeZeroValueHook))(att_tup);
+    }
     Datum result;
     switch (att_tup->atttypid) {
         case TIMESTAMPOID: {
@@ -2825,8 +2864,7 @@ Tuple ReplaceTupleNullCol(TupleDesc tupleDesc, TupleTableSlot *slot)
 }
 
 
-void InitOutputValues(RightRefState* refState, GenericExprState* targetArr[],
-                      Datum* values, bool* isnull, int targetCount, bool* hasExecs)
+void InitOutputValues(RightRefState* refState, Datum* values, bool* isnull, bool* hasExecs)
 {
     if (!IS_ENABLE_RIGHT_REF(refState)) {
         return;
@@ -2835,13 +2873,13 @@ void InitOutputValues(RightRefState* refState, GenericExprState* targetArr[],
     refState->values = values;
     refState->isNulls = isnull;
     refState->hasExecs = hasExecs;
-    int colCnt = refState->colCnt;
+    const int colCnt = refState->colCnt;
     for (int i = 0; i < colCnt; ++i) {
         hasExecs[i] = false;
     }
 
     if (IS_ENABLE_INSERT_RIGHT_REF(refState)) {
-        for (int i = 0; i < targetCount; ++i) {
+        for (int i = 0; i < colCnt; ++i) {
             Const* con = refState->constValues[i];
             if (con) {
                 values[i] = con->constvalue;

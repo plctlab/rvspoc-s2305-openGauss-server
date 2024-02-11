@@ -111,9 +111,9 @@ void UpdateFusion::InitBaseParam(List* targetList)
     ListCell* lc = NULL;
     int i = 0;
     FuncExpr* func = NULL;
-    TargetEntry* res = NULL;
     Expr* expr = NULL;
     OpExpr* opexpr = NULL;
+    TargetEntry* res = NULL;
 
     foreach (lc, targetList) {
         /* ignore ctid + tablebucketid or ctid at last */

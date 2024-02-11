@@ -51,6 +51,7 @@
 #include "utils/plog.h"
 #include "threadpool/threadpool.h"
 #include "instruments/instr_user.h"
+#include "instruments/instr_statement.h"
 #include "utils/postinit.h"
 #ifdef ENABLE_MOT
 #include "storage/mot/mot_fdw.h"
@@ -97,7 +98,8 @@ static const pg_on_exit_callback on_sess_exit_list[] = {
     AtProcExit_Files,
     audit_processlogout,
     log_disconnections,
-    libpqsw_cleanup
+    libpqsw_cleanup,
+    og_record_time_cleanup
 };
 
 static const int on_sess_exit_size = lengthof(on_sess_exit_list);
@@ -165,6 +167,15 @@ void proc_exit(int code)
             // if some threads call DmsCallbackThreadShmemInit, wait until they finish
             pg_usleep(WAIT_DMS_INIT_TIMEOUT);
         }
+    }
+
+    /* Wait for all statements that have not been flushed to complete flushing.
+     * The flush usleep wait interval is 100,000 microseconds,
+     * therefore we set it here to 300,000 microseconds for a safe margin.
+     */
+    if (u_sess->statement_cxt.suspend_count != 0) {
+        int flushWaitInterval = 3 * FLUSH_USLEEP_INTERVAL;
+        pg_usleep(flushWaitInterval);
     }
 
     if (t_thrd.utils_cxt.backend_reserved) {
@@ -279,45 +290,6 @@ void proc_exit(int code)
     StreamNodeGroup::syncQuit(STREAM_ERROR);
     StreamNodeGroup::destroy(STREAM_ERROR);
 
-#ifdef PROFILE_PID_DIR
-    {
-        /*
-         * If we are profiling ourself then gprof's mcleanup() is about to
-         * write out a profile to ./gmon.out.  Since mcleanup() always uses a
-         * fixed file name, each backend will overwrite earlier profiles. To
-         * fix that, we create a separate subdirectory for each backend
-         * (./gprof/pid) and 'cd' to that subdirectory before we exit() - that
-         * forces mcleanup() to write each profile into its own directory.	We
-         * end up with something like: $PGDATA/gprof/8829/gmon.out
-         * $PGDATA/gprof/8845/gmon.out ...
-         *
-         * To avoid undesirable disk space bloat, autovacuum workers are
-         * discriminated against: all their gmon.out files go into the same
-         * subdirectory.  Without this, an installation that is "just sitting
-         * there" nonetheless eats megabytes of disk space every few seconds.
-         *
-         * Note that we do this here instead of in an on_proc_exit() callback
-         * because we want to ensure that this code executes last - we don't
-         * want to interfere with any other on_proc_exit() callback.  For the
-         * same reason, we do not include it in proc_exit_prepare ... so if
-         * you are exiting in the "wrong way" you won't drop your profile in a
-         * nice place.
-         */
-        char gprofDirName[32];
-        errno_t rc = EOK;
-        if (IsAutoVacuumWorkerProcess())
-            rc = snprintf_s(gprofDirName, sizeof(gprofDirName), sizeof(gprofDirName) - 1, "gprof/avworker");
-        else
-            rc =
-                snprintf_s(gprofDirName, sizeof(gprofDirName), sizeof(gprofDirName) - 1, "gprof/%lu", gs_thread_self());
-
-        securec_check_ss(rc, "\0", "\0");
-        (void)mkdir("gprof", S_IRWXU | S_IRWXG | S_IRWXO);
-        (void)mkdir(gprofDirName, S_IRWXU | S_IRWXG | S_IRWXO);
-        (void)chdir(gprofDirName);
-    }
-#endif
-
     /*
      * Thread termination does not release any application visible process resources.
      * So we will take care of them explicitly.
@@ -370,6 +342,10 @@ void proc_exit(int code)
     }
 
     GlobalStatsCleanupFiles();
+
+    if (ENABLE_DMS && AmDmsAuxiliaryProcess()) {
+        g_instance.pid_cxt.DmsAuxiliaryPID = 0;
+    }
 
     gs_thread_exit(code);
 }
@@ -484,13 +460,6 @@ void sess_exit_prepare(int code)
     t_thrd.proc_cxt.sess_exit_inprogress = true;
     old_sigset = gs_signal_block_sigusr2();
 
-    /* FDW exit callback, used to free connections to other server, check FDW code for detail. */
-    for (int i = 0; i < MAX_TYPE_FDW; i++) {
-        if (u_sess->ext_fdw_ctx[i].fdwExitFunc != NULL) {
-            (u_sess->ext_fdw_ctx[i].fdwExitFunc)(code, UInt32GetDatum(NULL));
-        }
-    }
-
     for (; u_sess->on_sess_exit_index < on_sess_exit_size; u_sess->on_sess_exit_index++) {
         if (EnableLocalSysCache() && on_sess_exit_list[u_sess->on_sess_exit_index] == AtProcExit_Files) {
             // we close this only on proc exit
@@ -498,7 +467,14 @@ void sess_exit_prepare(int code)
         }
         (*on_sess_exit_list[u_sess->on_sess_exit_index])(code, UInt32GetDatum(NULL));
     }
-    
+
+    /* FDW exit callback, used to free connections to other server, check FDW code for detail. */
+    for (int i = 0; i < MAX_TYPE_FDW; i++) {
+        if (u_sess->ext_fdw_ctx[i].fdwExitFunc != NULL) {
+            (u_sess->ext_fdw_ctx[i].fdwExitFunc)(code, UInt32GetDatum(NULL));
+        }
+    }
+
     t_thrd.storage_cxt.on_proc_exit_index = 0;
     RESUME_INTERRUPTS();
     gs_signal_recover_mask(old_sigset);

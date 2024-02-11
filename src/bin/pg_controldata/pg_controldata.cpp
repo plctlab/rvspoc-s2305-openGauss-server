@@ -30,6 +30,7 @@
 #include "getopt_long.h"
 #include "storage/dss/dss_adaptor.h"
 #include "storage/file/fio_device.h"
+#include "tool_common.h"
 
 #define FirstNormalTransactionId ((TransactionId)3)
 #define TransactionIdIsNormal(xid) ((xid) >= FirstNormalTransactionId)
@@ -88,14 +89,26 @@ static const char* SSClusterState(SSGlobalClusterState state) {
     switch (state) {
         case CLUSTER_IN_ONDEMAND_BUILD:
             return _("in on-demand build");
-        case CLUSTER_IN_ONDEMAND_RECOVERY:
-            return _("in on-demand recovery");
+        case CLUSTER_IN_ONDEMAND_REDO:
+            return _("in on-demand redo");
         case CLUSTER_NORMAL:
             return _("normal");
         default:
             break;
     }
     return _("unrecognized status code");
+}
+
+static const char* SSClusterRunMode(ClusterRunMode run_mode) {
+    switch (run_mode) {
+        case RUN_MODE_PRIMARY:
+            return _("primary cluster");
+        case RUN_MODE_STANDBY:
+            return _("standby cluster");
+        default:
+            break;
+    }
+    return _("unrecognized cluster run mode");
 }
 
 static const char* wal_level_str(WalLevel wal_level)
@@ -263,6 +276,19 @@ static void display_last_page(ss_reformer_ctrl_t reformerCtrl, int last_page_id)
     printf(_("Primary instance ID:                  %d\n"), reformerCtrl.primaryInstId);
     printf(_("Recovery instance ID:                 %d\n"), reformerCtrl.recoveryInstId);
     printf(_("Cluster status:                       %s\n"), SSClusterState(reformerCtrl.clusterStatus));
+    printf(_("Cluster run mode:                     %s\n"), SSClusterRunMode(reformerCtrl.clusterRunMode));
+}
+
+static void checkDssInput(const char* file, char** socketpath)
+{
+    if (file[0] == '+') {
+        enable_dss = true;
+    }
+
+    /* set socketpath if not existed when enable dss */
+    if (enable_dss && *socketpath == NULL) {
+        *socketpath = getSocketpathFromEnv();
+    }
 }
 
 int main(int argc, char* argv[])
@@ -345,6 +371,8 @@ int main(int argc, char* argv[])
         exit_safely(1);
     }
     check_env_value_c(DataDir);
+
+    checkDssInput(DataDir, &socketpath);
 
     if (enable_dss) {
         if (socketpath == NULL || strlen(socketpath) == 0 || strncmp("UDS:", socketpath, 4) != 0) {

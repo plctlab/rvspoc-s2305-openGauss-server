@@ -557,7 +557,7 @@ function decompress()
         kernel=$(cat /etc/euleros-release | awk -F ' ' '{print $1}' | tr a-z A-Z)
         if [ "${kernel}" = "Euleros" ]
         then
-            kernel="Euler"
+            kernel="openEuler"
         fi
     elif [ -f "/etc/openEuler-release" ]
     then
@@ -653,6 +653,7 @@ function set_environment()
         gaussdata=$(cd ${data_path}; pwd)
         sed -i "/.*export\\s*GAUSSDATA=/d" ${env_file}
         echo "export GAUSSDATA=${gaussdata}" >> ${env_file}
+        echo "export PGDATA=${gaussdata}" >> ${env_file}
         info "[set GAUSSDATA environment variables success.]"
     elif [ "$2" = "log" ]
     then

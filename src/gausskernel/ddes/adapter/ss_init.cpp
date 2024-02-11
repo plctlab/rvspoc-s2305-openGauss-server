@@ -12,11 +12,11 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
  * ---------------------------------------------------------------------------------------
- * 
+ *
  * ss_init.cpp
  *  initialize for DMS shared storage.
- * 
- * 
+ *
+ *
  * IDENTIFICATION
  *        src/gausskernel/ddes/adapter/ss_init.cpp
  *
@@ -39,10 +39,11 @@
 #include "ddes/dms/ss_reform_common.h"
 #include "postmaster/postmaster.h"
 
+#define IS_NULL_STR(str) ((str) == NULL || (str)[0] == '\0')
+
 #define FIXED_NUM_OF_INST_IP_PORT 3
 #define BYTES_PER_KB 1024
 #define NON_PROC_NUM 4
-
 
 const int MAX_CPU_STR_LEN = 5;
 const int DEFAULT_DIGIT_RADIX = 10;
@@ -66,6 +67,8 @@ static void scanURL(dms_profile_t* profile, char* ipportstr, int index)
             errmsg("invalid ip string: %s", ipstr)));
     }
     profile->inst_net_addr[index].port = (uint16)pg_strtoint32(portstr);
+    profile->inst_net_addr[index].inst_id = index;
+    profile->inst_net_addr[index].need_connect = true;
 
     ret = strcpy_s(g_instance.dms_cxt.dmsInstAddr[index], DMS_MAX_IP_LEN, ipstr);
     securec_check(ret, "", "");
@@ -302,7 +305,7 @@ static void setScrlConfig(dms_profile_t *profile)
     // server bind
     (void)setBindCoreConfig(dms_attr->scrlock_server_bind_core_config, &profile->scrlock_server_bind_core_start,
         &profile->scrlock_server_bind_core_end);
-    
+
     // worker bind
     if (setBindCoreConfig(dms_attr->scrlock_worker_bind_core_config, &profile->scrlock_worker_bind_core_start,
         &profile->scrlock_worker_bind_core_end)) {
@@ -356,6 +359,21 @@ static void SetOckLogPath(knl_instance_attr_dms* dms_attr, char *ock_log_path)
     }
 }
 
+static void SetWorkThreadpoolConfig(dms_profile_t *profile) 
+{    
+    char* attr = TrimStr(g_instance.attr.attr_storage.dms_attr.work_thread_pool_attr);
+    if (IS_NULL_STR(attr)) {
+        profile->enable_mes_task_threadpool = false;
+        profile->mes_task_worker_max_cnt = 0;
+        return;
+    }
+
+    char* replStr = NULL;
+    replStr = pstrdup(attr);
+    profile->mes_task_worker_max_cnt = (unsigned int)pg_strtoint32(replStr);
+    profile->enable_mes_task_threadpool = true;
+}
+
 static void setDMSProfile(dms_profile_t* profile)
 {
     knl_instance_attr_dms* dms_attr = &g_instance.attr.attr_storage.dms_attr;
@@ -375,16 +393,27 @@ static void setDMSProfile(dms_profile_t* profile)
     SetOckLogPath(dms_attr, profile->ock_log_path);
     profile->inst_map = 0;
     profile->enable_reform = (unsigned char)dms_attr->enable_reform;
-    profile->load_balance_mode = 1; /* primary-standby */
     profile->parallel_thread_num = dms_attr->parallel_thread_num;
+    profile->max_wait_time = DMS_MSG_MAX_WAIT_TIME;
 
     if (dms_attr->enable_ssl && g_instance.attr.attr_security.EnableSSL) {
         InitDmsSSL();
     }
     parseInternalURL(profile);
+    SetWorkThreadpoolConfig(profile);
 
     /* some callback initialize */
     DmsInitCallback(&profile->callback);
+}
+
+static inline void DMSDfxStatReset(){
+    g_instance.dms_cxt.SSDFxStats.txnstatus_varcache_gets = 0;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_hashcache_gets = 0;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_network_io_gets = 0;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_total_hcgets_time = 0;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_total_niogets_time = 0;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_total_evictions = 0;
+    g_instance.dms_cxt.SSDFxStats.txnstatus_total_eviction_refcnt = 0;
 }
 
 void DMSInit()
@@ -394,6 +423,9 @@ void DMSInit()
     }
     if (dms_register_thread_init(DmsCallbackThreadShmemInit)) {
         ereport(FATAL, (errmsg("failed to register dms memcxt callback!")));
+    }
+    if (dms_register_thread_deinit(DmsThreadDeinit)) {
+        ereport(FATAL, (errmsg("failed to register DmsThreadDeinit!")));
     }
 
     uint32 TotalProcs = (uint32)(GLOBAL_ALL_PROCS);
@@ -409,6 +441,7 @@ void DMSInit()
     setDMSProfile(&profile);
 
     DMSInitLogger();
+    DMSDfxStatReset();
 
     g_instance.dms_cxt.log_timezone = u_sess->attr.attr_common.log_timezone;
 
@@ -485,6 +518,14 @@ void DMSRefreshLogger(char *log_field, unsigned long long *value)
     dms_refresh_logger(log_field, value);
 }
 
+static void SSWaitDmsAuxiliaryExit()
+{
+    while (g_instance.pid_cxt.DmsAuxiliaryPID != 0) {
+        pg_usleep(1);
+    }
+    ereport(LOG, (errmsg("[SS] dms auxiliary thread exit")));
+}
+
 void DMSUninit()
 {
     if (!ENABLE_DMS || !g_instance.dms_cxt.dmsInited) {
@@ -494,6 +535,12 @@ void DMSUninit()
     g_instance.dms_cxt.dmsInited = false;
     ereport(LOG, (errmsg("DMS uninit worker threads, DRC, errdesc and DL")));
     dms_uninit();
+
+    if (g_instance.pid_cxt.DmsAuxiliaryPID != 0) {
+        ereport(LOG, (errmsg("[SS] notify dms auxiliary thread exit")));
+        signal_child(g_instance.pid_cxt.DmsAuxiliaryPID, SIGTERM, -1);
+        SSWaitDmsAuxiliaryExit();
+    }
 }
 
 // order: DMS reform finish -> CBReformDoneNotify finish -> startup exit (if has)
@@ -544,8 +591,10 @@ void StartupWaitReform()
 {
     while (g_instance.dms_cxt.SSReformInfo.in_reform) {
         if (dms_reform_failed() || dms_reform_last_failed()) {
-            ereport(LOG, (errmsg("[SS reform] reform failed, startup no need wait.")));
-            break;
+            if (g_instance.dms_cxt.SSReformInfo.in_reform) {
+                ereport(LOG, (errmsg("[SS reform] reform failed, startup no need wait.")));
+                break;
+            }
         }
         pg_usleep(5000L);
     }

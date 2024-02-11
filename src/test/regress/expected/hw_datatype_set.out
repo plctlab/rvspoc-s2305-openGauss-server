@@ -4125,6 +4125,7 @@ ERROR:  invalid input value for set t1_c1_set: ''
 LINE 1: insert into t1 values ('a,,b');
                                ^
 CONTEXT:  referenced column: c1
+COPY t1(c1) FROM stdin WITH NULL 'NULL' CSV QUOTE '"' DELIMITER ',' ESCAPE '"';
 -- 2. define set type include ''
 drop table if exists t2;
 create table t2 (c1 set('a', '', 'b') default '');
@@ -4140,14 +4141,16 @@ select c1, c1+0 from t2;
 
 insert into t2 values ('a,,b'); -- expect 2, not 0
 insert into t2 values (',a,b'); -- expect 2, not 0
+COPY t2(c1) FROM stdin WITH NULL 'NULL' CSV QUOTE '"' DELIMITER ',' ESCAPE '"';
 select c1, c1+0 from t2 order by 2;
   c1  | ?column? 
 ------+----------
       |        0
       |        0
+      |        0
  a,,b |        7
  a,,b |        7
-(4 rows)
+(5 rows)
 
 drop table t1;
 drop table t2;
@@ -5238,20 +5241,20 @@ create table test_part_tab1(c1 int, c2 set('a', 'b', 'A', 'B'))charset utf8 coll
 );
 NOTICE:  CREATE TABLE will create implicit set "test_part_tab1_c2_set" for column "test_part_tab1.c2"
 select pg_get_tabledef('test_part_tab1');
-                              pg_get_tabledef                              
----------------------------------------------------------------------------
- SET search_path = public;                                                +
- CREATE TABLE test_part_tab1 (                                            +
-     c1 integer,                                                          +
-     c2 SET('a', 'b', 'A', 'B') CHARACTER SET "UTF8" COLLATE utf8_bin     +
- )                                                                        +
- CHARACTER SET = "UTF8" COLLATE = "utf8_bin"                              +
- WITH (orientation=row, compression=no)                                   +
- PARTITION BY RANGE (c1)                                                  +
- (                                                                        +
-     PARTITION test_set_tab_p1 VALUES LESS THAN (5) TABLESPACE pg_default,+
-     PARTITION test_set_tab_p2 VALUES LESS THAN (10) TABLESPACE pg_default+
- )                                                                        +
+                           pg_get_tabledef                            
+----------------------------------------------------------------------
+ SET search_path = public;                                           +
+ CREATE TABLE test_part_tab1 (                                       +
+     c1 integer,                                                     +
+     c2 SET('a', 'b', 'A', 'B') CHARACTER SET "UTF8" COLLATE utf8_bin+
+ )                                                                   +
+ CHARACTER SET = "UTF8" COLLATE = "utf8_bin"                         +
+ WITH (orientation=row, compression=no)                              +
+ PARTITION BY RANGE (c1)                                             +
+ (                                                                   +
+     PARTITION test_set_tab_p1 VALUES LESS THAN (5),                 +
+     PARTITION test_set_tab_p2 VALUES LESS THAN (10)                 +
+ )                                                                   +
  ENABLE ROW MOVEMENT;
 (1 row)
 
