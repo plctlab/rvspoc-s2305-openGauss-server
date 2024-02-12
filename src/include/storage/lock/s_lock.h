@@ -349,7 +349,7 @@ static __inline__ int tas(volatile slock_t* lock)
  * later, so the compiler builtin is preferred if available.  Note also that
  * the int-width variant of the builtin works on more chips than other widths.
  */
-#if defined(__arm__) || defined(__arm)
+#if defined(__arm__) || defined(__arm) || defined(__riscv)
 #define HAS_TEST_AND_SET
 
 #define TAS(lock) tas(lock)
@@ -365,7 +365,7 @@ static __inline__ int tas(volatile slock_t* lock)
 
 #define S_UNLOCK(lock) __sync_lock_release(lock)
 
-#else /* !HAVE_GCC_INT_ATOMICS */
+#elif !defined(__riscv) /* !HAVE_GCC_INT_ATOMICS */
 
 typedef unsigned char slock_t;
 

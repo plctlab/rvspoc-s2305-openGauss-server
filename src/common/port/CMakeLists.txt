@@ -94,6 +94,10 @@ if("${BUILD_TUPLE}" STREQUAL "loongarch64")
     list(REMOVE_ITEM TGT_port_SRC ${CMAKE_CURRENT_SOURCE_DIR}/pg_crc32c_choose.cpp ${CMAKE_CURRENT_SOURCE_DIR}/pg_crc32c_sse42.cpp)
 endif()
 
+if("${BUILD_TUPLE}" STREQUAL "riscv64")
+    list(REMOVE_ITEM TGT_port_SRC ${CMAKE_CURRENT_SOURCE_DIR}/pg_crc32c_choose.cpp ${CMAKE_CURRENT_SOURCE_DIR}/pg_crc32c_sse42.cpp)
+endif()
+
 SET(TGT_pgport_INC 
     ${PROJECT_SRC_DIR}/common/backend
     ${PROJECT_SRC_DIR}/common/port
@@ -164,6 +168,10 @@ if("${BUILD_TUPLE}" STREQUAL "aarch64")
 endif()
 
 if("${BUILD_TUPLE}" STREQUAL "loongarch64")
+    list(REMOVE_ITEM TGT_pgport_srv_SRC ${CMAKE_CURRENT_SOURCE_DIR}/port_srv/pg_crc32c_choose.cpp ${CMAKE_CURRENT_SOURCE_DIR}/port_srv/pg_crc32c_sse42.cpp)
+endif()
+
+if("${BUILD_TUPLE}" STREQUAL "riscv64")
     list(REMOVE_ITEM TGT_pgport_srv_SRC ${CMAKE_CURRENT_SOURCE_DIR}/port_srv/pg_crc32c_choose.cpp ${CMAKE_CURRENT_SOURCE_DIR}/port_srv/pg_crc32c_sse42.cpp)
 endif()
 

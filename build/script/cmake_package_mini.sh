@@ -476,6 +476,10 @@ function install_gaussdb()
        CMAKE_OPT="$CMAKE_OPT -DENABLE_BBOX=OFF -DENABLE_JEMALLOC=OFF"
     fi
     
+    if [ "${PLATFORM_ARCH}"x == "riscv64"x ]; then
+       CMAKE_OPT="$CMAKE_OPT -DENABLE_BBOX=OFF"
+    fi
+
     echo "CMAKE_OPT----> $CMAKE_OPT"
     echo "Begin run cmake for gaussdb server" >> "$LOG_FILE" 2>&1
     echo "CMake options: ${CMAKE_OPT}" >> "$LOG_FILE" 2>&1
