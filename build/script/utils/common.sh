@@ -108,7 +108,7 @@ if [ "$PLATFORM_ARCH"X == "loongarch64"X ];then
     gcc_version="8.3"
 fi
 
-if [ "$PLATFORM_ARCH"X == "aarch64"X ] && [ "$gcc_version" == "10.3" ]; then
+if ( [ "$PLATFORM_ARCH"X == "aarch64"X ] || [ "$PLATFORM_ARCH"X == "riscv64"X ] ) && [ "$gcc_version" == "10.3" ]; then
     gcc_sub_version="1"
 else
     gcc_sub_version="0"
