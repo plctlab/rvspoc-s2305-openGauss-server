@@ -275,8 +275,6 @@ if("${ENABLE_MOT}" STREQUAL "ON")
 endif()
 
 install(FILES ${GCC_LIB_PATH}/lib64/libgcc_s.so.1 DESTINATION lib)
-install(DIRECTORY ${GCC_LIB_PATH}/lib64/ DESTINATION lib
-    FILES_MATCHING PATTERN "libgomp.so*")
 
 install(CODE "execute_process(
      COMMAND cp ${GCC_LIB_PATH}/lib64/libstdc++.so.6.0.${LIBSTD_SUB_VERSION} ${prefix_home}/lib/libstdc++.so.6
