@@ -972,7 +972,7 @@ typedef struct {    /* condition information item name for signal/resignal */
     char *table_name;
     char *column_name;
     char *cursor_name;
-    int sqlerrcode;     /* mysql_errno */
+    char *sqlerrcode;     /* mysql_errno */
 } PLpgSQL_condition_info_item;
 
 typedef struct {    /* siganl_information_item */
@@ -1497,6 +1497,19 @@ typedef struct PlDebugEntry {
     PLpgSQL_function* func;
 } PlDebugEntry;
 
+typedef enum AddBreakPointError {
+    ADD_BP_ERR_ALREADY_EXISTS = -1,
+    ADD_BP_ERR_OUT_OF_RANGE = -2,
+    ADD_BP_ERR_INVALID_BP_POS = -3
+} AddBreakPointError;
+
+typedef struct PLDebug_codeline {
+    NodeTag type;
+    int lineno;
+    char* code;
+    bool canBreak;
+} PLDebug_codeline;
+
 typedef List* (*RawParserHook)(const char*, List**);
 
 const int MAXINT8LEN = 25;
@@ -1527,6 +1540,7 @@ const char DEBUG_STEP_INTO_HEADER = 's';
 const char DEBUG_STEP_INTO_HEADER_AFTER = 'S';
 const char DEBUG_BACKTRACE_HEADER = 't';
 const char DEBUG_SET_VARIABLE_HEADER = 'h';
+const char DEBUG_INFOCODE_HEADER = 'i';
 
 /* server return message */
 const int DEBUG_SERVER_SUCCESS = 0;
@@ -1562,7 +1576,7 @@ const int DEBUG_SERVER_PRINT_VAR_FRAMENO_EXCEED = 1;
         if (!g_instance.pldebug_cxt.debug_comm[idx].Used())                                   \
             ereport(ERROR,                                                                    \
                     (errmodule(MOD_PLDEBUGGER), errcode(ERRCODE_PLDEBUGGER_ERROR),            \
-                     errmsg("Debug Comm %d has been released or not turn on yet.", idx)));                        \
+                     errmsg("Debug Comm %d has been released or not turned on yet.", idx)));                        \
     } while (0)
 
 static const char *stringFromCompileStatus(int strindex)
@@ -1632,6 +1646,7 @@ extern void RecvUnixMsg(const char* buf, int bufLen, char* destBuf, int destLen)
 extern char* ResizeDebugBufferIfNecessary(char* buffer, int* oldSize, int needSize);
 extern void ReleaseDebugCommIdx(int idx);
 extern void SendUnixMsg(int socket, const char* val, int len, bool is_client);
+extern List* collect_breakable_line(PLpgSQL_function* func);
 
 /**********************************************************************
  * Function declarations
@@ -1941,6 +1956,12 @@ typedef struct ExceptionContext {
 
     PLpgSQL_declare_handler handler_type;
 } ExceptionContext;
+
+/*Save the type recorded during the cursor definition*/
+typedef struct CursorRecordType {
+    char* cursor_name;
+    Oid type_oid;
+} CursorRecordType;
 
 /* Quick access array state */
 #define IS_ARRAY_STATE(state_list, state) ((state_list && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT) ? \

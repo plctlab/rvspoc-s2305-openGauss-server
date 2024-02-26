@@ -349,7 +349,7 @@ static __inline__ int tas(volatile slock_t* lock)
  * later, so the compiler builtin is preferred if available.  Note also that
  * the int-width variant of the builtin works on more chips than other widths.
  */
-#if defined(__arm__) || defined(__arm)
+#if defined(__arm__) || defined(__arm) || defined(__riscv)
 #define HAS_TEST_AND_SET
 
 #define TAS(lock) tas(lock)
@@ -365,7 +365,7 @@ static __inline__ int tas(volatile slock_t* lock)
 
 #define S_UNLOCK(lock) __sync_lock_release(lock)
 
-#else /* !HAVE_GCC_INT_ATOMICS */
+#elif !defined(__riscv) /* !HAVE_GCC_INT_ATOMICS */
 
 typedef unsigned char slock_t;
 
@@ -605,6 +605,47 @@ static __inline__ int tas(volatile slock_t* lock)
 }
 
 #endif /* __ns32k__ */
+
+#if defined(__loongarch__)   /* loongarch */
+#define HAS_TEST_AND_SET
+
+typedef unsigned int slock_t;
+
+#define TAS(lock) tas(lock)
+
+static __inline__ int
+tas(volatile slock_t *lock)
+{
+       register volatile slock_t *_l = lock;
+       register int _res;
+       register int _tmp;
+
+       __asm__ __volatile__(
+               "       ll.w    %0, %2      \n"
+               "       ori     %1, %0, 1   \n"
+               "       sc.w    %1, %2      \n"
+               "       xori    %1, %1, 1   \n"
+               "       or      %0, %0, %1  \n"
+               "       dbar    0           \n"
+:              "=&r" (_res), "=&r" (_tmp), "+R" (*_l)
+:              /* no inputs */
+:              "memory");
+       return _res;
+}
+
+/* MIPS S_UNLOCK is almost standard but requires a "sync" instruction */
+#define S_UNLOCK(lock) \
+do \
+{ \
+       __asm__ __volatile__( \
+               "  dbar  0 \n" \
+:              /* no outputs */ \
+:              /* no inputs */ \
+:              "memory"); \
+       *((volatile slock_t *) (lock)) = 0; \
+} while (0)
+
+#endif /* loongarch */
 
 #if defined(__alpha) || defined(__alpha__) /* Alpha */
 /*

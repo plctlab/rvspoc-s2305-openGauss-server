@@ -850,6 +850,7 @@ static void knl_t_postgres_init(knl_t_postgres_context* postgres_cxt)
 {
     postgres_cxt->clear_key_memory = false;
     postgres_cxt->debug_query_string = NULL;
+    postgres_cxt->cur_command_tag = T_Invalid;
     postgres_cxt->isInResetUserName = false;
     postgres_cxt->whereToSendOutput = DestDebug;
     postgres_cxt->local_foreign_respool = NULL;
@@ -960,6 +961,16 @@ static void knl_t_page_redo_init(knl_t_page_redo_context* page_redo_cxt)
     page_redo_cxt->got_SIGHUP = false;
     page_redo_cxt->sleep_long = false;
     page_redo_cxt->check_repair = false;
+    page_redo_cxt->redo_worker_ptr = NULL;
+    page_redo_cxt->invalid_msg.valid = false;
+}
+
+static void knl_t_exrto_recycle_init(knl_t_exrto_recycle_context* exrto_recycle_cxt)
+{
+    exrto_recycle_cxt->shutdown_requested = false;
+    exrto_recycle_cxt->got_SIGHUP = false;
+    exrto_recycle_cxt->lsn_info.lsn_num = 0;
+    exrto_recycle_cxt->lsn_info.lsn_array = NULL;
 }
 
 static void knl_t_parallel_decode_init(knl_t_parallel_decode_worker_context* parallel_decode_cxt)
@@ -1120,6 +1131,7 @@ static void KnlTUndorecyclerInit(knl_t_undorecycler_context* undorecyclerCxt)
 {
     undorecyclerCxt->got_SIGHUP = false;
     undorecyclerCxt->shutdown_requested = false;
+    undorecyclerCxt->is_recovery_in_progress = false;
 }
 
 static void KnlTUstoreInit(knl_u_ustore_context *ustoreCxt)
@@ -1315,7 +1327,9 @@ static void knl_t_storage_init(knl_t_storage_context* storage_cxt)
     storage_cxt->BackendWritebackContext = (WritebackContext*)palloc0(sizeof(WritebackContext));
     storage_cxt->SharedBufHash = NULL;
     storage_cxt->InProgressBuf = NULL;
+    storage_cxt->ParentInProgressBuf = NULL;
     storage_cxt->IsForInput = false;
+    storage_cxt->ParentIsForInput = false;
     storage_cxt->PinCountWaitBuf = NULL;
     storage_cxt->InProgressAioDispatch = NULL;
     storage_cxt->InProgressAioDispatchCount = 0;
@@ -1429,6 +1443,7 @@ static void knl_t_storage_init(knl_t_storage_context* storage_cxt)
     storage_cxt->timeoutRemoteOpera = 0;
     storage_cxt->dmsBufCtl = NULL;
     storage_cxt->ondemandXLogMem = NULL;
+    storage_cxt->ondemandXLogFileIdCache = NULL;
 }
 
 static void knl_t_port_init(knl_t_port_context* port_cxt)
@@ -1708,6 +1723,11 @@ static void knl_t_dms_context_init(knl_t_dms_context *dms_cxt)
     errno_t rc = memset_s(dms_cxt->msg_backup, sizeof(dms_cxt->msg_backup), 0, sizeof(dms_cxt->msg_backup));
     securec_check(rc, "\0", "\0");
     dms_cxt->flush_copy_get_page_failed = false;
+    dms_cxt->SSTxnStatusHash = NULL;
+    dms_cxt->SSTxnStatusLRU = NULL;
+    dms_cxt->latest_snapshot_xmin = 0;
+    dms_cxt->latest_snapshot_xmax = 0;
+    dms_cxt->latest_snapshot_csn = 0;
 }
 
 static void knl_t_ondemand_xlog_copy_context_init(knl_t_ondemand_xlog_copy_context *ondemand_xlog_copy_cxt)
@@ -1881,6 +1901,7 @@ void knl_thread_init(knl_thread_role role)
     knl_t_pencentile_init(&t_thrd.percentile_cxt);
     knl_t_perf_snap_init(&t_thrd.perf_snap_cxt);
     knl_t_page_redo_init(&t_thrd.page_redo_cxt);
+    knl_t_exrto_recycle_init(&t_thrd.exrto_recycle_cxt);
     knl_t_parallel_decode_init(&t_thrd.parallel_decode_cxt);
     knl_t_parallel_decode_reader_init(&t_thrd.logicalreadworker_cxt);
     knl_t_heartbeat_init(&t_thrd.heartbeat_cxt);
@@ -1946,6 +1967,7 @@ void RedoInterruptCallBack()
 
     Assert(!AmStartupProcess());
     Assert(!AmPageRedoWorker());
+    Assert(!AmErosRecyclerProcess());
 }
 
 void RedoPageRepairCallBack(RepairBlockKey key, XLogPhyBlock pblk)

@@ -93,14 +93,6 @@ extern volatile uint64 sync_system_identifier;
 #define XLOG_FROM_PG_XLOG (1 << 1) /* Existing file in pg_xlog */
 #define XLOG_FROM_STREAM (1 << 2)  /* Streamed from master */
 
-#define DORADO_STANDBY_CLUSTER (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY && \
-                                g_instance.attr.attr_storage.xlog_file_path != 0)
-#define DORADO_PRIMARY_CLUSTER (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_PRIMARY && \
-                                g_instance.attr.attr_storage.xlog_file_path != 0)
-#define DORADO_STANDBY_CLUSTER_MAINSTANDBY_NODE ((t_thrd.postmaster_cxt.HaShmData->current_mode ==  STANDBY_MODE) && \
-                                                (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY) && \
-                                                (g_instance.attr.attr_storage.xlog_file_path != 0))
-
 /*
  * Recovery target type.
  * Only set during a Point in Time recovery, not when standby_mode = on
@@ -432,7 +424,7 @@ typedef struct XLogCtlInsert {
     uint32 PrevByteSize;
     int32 CurrLRC;
 
-#if (!defined __x86_64__) && (!defined __aarch64__)
+#if ((!defined __x86_64__) && (!defined __aarch64__)) || defined(__USE_SPINLOCK)
     slock_t insertpos_lck; /* protects CurrBytePos and PrevBytePos */
 #endif
     /*
@@ -541,7 +533,7 @@ typedef struct XLogCtlData {
 
     bool IsRecoveryDone;
     bool IsOnDemandBuildDone;
-    bool IsOnDemandRecoveryDone;
+    bool IsOnDemandRedoDone;
 
     /*
      * SharedHotStandbyActive indicates if we're still in crash or archive
@@ -695,7 +687,6 @@ extern bool RecoveryInProgress(void);
 extern bool HotStandbyActive(void);
 extern bool HotStandbyActiveInReplay(void);
 extern bool XLogInsertAllowed(void);
-extern bool SSXLogInsertAllowed(void);
 extern bool SSModifySharedLunAllowed(void);
 extern void GetXLogReceiptTime(TimestampTz* rtime, bool* fromStream);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID* targetTLI, XLogRecPtr* ReplayReadPtr = NULL);

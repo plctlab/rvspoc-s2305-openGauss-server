@@ -287,7 +287,7 @@ bool errstart(int elevel, const char* filename, int lineno, const char* funcname
                  * during which panic is not expected.
                  */
                 if (AmCheckpointerProcess() || AmBackgroundWriterProcess() || AmWalReceiverWriterProcess() ||
-                    AmDataReceiverWriterProcess())
+                    AmDataReceiverWriterProcess() || AmWLMArbiterProcess())
                     elevel = FATAL;
                 else
                     elevel = PANIC;
@@ -494,6 +494,7 @@ bool errstart(int elevel, const char* filename, int lineno, const char* funcname
     edata->table_name = NULL;
     edata->column_name = NULL;
     edata->cursor_name = NULL;
+    edata->mysql_errno = NULL;
 
     t_thrd.log_cxt.recursion_depth--;
     return true;
@@ -729,6 +730,8 @@ void errfinish(int dummy, ...)
         pfree(edata->column_name);
     if (edata->cursor_name)
         pfree(edata->cursor_name);
+    if (edata->mysql_errno)
+        pfree(edata->mysql_errno);
     t_thrd.log_cxt.errordata_stack_depth--;
 
     /* Exit error-handling context */
@@ -897,7 +900,6 @@ int errcode_for_file_access(void)
             /* File not found */
         case ENOENT: /* No such file or directory */
         case ERR_DSS_FILE_NOT_EXIST: /*  No such file in dss */
-        case ERR_DSS_DIR_NOT_EXIST: /* No such directory in dss */
             edata->sqlerrcode = ERRCODE_UNDEFINED_FILE;
             break;
 
@@ -1666,6 +1668,27 @@ int signal_cursor_name(const char *cursor_name)
 }
 
 /*
+ * signal_mysql_errno --- add mysql_errno to the current error
+ */
+int signal_mysql_errno(const char *mysql_errno)
+{
+    ErrorData* edata = &t_thrd.log_cxt.errordata[t_thrd.log_cxt.errordata_stack_depth];
+
+    /* we don't bother incrementing t_thrd.log_cxt.recursion_depth */
+    CHECK_STACK_DEPTH();
+
+    if (edata->mysql_errno != NULL) {
+        pfree(edata->mysql_errno);
+        edata->mysql_errno = NULL;
+    }
+
+    if (mysql_errno != NULL) {
+        edata->mysql_errno = MemoryContextStrdup(ErrorContext, mysql_errno);
+    }
+
+    return 0; /* return value does not matter */
+}
+/*
  * ErrOutToClient --- sets whether to send error output to client or not.
  */
 int
@@ -2030,6 +2053,8 @@ ErrorData* CopyErrorData(void)
         newedata->column_name = pstrdup(newedata->column_name);
     if (newedata->cursor_name)
         newedata->cursor_name = pstrdup(newedata->cursor_name);
+    if (newedata->mysql_errno)
+        newedata->mysql_errno = pstrdup(newedata->mysql_errno);
     return newedata;
 }
 
@@ -2058,6 +2083,7 @@ void UpdateErrorData(ErrorData* edata, ErrorData* newData)
     FREE_POINTER(edata->table_name);
     FREE_POINTER(edata->column_name);
     FREE_POINTER(edata->cursor_name);
+    FREE_POINTER(edata->mysql_errno);
     MemoryContext oldcontext = MemoryContextSwitchTo(ErrorContext);
 
     edata->elevel = newData->elevel;
@@ -2089,6 +2115,7 @@ void UpdateErrorData(ErrorData* edata, ErrorData* newData)
     edata->table_name = pstrdup(newData->table_name);
     edata->column_name = pstrdup(newData->column_name);
     edata->cursor_name = pstrdup(newData->cursor_name);
+    edata->mysql_errno = pstrdup(newData->mysql_errno);
     MemoryContextSwitchTo(oldcontext);
 }
 
@@ -2171,6 +2198,10 @@ void FreeErrorData(ErrorData* edata)
     if (edata->cursor_name) {
         pfree(edata->cursor_name);
         edata->cursor_name = NULL;
+    }
+    if (edata->mysql_errno) {
+        pfree(edata->mysql_errno);
+        edata->mysql_errno = NULL;
     }
     pfree(edata);
 }
@@ -2283,6 +2314,8 @@ void ReThrowError(ErrorData* edata)
         newedata->column_name = pstrdup(newedata->column_name);
     if (newedata->cursor_name)
         newedata->cursor_name = pstrdup(newedata->cursor_name);
+    if (newedata->mysql_errno)
+        newedata->mysql_errno = pstrdup(newedata->mysql_errno);
     t_thrd.log_cxt.recursion_depth--;
     
     if (DB_IS_CMPT(B_FORMAT)) {
@@ -5036,7 +5069,7 @@ static char* mask_Password_internal(const char* query_string)
                         int lengthOfQuote = 0;
                         int yyvalLen = (yylval.str != NULL) ? (int)strlen(yylval.str) : 0;
                         for (int len = 0; len < length[i]; len++) {
-                            if (len < yyvalLen && (yylval.str[len] == '\'')) {
+                            if ((yylval.str != NULL) && len < yyvalLen && (yylval.str[len] == '\'')) {
                                 lengthOfQuote++;
                             }
                         }
@@ -5639,6 +5672,9 @@ static char* mask_Password_internal(const char* query_string)
             if (NULL != edata->cursor_name) {
                 pfree_ext(edata->cursor_name);
             }
+            if (NULL != edata->mysql_errno) {
+                pfree_ext(edata->mysql_errno);
+            }
             t_thrd.log_cxt.errordata_stack_depth--;
         }
     }
@@ -5864,85 +5900,6 @@ void copyErrorDataArea(ErrorDataArea *from, ErrorDataArea *to)
     }
     MemoryContextSwitchTo(oldcontext);
 }
-bool strcompare(char* str1, char* str2)
-{
-    if(str1 != NULL) {
-        if (str2 != NULL) {
-            if (strcmp(str1, str2) != 0) {
-                return false;
-            }
-        } else {
-            return true;
-        }
-    } else {
-        if (str2 != NULL) {
-            return false;
-        }
-    }
-    return true;
-}
-bool compareErrorData(DolphinErrorData* err1, ErrorData* err2)
-{
-    if (err1->elevel != errorLevelToDolphin(err2->elevel))
-        return false;
-    int errcode = MAKE_SQLSTATE(err1->errorcode[0],
-                                err1->errorcode[1],
-                                err1->errorcode[2],
-                                err1->errorcode[3],
-                                err1->errorcode[4]);
-    if((errcode == err2->sqlerrcode) && strcompare(err1->class_origin,err2->class_origin)
-        && strcompare(err1->subclass_origin,err2->subclass_origin) && strcompare(err1->constraint_catalog,err2->cons_catalog)
-        && strcompare(err1->constraint_schema,err2->cons_schema) && strcompare(err1->constraint_name,err2->cons_name)
-        && strcompare(err1->catalog_name,err2->catalog_name) && strcompare(err1->schema_name,err2->schema_name)
-        && strcompare(err1->table_name,err2->table_name) && strcompare(err1->column_name,err2->column_name)
-        && strcompare(err1->cursor_name,err2->cursor_name) && strcompare(err1->message_text,err2->message))
-        return true;
-    else
-        return false;
-}
-
-void copyDiffErrorDataArea(ErrorDataArea *from, ErrorDataArea *to, ErrorData *edata)
-{
-    cleanErrorDataArea(to);
-    bool is_same = false;
-    MemoryContext oldcontext;
-    int count = 0;
-
-    oldcontext = MemoryContextSwitchTo(u_sess->dolphin_errdata_ctx.dolphinErrorDataMemCxt);
-
-    ListCell *lc = NULL;
-    lc = list_head(from->sqlErrorDataList);
-    foreach (lc, from->sqlErrorDataList) {
-        DolphinErrorData *eData = (DolphinErrorData *)lfirst(lc);
-        is_same = compareErrorData(eData, edata);
-        if (is_same)
-            continue;
-        DolphinErrorData *newErrData = (DolphinErrorData *)palloc(sizeof(DolphinErrorData));
-        newErrData->elevel = eData->elevel;
-        newErrData->errorcode = pstrdup(eData->errorcode);
-        newErrData->sqlstatestr = pstrdup(eData->sqlstatestr);
-        newErrData->message_text = pstrdup(eData->message_text);
-        newErrData->class_origin = pstrdup(eData->class_origin);
-        newErrData->subclass_origin = pstrdup(eData->subclass_origin);
-        newErrData->constraint_catalog = pstrdup(eData->constraint_catalog);
-        newErrData->constraint_schema = pstrdup(eData->constraint_schema);
-        newErrData->constraint_name = pstrdup(eData->constraint_name);
-        newErrData->catalog_name = pstrdup(eData->catalog_name);
-        newErrData->schema_name = pstrdup(eData->schema_name);
-        newErrData->table_name = pstrdup(eData->table_name);
-        newErrData->column_name = pstrdup(eData->column_name);
-        newErrData->cursor_name = pstrdup(eData->cursor_name);
-        count++;
-        to->sqlErrorDataList = lappend(to->sqlErrorDataList, newErrData);
-    }
-    if (count != 0) {
-        to->current_edata_count = count;
-        for (int i = 0; i <= enum_dolphin_error_level::B_END; i++) {
-            to->current_edata_count_by_level[i] = from->current_edata_count_by_level[i];
-        }
-    }
-    MemoryContextSwitchTo(oldcontext);
-}
 
 void resetErrorDataArea(bool stacked, bool handler_active)
 {
@@ -5978,9 +5935,10 @@ enum_dolphin_error_level errorLevelToDolphin(int elevel)
 void pushErrorData(ErrorData *edata)
 {
     MemoryContext oldcontext;
-    if (edata->is_signal == PLpgSQL_signal_resignal::PLPGSQL_RESIGNAL_WITHOUT_SQLSTATE) {
+    if (edata->is_signal == PLpgSQL_signal_resignal::PLPGSQL_RESIGNAL_WITHOUT_SQLSTATE || edata->is_signal == PLpgSQL_signal_resignal::PLPGSQL_NORMAL) {
         /* resignal without sqlstate */
-        resetErrorDataArea(false, u_sess->dolphin_errdata_ctx.handler_active);
+        if (u_sess->dolphin_errdata_ctx.handler_active)
+            resetErrorDataArea(false, u_sess->dolphin_errdata_ctx.handler_active);
     } else if (edata->is_signal == PLpgSQL_signal_resignal::PLPGSQL_RESIGNAL_WITH_SQLSTATE) {
         /* resignal sqlstate */
         copyErrorDataArea(u_sess->dolphin_errdata_ctx.lastErrorDataArea, u_sess->dolphin_errdata_ctx.errorDataArea);
@@ -6012,10 +5970,10 @@ void pushErrorData(ErrorData *edata)
                 dolphinErrorData->class_origin = pstrdup(edata->class_origin);
                 dolphinErrorData->subclass_origin = pstrdup(edata->subclass_origin);
                 dolphinErrorData->sqlstatestr = pstrdup(edata->sqlstate);
-                char sqlerrcode [128];
-                int ret = sprintf_s(sqlerrcode, 128, "%d", edata->sqlerrcode);
-                securec_check_ss_c(ret, "\0", "\0");
-                dolphinErrorData->errorcode = pstrdup(sqlerrcode);
+                if (edata->mysql_errno == NULL)
+                    dolphinErrorData->errorcode = pstrdup(plpgsql_get_sqlstate(edata->sqlerrcode));
+                else
+                    dolphinErrorData->errorcode = pstrdup(edata->mysql_errno);
             } else {
                 dolphinErrorData->class_origin = pstrdup(class_origin);
                 dolphinErrorData->subclass_origin = pstrdup(subclass_origin);
@@ -6275,7 +6233,6 @@ void getDiagnosticsInfo(List* condInfo, bool hasCondNum, List* condNum)
             FreeStringInfo(&buf);
             return;
         }
-        int currIdx = 0;
         DolphinErrorData* eData = (DolphinErrorData *)list_nth(errorDataArea->sqlErrorDataList, conditionNum - 1);
         foreach(lc, condInfo) {
             CondInfo *cond = (CondInfo*)lfirst(lc);

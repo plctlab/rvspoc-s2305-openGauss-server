@@ -32,6 +32,7 @@ extern "C" {
 #endif
 
 #define SS_LIBDMS_NAME "libdms.so"
+#define CM_INVALID_ID8 0xff
 
 typedef struct st_ss_dms_func {
     bool inited;
@@ -65,7 +66,7 @@ typedef struct st_ss_dms_func {
     int (*dms_register_ssl_decrypt_pwd)(dms_decrypt_pwd_t cb_func);
     int (*dms_set_ssl_param)(const char *param_name, const char *param_value);
     int (*dms_get_ssl_param)(const char *param_name, char *param_value, unsigned int size);
-    int (*dms_recovery_page_need_skip)(char pageid[DMS_PAGEID_SIZE], unsigned char *skip);
+    int (*dms_recovery_page_need_skip)(char pageid[DMS_PAGEID_SIZE], unsigned char *skip, unsigned int alloc);
     int (*dms_reform_failed)(void);
     int (*dms_switchover)(unsigned int sess_id);
     int (*dms_drc_accessible)(unsigned char res_type);
@@ -84,6 +85,8 @@ typedef struct st_ss_dms_func {
     int (*dms_reform_req_opengauss_ondemand_redo_buffer)(dms_context_t *dms_ctx, void *block_key, unsigned int key_len,
         int *redo_status);
     unsigned int (*dms_get_mes_max_watting_rooms)(void);
+    int (*dms_send_opengauss_oldest_xmin)(dms_context_t *dms_ctx, unsigned long long oldest_xmin, unsigned char dest_id);
+    int (*dms_get_drc_info)(int* is_found, stat_drc_info_t* drc_info);
 } ss_dms_func_t;
 
 int ss_dms_func_init();
@@ -116,7 +119,7 @@ int drc_get_page_master_id(char pageid[DMS_PAGEID_SIZE], unsigned char *master_i
 int dms_register_ssl_decrypt_pwd(dms_decrypt_pwd_t cb_func);
 int dms_set_ssl_param(const char *param_name, const char *param_value);
 int dms_get_ssl_param(const char *param_name, char *param_value, unsigned int size);
-int dms_recovery_page_need_skip(char pageid[DMS_PAGEID_SIZE], unsigned char *skip);
+int dms_recovery_page_need_skip(char pageid[DMS_PAGEID_SIZE], unsigned char *skip, unsigned int alloc);
 int dms_reform_failed(void);
 int dms_switchover(unsigned int sess_id);
 int dms_drc_accessible(unsigned char res_type);
@@ -131,6 +134,10 @@ void dms_validate_drc(dms_context_t *dms_ctx, dms_buf_ctrl_t *ctrl, unsigned lon
 int dms_reform_req_opengauss_ondemand_redo_buffer(dms_context_t *dms_ctx, void *block_key, unsigned int key_len,
                                                   int *redo_status);
 unsigned int dms_get_mes_max_watting_rooms(void);
+int dms_send_opengauss_oldest_xmin(dms_context_t *dms_ctx, unsigned long long oldest_xmin, unsigned char dest_id);
+
+int get_drc_info(int* is_found, stat_drc_info_t* drc_info);
+
 #ifdef __cplusplus
 }
 #endif

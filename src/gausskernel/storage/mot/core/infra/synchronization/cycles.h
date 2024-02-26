@@ -55,6 +55,10 @@ public:
         unsigned long cval = 0;
         asm volatile("isb; mrs %0, cntvct_el0" : "=r"(cval) : : "memory");
         return cval;
+#elif defined(__riscv64)
+	unsigned long cval = 0;
+	asm volatile ("rdcycle %0" : "=r" (dst) );
+	return cval;
 #else
 #error "Unsupported CPU architecture or compiler."
 #endif
@@ -75,6 +79,10 @@ public:
         unsigned long cval = 0;
         asm volatile("isb; mrs %0, cntvct_el0" : "=r"(cval) : : "memory");
         return cval;
+#elif defined(__riscv64)
+	unsigned long cval = 0;
+	asm volatile ("rdcycle %0" : "=r" (dst) );
+	return cval;
 #else
 #error "Unsupported CPU architecture or compiler."
 #endif

@@ -37,6 +37,7 @@
 #include "access/multixact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_matview.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
@@ -3664,6 +3665,13 @@ void RemoveRelations(DropStmt* drop, StringInfo tmp_queryString, RemoteQueryExec
         }
 
         delrel = try_relation_open(relOid, NoLock);
+        /*Not allow to drop mlog*/
+        if (relkind == RELKIND_RELATION && delrel != NULL && ISMLOG(delrel->rd_rel->relname.data)) {
+            /*If we can find a base table, it is mlog.*/
+            if (get_matview_mlog_baserelid(relOid)!= InvalidOid)
+                ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Use 'Drop table' to drop mlog table %s is not allowed.",delrel->rd_rel->relname.data)));
+        }
         /*
          * Open up drop table command for table being redistributed right now.
          *
@@ -21921,6 +21929,51 @@ void RangeVarCallbackOwnsTable(const RangeVar* relation, Oid relId, Oid oldRelId
 }
 
 /*
+ * This is intended as a callback for RangeVarGetRelidExtended().  It allows
+ * the relation to be locked only if (1) it's a materialized view and
+ * (2) the current user is the owner (or the superuser).
+ * This meets the permission-checking needs of and REFRESH MATERIALIZED VIEW;
+ * we expose it here so that it can be used by all.
+ */
+void RangeVarCallbackOwnsMatView(const RangeVar* relation, Oid relId, Oid oldRelId, bool target_is_partition, void* arg)
+{
+    char relkind;
+
+    /* Nothing to do if the relation was not found. */
+    if (!OidIsValid(relId)) {
+        return;
+    }
+
+    /*
+     * If the relation does exist, check whether it's an index.  But note that
+     * the relation might have been dropped between the time we did the name
+     * lookup and now.	In that case, there's nothing to do.
+     */
+    relkind = get_rel_relkind(relId);
+    if (!relkind) {
+        return;
+    }
+    if (relkind != RELKIND_RELATION &&
+        relkind != RELKIND_TOASTVALUE &&
+        relkind != RELKIND_MATVIEW) {
+        ereport(ERROR,
+                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmsg("\"%s\" is not a table or materialized view", relation->relname)));
+    }
+
+    /* Check permissions */
+    AclResult aclresult = pg_class_aclcheck(relId, GetUserId(), ACL_INSERT | ACL_DELETE);
+    if (aclresult != ACLCHECK_OK) {
+        aclcheck_error(aclresult, ACL_KIND_CLASS, relation->relname);
+    }
+
+    bool is_owner = pg_class_ownercheck(relId, GetUserId());
+    if (!is_owner) {
+        aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS, relation->relname);
+    }
+}
+
+/*
  * Callback to RangeVarGetRelidExtended(), similar to
  * RangeVarCallbackOwnsTable() but without checks on the type of the relation.
  */
@@ -31270,12 +31323,6 @@ void CreateWeakPasswordDictionary(CreateWeakPasswordDictionaryStmt* stmt)
     }
 
     rel = heap_open(GsGlobalConfigRelationId, RowExclusiveLock);
-    if (!OidIsValid(rel)) {
-        ereport(ERROR, 
-            (errcode(ERRCODE_SYSTEM_ERROR),
-                errmsg("could not open gs_global_config")));
-        return;
-    }
 
     foreach (pwd_obj, stmt->weak_password_string_list) {
         Datum values[Natts_gs_global_config] = {0};

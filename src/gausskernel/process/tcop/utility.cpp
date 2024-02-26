@@ -643,7 +643,7 @@ void PreventCommandDuringRecovery(const char* cmd_name)
                 errmsg("cannot execute %s during recovery", cmd_name)));
 }
 
-void PreventCommandDuringSSOndemandRecovery(Node* parseTree)
+void PreventCommandDuringSSOndemandRedo(Node* parseTree)
 {
     switch(nodeTag(parseTree)) {
         case T_InsertStmt:
@@ -8876,9 +8876,11 @@ const char* CreateCommandTag(Node* parse_tree)
             tag = "COPY";
             break;
 
-        case T_RenameStmt:
-            tag = AlterObjectTypeCommandTag(((RenameStmt*)parse_tree)->renameType);
+        case T_RenameStmt: {
+            ObjectType RenameType = ((RenameStmt*)parse_tree)->renameType == OBJECT_COLUMN ? ((RenameStmt*)parse_tree)->relationType:((RenameStmt*)parse_tree)->renameType;
+            tag = AlterObjectTypeCommandTag(RenameType);
             break;
+        }
 
         case T_AlterObjectSchemaStmt:
             tag = AlterObjectTypeCommandTag(((AlterObjectSchemaStmt*)parse_tree)->objectType);

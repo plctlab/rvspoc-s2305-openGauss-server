@@ -73,6 +73,7 @@
 #include "postmaster/barrier_creator.h"
 #include "pgxc/barrier.h"
 #include "ddes/dms/ss_dms_recovery.h"
+#include "ddes/dms/ss_xmin.h"
 
 const int NUM_PERCENTILE_COUNT = 2;
 const int INIT_NUMA_ALLOC_COUNT = 32;
@@ -148,6 +149,7 @@ typedef struct knl_g_cost_context {
 
 enum plugin_vecfunc_type {
     DOLPHIN_VEC = 0,
+    WHALE_VEC,
 
     /* 
      * This is the number of vecfunc hash tables.
@@ -214,9 +216,11 @@ typedef struct knl_g_pid_context {
     ThreadId LogicalReadWorkerPID;
     ThreadId LogicalDecoderWorkerPID;
     ThreadId BarrierPreParsePID;
+    ThreadId exrto_recycler_pid;
     ThreadId ApplyLauncerPID;
     ThreadId StackPerfPID;
     ThreadId CfsShrinkerPID;
+    ThreadId DmsAuxiliaryPID;
 } knl_g_pid_context;
 
 typedef struct {
@@ -722,6 +726,15 @@ typedef struct knl_g_parallel_decode_context {
     ErrorData *edata;
 } knl_g_parallel_decode_context;
 
+typedef struct _ExrtoSnapshotData* ExrtoSnapshot;
+
+typedef struct _StandbyReadDelayDdlState {
+    uint64 next_index_need_unlink;
+    uint64 next_index_can_insert;
+    uint32 delete_stat;
+    uint32 insert_stat;
+} StandbyReadDelayDdlState;
+
 typedef struct knl_g_parallel_redo_context {
     RedoType redoType;
     volatile knl_parallel_redo_state state;
@@ -743,8 +756,16 @@ typedef struct knl_g_parallel_redo_context {
     char* ali_buf;
     XLogRedoNumStatics xlogStatics[RM_NEXT_ID][MAX_XLOG_INFO_NUM];
     RedoCpuBindControl redoCpuBindcontrl;
-
     HTAB **redoItemHash; /* used in ondemand extreme RTO */
+    /* extreme-rto standby read */
+    TransactionId exrto_recyle_xmin;
+    XLogRecPtr global_recycle_lsn;
+    ExrtoSnapshot exrto_snapshot;
+    TimestampTz exrto_send_lsn_forworder_time;
+    StandbyReadDelayDdlState standby_read_delay_ddl_stat;
+    uint64 max_clog_pageno;
+    int *buffer_pin_wait_buf_ids;
+    int buffer_pin_wait_buf_len;
 } knl_g_parallel_redo_context;
 
 typedef struct knl_g_heartbeat_context {
@@ -898,6 +919,7 @@ typedef struct knl_g_xlog_context {
     void *shareStorageXLogCtlOrigin;
     ShareStorageOperateCtl shareStorageopCtl;
     int shareStorageLockFd;
+    ShareStorageXLogCtl *ssReplicationXLogCtl;
 } knl_g_xlog_context;
 
 typedef struct knl_g_undo_context {
@@ -914,6 +936,8 @@ typedef struct knl_g_undo_context {
     pg_atomic_uint64         globalFrozenXid;
     /* Oldest transaction id which is having undo. */
     pg_atomic_uint64         globalRecycleXid;
+    pg_atomic_uint64         hotStandbyRecycleXid;
+    bool                     is_exrto_residual_undo_file_recycled;
 } knl_g_undo_context;
 
 typedef struct knl_g_flashback_context {
@@ -1193,12 +1217,12 @@ typedef struct knl_g_datadir_context {
     char xlogDir[MAXPGPATH];
     char controlPath[MAXPGPATH];
     char controlBakPath[MAXPGPATH];
+    char controlInfoPath[MAXPGPATH];
     knl_g_dwsubdatadir_context dw_subdir_cxt;
 } knl_g_datadir_context;
 
 typedef struct knl_g_dms_context {
     uint32 dmsProcSid;
-    uint64 xminAck;
     dms_status_t dms_status;
     ClusterNodeState SSClusterState;
     ss_reformer_ctrl_t SSReformerControl;  // saved in disk; saved by primary
@@ -1212,8 +1236,14 @@ typedef struct knl_g_dms_context {
     bool resetSyscache;
     bool finishedRecoverOldPrimaryDWFile;
     bool dw_init;
+    uint64 latest_snapshot_xmin;
+    uint64 latest_snapshot_xmax;
+    uint64 latest_snapshot_csn;
+    slock_t set_snapshot_mutex;
     char dmsInstAddr[MAX_REPLNODE_NUM][DMS_MAX_IP_LEN];
     char conninfo[MAXPGPATH];
+    ss_dfx_stats_t SSDFxStats;
+    ss_xmin_info_t SSXminInfo;
 } knl_g_dms_context;
 
 typedef struct knl_instance_context {
@@ -1345,6 +1375,9 @@ typedef struct knl_instance_context {
     void *raw_parser_hook[DB_CMPT_MAX];
     char *llvmIrFilePath[DB_CMPT_MAX];
     pthread_mutex_t loadPluginLock[DB_CMPT_MAX];
+
+    List* needCheckConflictSubIds;
+    pthread_mutex_t subIdsLock;
 #endif
     pg_atomic_uint32 extensionNum;
     knl_g_audit_context audit_cxt;
@@ -1387,4 +1420,3 @@ extern void add_numa_alloc_info(void* numaAddr, size_t length);
 #define DEFAULT_CREATE_GLOBAL_INDEX (u_sess->attr.attr_storage.default_index_kind == DEFAULT_INDEX_KIND_GLOBAL)
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_H_ */
-

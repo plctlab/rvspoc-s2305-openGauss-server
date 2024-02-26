@@ -2431,7 +2431,7 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
 
         /* check for bogus TID */
         if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(dp)) {
-            break;
+            return false;
         }
 
         lp = PageGetItemId(dp, offnum);
@@ -2445,7 +2445,7 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
                 continue;
             }
             /* else must be end of chain */
-            break;
+            return false;
         }
 
         /*
@@ -2468,7 +2468,7 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
          * Shouldn't see a HEAP_ONLY tuple at chain start.
          */
         if (at_chain_start && HeapTupleIsHeapOnly(heap_tuple)) {
-            break;
+            return false;
         }
 
         /*
@@ -2476,7 +2476,7 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
          * broken.
          */
         if (TransactionIdIsValid(prev_xmax) && !TransactionIdEquals(prev_xmax, HeapTupleGetRawXmin(heap_tuple))) {
-            break;
+            return false;
         }
 
         /*
@@ -2557,7 +2557,7 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
             at_chain_start = false;
             prev_xmax = HeapTupleGetUpdateXid(heap_tuple);
         } else {
-            break; /* end of chain */
+            return false; /* end of chain */
         }
     }
     return false;
@@ -8737,6 +8737,10 @@ static void heap_xlog_cleanup_info(XLogReaderState* record)
     RelFileNode tmp_node;
     RelFileNodeCopy(tmp_node, xlrec->node, XLogRecGetBucketId(record));
 
+    if (IsExtremeRedo()) {
+        return;
+    }
+
     if (InHotStandby && g_supportHotStandby) {
         XLogRecPtr lsn = record->EndRecPtr;
         ResolveRecoveryConflictWithSnapshot(xlrec->latestRemovedXid, tmp_node, lsn);
@@ -10324,4 +10328,3 @@ HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead, bool* has
 
     return NULL;
 }
-

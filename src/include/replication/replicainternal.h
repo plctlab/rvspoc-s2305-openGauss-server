@@ -104,7 +104,8 @@ typedef enum {
     COPY_SECURE_FILES_BUILD,
     CROSS_CLUSTER_FULL_BUILD,
     CROSS_CLUSTER_INC_BUILD,
-    CROSS_CLUSTER_STANDBY_FULL_BUILD
+    CROSS_CLUSTER_STANDBY_FULL_BUILD,
+    BUILD_CHECK
 } BuildMode;
 
 typedef struct buildstate {
@@ -212,6 +213,13 @@ typedef enum replauthmode{
     REPL_AUTH_DEFAULT = 0, /* no extra replication auth */
     REPL_AUTH_UUID /* uuid auth */
 } ReplAuthMode;
+
+typedef enum
+{
+    RESOLVE_ERROR,
+    RESOLVE_APPLY_REMOTE,
+    RESOLVE_KEEP_LOCAL
+} PGLogicalResolveOption;
 
 extern bool data_catchup;
 extern bool wal_catchup;

@@ -11,28 +11,13 @@ export LD_LIBRARY_PATH=$prefix/lib:$prefix/lib/libobs:$LD_LIBRARY_PATH
 export PATH="$prefix/bin":$PATH
 export g_data_path="$install_path/hadata"
 
-eth0ip=`/sbin/ifconfig eth0|sed -n 2p|awk  '{ print $2 }'`
-eth1ip=`/sbin/ifconfig eth1|sed -n 2p|awk  '{ print $2 }'`
-ethens=`/sbin/ifconfig ens4f0|sed -n 2p |awk  '{ print $2 }'`
-enp2s0f0=`/sbin/ifconfig enp2s0f0|sed -n 2p |awk  '{ print $2 }'`
-enp2s0f1=`/sbin/ifconfig enp2s0f1|sed -n 2p |awk  '{ print $2 }'`
-enp125s0f0=`/sbin/ifconfig enp125s0f0|sed -n 2p |awk  '{ print $2 }'`
+eth0ip=`/sbin/ifconfig | grep 'inet ' | grep -v 127.0.0.1 | head -1 | awk '{ print $2 }'`
 
 if [ -n "$eth0ip" ]; then
-        export eth_local_ip=$eth0ip
-elif [ -n "$eth1ip" ];then
-        export eth_local_ip=$eth1ip
-elif [ -n "$ethens" ];then
-        export eth_local_ip=$eth1ip
-elif [ -n "$enp2s0f0" ];then
-        export eth_local_ip=$enp2s0f0
-elif [ -n "$enp2s0f1" ];then
-        export eth_local_ip=$enp2s0f1
-elif [ -n "$enp125s0f0" ];then
-        export eth_local_ip=$enp125s0f0
+    export eth_local_ip=$eth0ip
 else
-     echo "error eth0 and eth1 not configured,exit"
-     exit 1
+    echo "error eth0 and eth1 not configured,exit"
+    exit 1
 fi
 
 export g_local_ip="127.0.0.1"
@@ -488,8 +473,12 @@ function check_multi_standby_startup()
 }
 function start_standby()
 {
+cluster_mode_param=""
+if [-n "$1" ]; then
+  cluster_mode_param=$1
+fi
 echo "start standby $standby_data_dir"
-$bin_dir/gaussdb --single_node  -M standby -p $dn1_standby_port -D $standby_data_dir > ./results/gaussdb.log 2>&1 &
+$bin_dir/gaussdb --single_node  -M standby -p $dn1_standby_port -D $standby_data_dir $cluster_mode_param > ./results/gaussdb.log 2>&1 &
 check_standby_startup
 }
 
@@ -502,15 +491,23 @@ sleep 10
 
 function start_standby2()
 {
+  cluster_mode_param=""
+  if [-n "$1" ]; then
+    cluster_mode_param=$1
+  fi
   echo "start standby2 $standby2_data_dir"
-  $bin_dir/gaussdb --single_node -M standby -p $standby2_port -D $standby2_data_dir > ./results/gaussdb.log 2>&1 &
+  $bin_dir/gaussdb --single_node -M standby -p $standby2_port -D $standby2_data_dir $cluster_mode_param > ./results/gaussdb.log 2>&1 &
   sleep 10
 }
 
 function start_standby3()
 {
+  cluster_mode_param=""
+  if [-n "$1" ]; then
+    cluster_mode_param=$1
+  fi
   echo "start standby3 $standby3_data_dir"
-  $bin_dir/gaussdb --single_node -M standby -p $standby3_port -D $standby3_data_dir > ./results/gaussdb.log 2>&1 &
+  $bin_dir/gaussdb --single_node -M standby -p $standby3_port -D $standby3_data_dir $cluster_mode_param > ./results/gaussdb.log 2>&1 &
   sleep 10
 }
 
@@ -523,15 +520,23 @@ function start_standby4()
 
 function start_primary_as_primary()
 {
+cluster_mode_param=""
+if [-n "$1" ]; then
+  cluster_mode_param=$1
+fi
 echo "start primary $primary_data_dir as primary"
-$bin_dir/gaussdb --single_node  -M primary -p $dn1_primary_port -D $primary_data_dir > ./results/gaussdb.log 2>&1 &
+$bin_dir/gaussdb --single_node  -M primary -p $dn1_primary_port -D $primary_data_dir $cluster_mode_param > ./results/gaussdb.log 2>&1 &
 check_primary_startup
 }
 
 function start_primary_as_standby()
 {
+cluster_mode_param=""
+if [-n "$1" ]; then
+  cluster_mode_param=$1
+fi
 echo "start primary $primary_data_dir as standby"
-$bin_dir/gaussdb --single_node  -M standby -p $dn1_primary_port -D $primary_data_dir > ./results/gaussdb.log 2>&1 &
+$bin_dir/gaussdb --single_node  -M standby -p $dn1_primary_port -D $primary_data_dir $cluster_mode_param > ./results/gaussdb.log 2>&1 &
 check_primary_startup
 }
 
@@ -544,8 +549,12 @@ check_standby_startup
 
 function start_standby2_as_primary()
 {
+cluster_mode_param=""
+if [-n "$1" ]; then
+  cluster_mode_param=$1
+fi
 echo "start standby $standby2_data_dir as primary"
-$bin_dir/gaussdb --single_node  -M primary -p $standby2_port -D $standby2_data_dir > ./results/gaussdb.log 2>&1 &
+$bin_dir/gaussdb --single_node  -M primary -p $standby2_port -D $standby2_data_dir $cluster_mode_param > ./results/gaussdb.log 2>&1 &
 check_standby2_startup
 }
 

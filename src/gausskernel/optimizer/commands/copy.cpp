@@ -1251,7 +1251,8 @@ void VerifyEncoding(int encoding)
 {
     Oid proc;
 
-    if (encoding == GetDatabaseEncoding() || encoding == PG_SQL_ASCII || GetDatabaseEncoding() == PG_SQL_ASCII)
+    if (encoding == GetDatabaseEncoding() || encoding == PG_SQL_ASCII || GetDatabaseEncoding() == PG_SQL_ASCII ||
+        (GetDatabaseEncoding() == PG_GB18030_2022 && encoding == PG_GB18030))
         return;
 
     proc = FindDefaultConversionProc(encoding, GetDatabaseEncoding());
@@ -3547,6 +3548,7 @@ void BulkloadErrorCallback(void* arg)
                 cstate->cur_lineno,
                 cstate->cur_attname,
                 lineval);
+            pfree_ext(lineval);
         } else {
             /* error is relevant to a particular line */
             if (cstate->line_buf_converted || !cstate->need_transcoding) {
@@ -6449,8 +6451,8 @@ bool NextCopyFrom(CopyState cstate, ExprContext* econtext, Datum* values, bool* 
                  * 1. A db SQL compatibility requires; or
                  * 2. This column donesn't accept any empty string.
                  */
-                if ((u_sess->attr.attr_sql.sql_compatibility == A_FORMAT || !accept_empty_str[m]) &&
-                    (string != NULL && string[0] == '\0')) {
+                if (((u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !ACCEPT_EMPTY_STR) ||
+                    !accept_empty_str[m]) && (string != NULL && string[0] == '\0')) {
                     /* for any type, '' = null */
                     string = NULL;
                 }
@@ -6982,6 +6984,24 @@ static bool CopyReadLineTextTemplate(CopyState cstate)
         if (raw_buf_ptr < copy_buf_len) {
             sec = copy_raw_buf[raw_buf_ptr];
         }
+        if (IS_TEXT(cstate) && (cstate->copy_dest == COPY_NEW_FE) && !cstate->is_load_copy) {
+            if (c == '\\') {
+                char c2;
+                IF_NEED_REFILL_AND_NOT_EOF_CONTINUE(0);
+
+                /* get next character */
+                c2 = copy_raw_buf[raw_buf_ptr];
+
+                /*
+                 * If the following character is a newline or CRLF,
+                 * skip the '\\'.
+                 */
+                if (c2 == '\n' || c2 == '\r' ||
+                    (c2 == '\r' && (raw_buf_ptr + 1) < copy_buf_len && copy_raw_buf[raw_buf_ptr + 1] == '\n')) {
+                    continue;
+                }
+            }
+        }
 
         if (csv_mode) {
             /*
@@ -7416,6 +7436,8 @@ static int CopyReadAttributesTextT(CopyState cstate)
         int input_len;
         bool saw_non_ascii = false;
         proc_col_num++;
+        int byte_count = 0;
+        int pos = 0;
 
         /* Make sure there is enough space for the next value */
         if (fieldno >= cstate->max_fields) {
@@ -7469,8 +7491,29 @@ static int CopyReadAttributesTextT(CopyState cstate)
                 found_delim = true;
                 break;
             }
+            if (PG_GB18030 == GetDatabaseEncoding() || PG_GB18030_2022 == GetDatabaseEncoding()) {
+                if (pos == byte_count) {
+                    unsigned char c1 = (unsigned char)(c);
+                    if (c1 < (unsigned char)0x80) {
+                        byte_count = 1;
+                    } else if (c1 >= (unsigned char)0x81 && c1 <= (unsigned char)0xFE) {
+                        char nextc = *cur_ptr;
+                        unsigned char nextc1 = (unsigned char)(nextc);
+                        if (nextc1 >= (unsigned char)0x30 && nextc1 <= (unsigned char)0x39) {
+                            byte_count = 4;
+                        } else {
+                            byte_count = 2;
+                        }
+                    } else {
+                        ereport(ERROR, (errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+                            errmsg("invalid character encoding in gb18030 or gb18030_2022")));
+                    }
+                    pos = 0;
+                }
+                pos++;
+            }
 
-            if (c == '\\' && !cstate->without_escaping) {
+            if (c == '\\' && !cstate->without_escaping && byte_count != 2) {
                 if (cur_ptr >= line_end_ptr) {
                     break;
                 }
@@ -8776,7 +8819,7 @@ bool StrToInt32(const char* s, int *val)
     return true;
 }
 
-char* TrimStr(const char* str)
+char* TrimStrQuote(const char* str, bool isQuote)
 {
     if (str == NULL) {
         return NULL;
@@ -8804,10 +8847,22 @@ char* TrimStr(const char* str)
     }
 
     len = end - begin + 1;
+
+    if (isQuote && len>=2 && *begin == '"' && *end == '"') {
+        begin++;
+        end--;
+        len = end - begin + 1;
+    }
+
     rc = memmove_s(cpyStr, strlen(cpyStr), begin, len);
     securec_check(rc, "\0", "\0");
     cpyStr[len] = '\0';
     return cpyStr;
+}
+
+char* TrimStr(const char* str) 
+{
+    return TrimStrQuote(str, false);
 }
 
 /* Deserialize the LOCATION options into locations list.
