@@ -279,6 +279,7 @@ extern Datum int4setle(PG_FUNCTION_ARGS);
 extern Datum int4setge(PG_FUNCTION_ARGS);
 extern Datum findinset(PG_FUNCTION_ARGS);
 extern Datum btint8sortsupport(PG_FUNCTION_ARGS);
+extern void check_duplicate_value_by_collation(List* vals, Oid collation, char type);
 
 /* int.c */
 extern Datum int2in(PG_FUNCTION_ARGS);
@@ -1346,6 +1347,7 @@ extern Datum int1_numeric(PG_FUNCTION_ARGS);
 extern Datum numeric_int1(PG_FUNCTION_ARGS);
 extern Datum float8_numeric(PG_FUNCTION_ARGS);
 extern Datum float8_interval(PG_FUNCTION_ARGS);
+extern Datum float8_to_interval(PG_FUNCTION_ARGS);
 extern Datum numeric_float8(PG_FUNCTION_ARGS);
 extern Datum numeric_float8_no_overflow(PG_FUNCTION_ARGS);
 extern Datum float4_numeric(PG_FUNCTION_ARGS);
@@ -1397,9 +1399,13 @@ extern Datum width_bucket_numeric(PG_FUNCTION_ARGS);
 extern Datum hash_numeric(PG_FUNCTION_ARGS);
 extern Datum numtodsinterval(PG_FUNCTION_ARGS);
 extern Datum numeric_interval(PG_FUNCTION_ARGS);
+extern Datum numeric_to_interval(PG_FUNCTION_ARGS);
 extern Datum int1_interval(PG_FUNCTION_ARGS);
 extern Datum int2_interval(PG_FUNCTION_ARGS);
 extern Datum int4_interval(PG_FUNCTION_ARGS);
+extern Datum int1_to_interval(PG_FUNCTION_ARGS);
+extern Datum int2_to_interval(PG_FUNCTION_ARGS);
+extern Datum int4_to_interval(PG_FUNCTION_ARGS);
 
 /* ri_triggers.c */
 extern Datum RI_FKey_check_ins(PG_FUNCTION_ARGS);
@@ -1829,6 +1835,7 @@ extern Datum pg_show_replication_origin_status(PG_FUNCTION_ARGS);
 extern Datum btequalimage(PG_FUNCTION_ARGS);
 /* varlena.cpp */
 extern Datum btvarstrequalimage(PG_FUNCTION_ARGS);
+extern Datum text_interval(PG_FUNCTION_ARGS);
 
 /* pg_publication.cpp */
 extern Datum pg_get_publication_tables(PG_FUNCTION_ARGS);
@@ -1851,7 +1858,7 @@ extern Datum compress_buffer_stat_info(PG_FUNCTION_ARGS);
 extern Datum compress_ratio_info(PG_FUNCTION_ARGS);
 extern Datum compress_statistic_info(PG_FUNCTION_ARGS);
 extern Datum pg_read_binary_file_blocks(PG_FUNCTION_ARGS);
-
+extern Datum dss_io_stat(PG_FUNCTION_ARGS);
 #else
 #endif
 extern char *pg_ultostr(char *str, uint32 value);

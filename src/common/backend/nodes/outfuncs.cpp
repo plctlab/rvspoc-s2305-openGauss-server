@@ -2344,6 +2344,9 @@ static void _outParam(StringInfo str, Param* node)
         WRITE_NODE_FIELD(tableOfIndexTypeList);
     }
 
+    if (t_thrd.proc->workingVersionNum >= PARAM_MARK_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_bind_param);
+    }
 }
 
 static void _outRownum(StringInfo str, const Rownum* node)
@@ -4273,6 +4276,14 @@ static void _outPLDebug_frame(StringInfo str, PLDebug_frame* node)
     WRITE_INT_FIELD(lineno);
     WRITE_STRING_FIELD(query);
     WRITE_INT_FIELD(funcoid);
+}
+
+static void _outPLDebug_codeline(StringInfo str, PLDebug_codeline* node)
+{
+    WRITE_NODE_TYPE("PLDEBUG_CODELINE");
+    WRITE_INT_FIELD(lineno);
+    WRITE_STRING_FIELD(code);
+    WRITE_BOOL_FIELD(canBreak);
 }
 
 /*
@@ -6966,6 +6977,9 @@ static void _outNode(StringInfo str, const void* obj)
                 break;
             case T_PLDebug_frame:
                 _outPLDebug_frame(str, (PLDebug_frame*) obj);
+                break;
+            case T_PLDebug_codeline:
+                _outPLDebug_codeline(str, (PLDebug_codeline*) obj);
                 break;
             case T_CharsetCollateOptions:
                 _outCharsetcollateOptions(str, (CharsetCollateOptions*)obj);

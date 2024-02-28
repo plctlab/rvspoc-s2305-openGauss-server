@@ -201,6 +201,9 @@ NON_EXEC_STATIC void JobScheduleMain()
     /* Initialize openGauss with DEFAULT_DATABASE, since it cannot be dropped */
     t_thrd.proc_cxt.PostInit->SetDatabaseAndUser(dbname, InvalidOid, username);
     t_thrd.proc_cxt.PostInit->InitJobScheduler();
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+    LoadSqlPlugin();
+#endif
 
 #ifdef PGXC /* PGXC_COORD */
     /*
@@ -520,7 +523,7 @@ static void jobschd_sighup_handler(SIGNAL_ARGS)
 static void jobschd_sigusr2_handler(SIGNAL_ARGS)
 {
     int save_errno = errno;
-    elog(LOG, "Job scheduler received sigusr2 when job worker startup failed.");
+    write_stderr("Job scheduler received sigusr2 when job worker startup failed.");
 
     t_thrd.job_cxt.got_SIGUSR2 = true;
     if (t_thrd.proc) {

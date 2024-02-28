@@ -89,6 +89,7 @@ static void knl_u_analyze_init(knl_u_analyze_context* anl_cxt)
     anl_cxt->autoanalyze_process = NULL;
     anl_cxt->autoanalyze_timeinfo = NULL;
     anl_cxt->vac_strategy = (BufferAccessStrategyData*)palloc0(sizeof(BufferAccessStrategyData));
+    anl_cxt->DeclareCursorName = NULL;
 }
 
 static void knl_u_attr_init(knl_session_attr* attr)
@@ -869,6 +870,7 @@ static void knl_u_plpgsql_init(knl_u_plpgsql_context* plsql_cxt)
     plsql_cxt->cur_exception_cxt = NULL;
     plsql_cxt->pragma_autonomous = false;
     plsql_cxt->is_insert_gs_source = false;
+    plsql_cxt->CursorRecordTypeList = NIL;
 }
 
 static void knl_u_stat_init(knl_u_stat_context* stat_cxt)
@@ -914,6 +916,8 @@ static void knl_u_stat_init(knl_u_stat_context* stat_cxt)
     size = sizeof(int64) * TOTAL_TIME_INFO_TYPES;
     stat_cxt->localTimeInfoArray = (int64*)palloc0(size);
     stat_cxt->localNetInfo = (uint64*)palloc0(sizeof(uint64) * TOTAL_NET_INFO_TYPES);
+    stat_cxt->og_record_stat = New(CurrentMemoryContext) OgRecordStat(stat_cxt->localTimeInfoArray,
+            stat_cxt->localNetInfo);
 
     stat_cxt->trackedMemChunks = 0;
     stat_cxt->trackedBytes = 0;
@@ -952,6 +956,9 @@ static void knl_u_storage_init(knl_u_storage_context* storage_cxt)
 
     /* var in knl_uundofile.cpp */
     storage_cxt->UndoFileCxt = NULL;
+
+    /* var in storage_exrto_file.cpp */
+    storage_cxt->exrto_standby_read_file_cxt = NULL;
 
     /* var in sync.cpp */
     storage_cxt->pendingUnlinks = NIL;

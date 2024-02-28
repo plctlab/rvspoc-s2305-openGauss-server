@@ -72,9 +72,11 @@
 #include "replication/worker_internal.h"
 #include "replication/origin.h"
 #include "replication/libpqsw.h"
+#include "og_record_time.h"
 #include "catalog/pg_subscription.h"
 #include "port/pg_crc32c.h"
 #include "ddes/dms/ss_common_attr.h"
+#include "ddes/dms/ss_txnstatus.h"
 
 #define MAX_PATH_LEN 1024
 extern const int g_reserve_param_num;
@@ -779,6 +781,7 @@ typedef struct knl_t_xlog_context {
     /* for switchover failed when load xlog record invalid retry count */
     int currentRetryTimes;
     RedoTimeCost timeCost[TIME_COST_NUM];
+    int ssXlogReadFailedTimes;
 } knl_t_xlog_context;
 
 typedef struct knl_t_dfs_context {
@@ -1553,6 +1556,7 @@ typedef struct knl_t_undorecycler_context {
     /* Flags set by signal handlers */
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
+    bool is_recovery_in_progress;
 } knl_t_undorecycler_context;
 
 typedef struct knl_t_rollback_requests_context {
@@ -1692,6 +1696,7 @@ typedef struct knl_t_postgres_context {
     bool clear_key_memory;
 
     const char* debug_query_string; /* client-supplied query string */
+    NodeTag cur_command_tag; /* current execute sql nodetag */
     bool isInResetUserName;
 
     /* Note: whereToSendOutput is initialized for the bootstrap/standalone case */
@@ -1937,12 +1942,38 @@ typedef struct knl_t_conn_context {
     const char* _float_inf;
 } knl_t_conn_context;
 
+typedef struct _DelayInvalidMsg {
+    SharedInvalidationMessage* inval_msgs;
+    int nmsgs;
+    uint32 xinfo;
+    Oid db_id;
+    Oid ts_id;
+    XLogRecPtr lsn;
+    bool relcache_init_file_inval;
+    bool valid;
+} DelayInvalidMsg;
+
 typedef struct {
     volatile sig_atomic_t shutdown_requested;
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t sleep_long;
     volatile sig_atomic_t check_repair;
+    void *redo_worker_ptr;
+    DelayInvalidMsg invalid_msg;
 } knl_t_page_redo_context;
+
+typedef struct _StandbyReadLsnInfoArray {
+    XLogRecPtr *lsn_array;
+    uint32 lsn_num;
+    XLogRecPtr base_page_lsn;
+    uint64 base_page_pos;
+} StandbyReadLsnInfoArray;
+
+typedef struct {
+    volatile sig_atomic_t shutdown_requested;
+    volatile sig_atomic_t got_SIGHUP;
+    StandbyReadLsnInfoArray lsn_info;
+} knl_t_exrto_recycle_context;
 
 typedef struct knl_t_startup_context {
     /*
@@ -2562,8 +2593,10 @@ typedef struct knl_t_storage_context {
     struct HTAB* SharedBufHash;
     struct HTAB* BufFreeListHash;
     struct BufferDesc* InProgressBuf;
+    struct BufferDesc* ParentInProgressBuf;
     /* local state for StartBufferIO and related functions */
     volatile bool IsForInput;
+    volatile bool ParentIsForInput;
     /* local state for LockBufferForCleanup */
     struct BufferDesc* PinCountWaitBuf;
     /* local state for aio clean up resource  */
@@ -2806,6 +2839,7 @@ typedef struct knl_t_storage_context {
     char* PcaBufferBlocks;
     dms_buf_ctrl_t* dmsBufCtl;
     char* ondemandXLogMem;
+    struct HTAB* ondemandXLogFileIdCache;
 } knl_t_storage_context;
 
 typedef struct knl_t_port_context {
@@ -3333,6 +3367,7 @@ typedef struct knl_t_apply_worker_context {
     List *tableStates;
     XLogRecPtr remoteFinalLsn;
     CommitSeqNo curRemoteCsn;
+    bool isSkipTransaction;
 } knl_t_apply_worker_context;
 
 typedef struct knl_t_publication_context {
@@ -3348,6 +3383,9 @@ typedef struct knl_t_dms_context {
     bool buf_in_aio;
     bool is_reform_proc;
     bool CloseAllSessionsFailed;
+    uint64 latest_snapshot_xmin;
+    uint64 latest_snapshot_xmax;
+    uint64 latest_snapshot_csn;
     char *origin_buf; /* origin buffer for unaligned read/write */
     char *aligned_buf;
     int size; /* aligned buffer size */
@@ -3355,6 +3393,9 @@ typedef struct knl_t_dms_context {
     int file_size; /* initialized as pg_internal.init file size, will decrease after read */
     char msg_backup[24]; // 24 is sizeof mes_message_head_t
     bool flush_copy_get_page_failed; //used in flush copy
+    HTAB* SSTxnStatusHash;
+    LRUQueue* SSTxnStatusLRU;
+    uint32 srsn; /* session rsn used for DMS page request ordering */
 } knl_t_dms_context;
 
 typedef struct knl_t_ondemand_xlog_copy_context {
@@ -3362,6 +3403,10 @@ typedef struct knl_t_ondemand_xlog_copy_context {
     XLogSegNo openLogSegNo;
     uint32 openLogOff;
 } knl_t_ondemand_xlog_copy_context;
+
+typedef struct knl_t_dms_auxiliary_context {
+    volatile sig_atomic_t shutdown_requested;
+} knl_t_dms_auxiliary_context;
 
 /* thread context. */
 typedef struct knl_thrd_context {
@@ -3470,6 +3515,7 @@ typedef struct knl_thrd_context {
     knl_t_percentile_context percentile_cxt;
     knl_t_perf_snap_context perf_snap_cxt;
     knl_t_page_redo_context page_redo_cxt;
+    knl_t_exrto_recycle_context exrto_recycle_cxt;
     knl_t_parallel_decode_worker_context parallel_decode_cxt;
     knl_t_logical_read_worker_context logicalreadworker_cxt;
     knl_t_heartbeat_context heartbeat_cxt;
@@ -3513,6 +3559,7 @@ typedef struct knl_thrd_context {
     knl_t_dms_context dms_cxt;
     knl_t_ondemand_xlog_copy_context ondemand_xlog_copy_cxt;
     knl_t_rc_context rc_cxt;
+    knl_t_dms_auxiliary_context dms_aux_cxt;
 } knl_thrd_context;
 
 #ifdef ENABLE_MOT

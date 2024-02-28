@@ -209,6 +209,7 @@ static bool _equalParam(const Param* a, const Param* b)
     COMPARE_LOCATION_FIELD(location);
     COMPARE_SCALAR_FIELD(tableOfIndexType);
     COMPARE_SCALAR_FIELD(recordVarTypOid);
+    COMPARE_SCALAR_FIELD(is_bind_param);
 
     return true;
 }
@@ -1892,6 +1893,7 @@ static bool _equalCreateSeqStmt(const CreateSeqStmt* a, const CreateSeqStmt* b)
     COMPARE_SCALAR_FIELD(uuid);
     COMPARE_SCALAR_FIELD(canCreateTempSeq);
     COMPARE_SCALAR_FIELD(is_large);
+    COMPARE_SCALAR_FIELD(missing_ok);
 
     return true;
 }
@@ -3485,6 +3487,7 @@ static bool _equalCharsetClause(const CharsetClause* a, const CharsetClause* b)
     COMPARE_SCALAR_FIELD(charset);
     COMPARE_SCALAR_FIELD(is_binary);
     COMPARE_LOCATION_FIELD(location);
+    return true;
 }
 
 static bool _equalPrefixKey(const PrefixKey* a, const PrefixKey* b)

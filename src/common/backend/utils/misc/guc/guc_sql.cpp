@@ -38,7 +38,9 @@
 #include "access/xlog.h"
 #include "access/ustore/knl_whitebox_test.h"
 #include "access/ubtree.h"
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 #include "catalog/namespace.h"
 #include "catalog/pgxc_group.h"
 #include "catalog/storage_gtt.h"
@@ -366,7 +368,7 @@ static const struct behavior_compat_entry behavior_compat_options[OPT_MAX] = {
     {"unbind_divide_bound", OPT_UNBIND_DIVIDE_BOUND},
     {"correct_to_number", OPT_CORRECT_TO_NUMBER},
     {"compat_concat_variadic", OPT_CONCAT_VARIADIC},
-    {"merge_update_multi", OPT_MEGRE_UPDATE_MULTI},
+    {"merge_update_multi", OPT_MERGE_UPDATE_MULTI},
     {"convert_string_digit_to_numeric", OPT_CONVERT_TO_NUMERIC},
     {"plstmt_implicit_savepoint", OPT_PLSTMT_IMPLICIT_SAVEPOINT},
     {"hide_tailing_zero", OPT_HIDE_TAILING_ZERO},
@@ -383,7 +385,8 @@ static const struct behavior_compat_entry behavior_compat_options[OPT_MAX] = {
     {"pgformat_substr", OPT_PGFORMAT_SUBSTR},
     {"truncate_numeric_tail_zero", OPT_TRUNC_NUMERIC_TAIL_ZERO},
     {"allow_orderby_undistinct_column", OPT_ALLOW_ORDERBY_UNDISTINCT_COLUMN},
-    {"select_into_return_null", OPT_SELECT_INTO_RETURN_NULL}
+    {"select_into_return_null", OPT_SELECT_INTO_RETURN_NULL},
+    {"accept_empty_str", OPT_ACCEPT_EMPTY_STR}
 };
 
 // increase SQL_IGNORE_STRATEGY_NUM if we need more strategy
@@ -473,6 +476,17 @@ static void InitSqlConfigureNamesBool()
             NULL,
             NULL,
             NULL},
+        {{"enable_union_all_subquery_orderby",
+          PGC_USERSET,
+          NODE_SINGLENODE,
+          QUERY_TUNING_METHOD,
+          gettext_noop("Enable union all to order subquery."),
+          NULL},
+         &u_sess->attr.attr_sql.enable_union_all_subquery_orderby,
+         false,
+         NULL,
+         NULL,
+         NULL},
         {{"enable_global_stats",
             PGC_SUSET,
             NODE_ALL,
@@ -569,7 +583,7 @@ static void InitSqlConfigureNamesBool()
             gettext_noop("Enable llvm for executor."),
             NULL},
             &u_sess->attr.attr_sql.enable_codegen,
-            true,
+            false,
             NULL,
             NULL,
             NULL},
@@ -1077,6 +1091,17 @@ static void InitSqlConfigureNamesBool()
             NULL,
             NULL,
             NULL},
+            {{"transform_to_numeric_operators",
+              PGC_USERSET,
+              NODE_SINGLENODE,
+              QUERY_TUNING_METHOD,
+              gettext_noop("When turn on, choose numeric (op) numeric for varchar (op) int."),
+              NULL},
+             &u_sess->attr.attr_sql.transform_to_numeric_operators,
+             false,
+             NULL,
+             NULL,
+             NULL},
         {{"check_function_bodies",
             PGC_USERSET,
             NODE_ALL,

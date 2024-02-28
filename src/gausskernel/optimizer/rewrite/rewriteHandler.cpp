@@ -35,6 +35,7 @@
 #include "parser/parsetree.h"
 #include "parser/parse_merge.h"
 #include "parser/parse_hint.h"
+#include "parser/parse_type.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
@@ -791,7 +792,7 @@ static List* rewriteTargetListIU(List* targetList, CmdType commandType, Relation
                     ereport(DEBUG2, (errmodule(MOD_PARSER), errcode(ERRCODE_LOG),
                         errmsg("default column \"%s\" is effectively NULL, and hence omitted.",
                             NameStr(att_tup->attname))));
-                } else {
+                } else if (target_relation->rd_rel->relkind != RELKIND_VIEW) {
                     new_expr = (Node*)makeConst(att_tup->atttypid,
                         -1,
                         att_tup->attcollation,
@@ -936,7 +937,7 @@ static void rewriteTargetListMutilUpdate(Query* parsetree, List* rtable, List* r
                 new_tle = NULL;
             } else if (applyDefault) {
                 Node* new_expr = build_column_default(target_relation, attrno, true);
-                if (new_expr == NULL) {
+                if (new_expr == NULL && target_relation->rd_rel->relkind != RELKIND_VIEW) {
                     new_expr = (Node*)makeConst(att_tup->atttypid,
                         -1,
                         att_tup->attcollation,
@@ -948,7 +949,9 @@ static void rewriteTargetListMutilUpdate(Query* parsetree, List* rtable, List* r
                     new_expr = coerce_to_domain(
                         new_expr, InvalidOid, -1, att_tup->atttypid, COERCE_IMPLICIT_CAST, -1, false, false);
                 }
-                new_tle = makeTargetEntry((Expr*)new_expr, attrno, pstrdup(NameStr(att_tup->attname)), false);
+                if (new_expr != NULL) {
+                    new_tle = makeTargetEntry((Expr*)new_expr, attrno, pstrdup(NameStr(att_tup->attname)), false);
+                }
                 new_tle->rtindex = result_relation;
             }
 
@@ -3816,7 +3819,7 @@ static List* RewriteQuery(Query* parsetree, List* rewrite_events)
         bool rewriteView = false;
         List* rewriteRelations = NIL;
 
-        result_relation = linitial_int(parsetree->resultRelations);
+        result_relation = linitial2_int(parsetree->resultRelations);
 
         if (result_relation == 0)
             return rewritten;
@@ -4505,6 +4508,21 @@ static bool findAttrByName(const char* attributeName, List* tableElts, int maxle
     }
     return false;
 }
+/*
+ * for create table as in B foramt, add type's oid and typemod in tableElts
+ */
+static void addInitAttrType(List* tableElts)
+{
+    ListCell* lc = NULL;
+
+    foreach (lc, tableElts) {
+        Node* node = (Node*)lfirst(lc);
+        if (IsA(node, ColumnDef)) {
+            ColumnDef* def = (ColumnDef*)node;
+            typenameTypeIdAndMod(NULL, def->typname, &def->typname->typeOid, &def->typname->typemod);
+        }
+    }
+}
 
 char* GetCreateTableStmt(Query* parsetree, CreateTableAsStmt* stmt)
 {
@@ -4515,8 +4533,10 @@ char* GetCreateTableStmt(Query* parsetree, CreateTableAsStmt* stmt)
     IntoClause* into = stmt->into;
     List* tableElts = NIL;
 
-    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT)
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
         tableElts = stmt->into->tableElts;
+        addInitAttrType(tableElts);
+    }
     int initlen = list_length(tableElts);
 
     /* Obtain the target list of new table */
@@ -4672,8 +4692,7 @@ char* GetCreateTableStmt(Query* parsetree, CreateTableAsStmt* stmt)
 
     StringInfo cquery = makeStringInfo();
 
-    if (u_sess->attr.attr_sql.sql_compatibility != B_FORMAT || initlen <= 0)
-        deparse_query(parsetree, cquery, NIL, false, false);
+    deparse_query(parsetree, cquery, NIL, false, false);
 
     return cquery->data;
 }
@@ -4955,7 +4974,7 @@ List *QueryRewriteRefresh(Query *parse_tree)
      */
     matviewOid = RangeVarGetRelidExtended(stmt->relation,
                                          AccessExclusiveLock, false, false, false, false,
-                                         RangeVarCallbackOwnsTable, NULL);
+                                         RangeVarCallbackOwnsMatView, NULL);
     matviewRel = heap_open(matviewOid, NoLock);
 
     /* Make sure it is a materialized view. */
@@ -5147,10 +5166,16 @@ List* QueryRewritePrepareStmt(Query* parsetree)
             (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
                 errmsg("userdefined variable in prepare statement must be text type.")));
     }
+    if (value->constvalue == (Datum)0) {
+        ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("Query was empty")));
+    }
 
     sqlstr = TextDatumGetCString(value->constvalue);
 
     raw_parsetree_list = pg_parse_query(sqlstr);
+    if (raw_parsetree_list == NIL) {
+        ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("Query was empty")));
+    }
 
     if (raw_parsetree_list->length != 1) {
         ereport(ERROR,

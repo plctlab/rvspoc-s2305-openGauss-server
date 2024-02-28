@@ -1731,6 +1731,16 @@ static PLDebug_frame* _readPLDebug_frame(void)
     READ_DONE();
 }
 
+static PLDebug_codeline* _readPLDebug_codeline(void)
+{
+    READ_LOCALS(PLDebug_codeline);
+    READ_INT_FIELD(lineno);
+    READ_STRING_FIELD(code);
+    READ_BOOL_FIELD(canBreak);
+
+    READ_DONE();
+}
+
 /*
  * _readWithCheckOption
  */
@@ -2131,6 +2141,10 @@ static Param* _readParam(void)
     IF_EXIST(tableOfIndexTypeList)
     {
         READ_NODE_FIELD(tableOfIndexTypeList);
+    }
+    IF_EXIST(is_bind_param)
+    {
+        READ_BOOL_FIELD(is_bind_param);
     }
     READ_DONE();
 }
@@ -6653,6 +6667,8 @@ Node* parseNodeString(void)
         return_value = _readPLDebug_breakPoint(); 
     } else if (MATCH("PLDEBUG_FRAME", 13)) {
         return_value = _readPLDebug_frame();
+    } else if (MATCH("PLDEBUG_CODELINE", 16)) {
+        return_value = _readPLDebug_codeline();
     } else if (MATCH("TdigestData", 11)) {
         return_value = _readTdigestData();
     } else if (MATCH("AUTO_INCREMENT", 14)) {

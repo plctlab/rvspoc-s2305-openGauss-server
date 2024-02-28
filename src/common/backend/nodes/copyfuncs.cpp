@@ -2563,6 +2563,7 @@ static Param* _copyParam(const Param* from)
     COPY_SCALAR_FIELD(tableOfIndexType);
     COPY_SCALAR_FIELD(recordVarTypOid);
     COPY_NODE_FIELD(tableOfIndexTypeList);
+    COPY_SCALAR_FIELD(is_bind_param);
 
     return newnode;
 }
@@ -5900,6 +5901,7 @@ static CreateSeqStmt* _copyCreateSeqStmt(const CreateSeqStmt* from)
     COPY_SCALAR_FIELD(uuid);
     COPY_SCALAR_FIELD(canCreateTempSeq);
     COPY_SCALAR_FIELD(is_large);
+    COPY_SCALAR_FIELD(missing_ok);
 
     return newnode;
 }

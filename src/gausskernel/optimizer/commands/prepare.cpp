@@ -164,6 +164,7 @@ void PrepareQuery(PrepareStmt* stmt, const char* queryString)
         stmt->name,
 #endif
         CreateCommandTag(stmt->query));
+    t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(stmt->query);
 
     /* Transform list of TypeNames to array of type OIDs */
     nargs = list_length(stmt->argtypes);
@@ -314,6 +315,7 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
     /* Look it up in the hash table */
     entry = FetchPreparedStatement(stmt->name, true, true);
     psrc = entry->plansource;
+    t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(psrc->raw_parse_tree);
 
     /* Shouldn't find a non-fixed-result cached plan */
     if (!entry->plansource->fixed_result)
@@ -494,6 +496,8 @@ static ParamListInfo EvaluateParams(CachedPlanSource* psrc, List* params, const 
     ParamListInfo paramLI;
     List* exprstates = NIL;
     ListCell* l = NULL;
+    Oid param_collation;
+    int param_charset;
     int i;
 
     if (nparams != num_params)
@@ -515,6 +519,8 @@ static ParamListInfo EvaluateParams(CachedPlanSource* psrc, List* params, const 
     pstate = make_parsestate(NULL);
     pstate->p_sourcetext = queryString;
 
+    param_collation = GetCollationConnection();
+    param_charset = GetCharsetConnection();
     i = 0;
     foreach (l, params) {
         Node* expr = (Node*)lfirst(l);
@@ -550,6 +556,12 @@ static ParamListInfo EvaluateParams(CachedPlanSource* psrc, List* params, const 
 
         /* Take care of collations in the finished expression. */
         assign_expr_collations(pstate, expr);
+
+        /* Try convert expression to target parameter charset. */
+        if (OidIsValid(param_collation) && IsSupportCharsetType(expected_type_id)) {
+            /* convert charset only, expression will be evaluated below */
+            expr = coerce_to_target_charset(expr, param_charset, expected_type_id, -1, param_collation, false);
+        }
 
         lfirst(l) = expr;
         i++;
@@ -1556,6 +1568,7 @@ void DropDatanodeStatement(const char* stmt_name)
         (void*)hash_search(u_sess->pcache_cxt.datanode_queries, entry->stmt_name, HASH_REMOVE, NULL);
         if (!ENABLE_CN_GPC)
             ExecCloseRemoteStatement(stmt_name, nodelist);
+        list_free_ext(nodelist);
     }
 }
 
@@ -1750,6 +1763,7 @@ void RePrepareQuery(ExecuteStmt* stmt)
      */
     foreach (parsetree_item, parseTree_list) {
         Node* parsetree = (Node*)lfirst(parsetree_item);
+        t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(parsetree);
         List* planTree_list = NIL;
 
         queryTree_list = pg_analyze_and_rewrite(parsetree, query_string, NULL, 0);
@@ -1859,6 +1873,7 @@ static Node* substitute_const_with_parameters_mutator(Node* node, substitute_con
         param->paramtypmod = con->consttypmod;
         param->paramcollid = con->constcollid;
         param->location = con->location;
+        param->is_bind_param = true;
         if (*context->args) {
             *context->args = (Oid*)repalloc(*context->args, param->paramid * sizeof(Oid));
         } else {

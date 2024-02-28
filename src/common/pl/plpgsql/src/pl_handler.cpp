@@ -699,8 +699,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
     int save_sec_context = 0;
     Oid cast_owner = InvalidOid;
     bool has_switch = false;
-    // PGSTAT_INIT_PLSQL_TIME_RECORD
-    int64 startTime = 0;
+    PGSTAT_INIT_TIME_RECORD();
     bool needRecord = false;
     PLpgSQL_package* pkg = NULL;
     MemoryContext oldContext = CurrentMemoryContext;
@@ -809,6 +808,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         /* Must save and restore prior value of cur_estate and debug_info */
         save_cur_estate = func->cur_estate;
         save_debug_info = func->debug;
+        NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
 
         // set the procedure's search_path as the current search_path
         validate_search_path(func);
@@ -880,7 +880,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
             u_sess->plsql_cxt.cur_exception_cxt = NULL;
 
             t_thrd.log_cxt.call_stack = saveplcallstack;
-
+            t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
 
 #ifndef ENABLE_MULTIPLE_NODES
             /* for restore parent session and automn session package var values */
@@ -958,6 +958,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         DecreasePackageUseCount(func);
         func->cur_estate = save_cur_estate;
         func->debug = save_debug_info;
+        t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
 
         // resume the search_path when the procedure has executed
         PopOverrideSearchPath();
@@ -1044,8 +1045,7 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
     FmgrInfo flinfo;
     Datum retval;
     int rc;
-    // PGSTAT_INIT_PLSQL_TIME_RECORD
-    int64 startTime = 0;
+    PGSTAT_INIT_TIME_RECORD();
     bool needRecord = false;
 
     _PG_init();
@@ -1128,6 +1128,8 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
     save_compile_context = u_sess->plsql_cxt.curr_compile_context;
     int save_compile_list_length = list_length(u_sess->plsql_cxt.compile_context_list);
     int save_compile_status = u_sess->plsql_cxt.compile_status;
+    DebugInfo* save_debug_info = func->debug;
+    NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
     FormatCallStack* saveplcallstack = t_thrd.log_cxt.call_stack;
     PG_TRY();
     {
@@ -1149,11 +1151,22 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
         DecreasePackageUseCount(func);
 
 #ifndef ENABLE_MULTIPLE_NODES
+        /* debug finished, close debug resource */
+        if (func->debug) {
+            /* if debuger is waiting for end msg, send end */
+            server_send_end_msg(func->debug);
+            /* pass opt to upper debug function */
+            server_pass_upper_debug_opt(func->debug);
+            clean_up_debug_server(func->debug, false, true);
+            delete_debug_func(InvalidOid);
+        }
+        func->debug = save_debug_info;
         /* for restore parent session and automn session package var values */
         (void)processAutonmSessionPkgsInException(func);
 
         dopControl.ResetSmp();
 #endif
+        t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
         ereport(DEBUG3, (errmodule(MOD_NEST_COMPILE), errcode(ERRCODE_LOG),
             errmsg("%s clear curr_compile_context because of error.", __func__)));
         /* reset nest plpgsql compile */
@@ -1169,6 +1182,19 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
         PG_RE_THROW();
     }
     PG_END_TRY();
+#ifndef ENABLE_MULTIPLE_NODES
+    /* debug finished, close debug resource */
+    if (func->debug) {
+        /* if debuger is waiting for end msg, send end */
+        server_send_end_msg(func->debug);
+        /* pass opt to upper debug function */
+        server_pass_upper_debug_opt(func->debug);
+        clean_up_debug_server(func->debug, false, true);
+        delete_debug_func(InvalidOid);
+    }
+    func->debug = save_debug_info;
+#endif
+    t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
     if (u_sess->SPI_cxt._connected == 0) {
         t_thrd.utils_cxt.STPSavedResourceOwner = NULL;
     }
