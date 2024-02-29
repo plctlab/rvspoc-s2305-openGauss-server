@@ -38,6 +38,7 @@
 #include "access/double_write.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/multi_redo_api.h"
 #include "access/rewriteheap.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -53,6 +54,7 @@
 #include "access/hash.h"
 #include "access/xlogproc.h"
 #include "access/parallel_recovery/dispatcher.h"
+#include "access/extreme_rto/page_redo.h"
 
 #include "commands/tablespace.h"
 #include "commands/matview.h"
@@ -63,7 +65,9 @@
 #include "catalog/pg_database.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#ifdef ENABLE_BBOX
 #include "gs_bbox.h"
+#endif
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #ifdef PGXC
@@ -87,6 +91,7 @@
 #include "replication/reorderbuffer.h"
 #include "replication/replicainternal.h"
 #include "replication/shared_storage_walreceiver.h"
+#include "replication/ss_cluster_replication.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"
 #include "replication/syncrep.h"
@@ -131,6 +136,7 @@
 #include <sched.h>
 #include <utmpx.h>
 #include <time.h>
+#include "access/slru.h"
 
 #ifdef ENABLE_MOT
 #include "storage/mot/mot_fdw.h"
@@ -152,6 +158,7 @@
 #include "vectorsonic/vsonichash.h"
 
 #include "ddes/dms/ss_reform_common.h"
+#include "ddes/dms/ss_transaction.h"
 #include "ddes/dms/ss_dms_recovery.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 #include "storage/file/fio_device.h"
@@ -264,6 +271,7 @@ static void remove_xlogtemp_files(void);
 static bool validate_parse_delay_ddl_file(DelayDDLRange *delayRange);
 static bool write_delay_ddl_file(const DelayDDLRange &delayRange, bool onErrDelete);
 extern void CalculateLocalLatestSnapshot(bool forceCalc);
+extern std::vector<int> SSGetAllStableNodeId();
 
 /*
  * Calculate the amount of space left on the page after 'endptr'. Beware
@@ -416,6 +424,8 @@ static uint64 XLogRecPtrToBytePos(XLogRecPtr ptr);
 
 static XLogRecPtr XLogInsertRecordSingle(XLogRecData *rdata, XLogRecPtr fpw_lsn);
 static int SSReadXLog(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
+                      XLogRecPtr targetRecPtr, char *readBuf, TimeLineID *readTLI, char* xlog_path);
+static int SSDoradoReadXLog(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
                       XLogRecPtr targetRecPtr, char *readBuf, TimeLineID *readTLI, char* xlog_path);
 void ArchiveXlogForForceFinishRedo(XLogReaderState *xlogreader, TermFileData *term_file);
 TermFileData GetTermFileDataAndClear(void);
@@ -643,8 +653,8 @@ static XLogRecPtr XLogInsertRecordGroup(XLogRecData *rdata, XLogRecPtr fpw_lsn)
         ereport(ERROR, (errcode(ERRCODE_CASE_NOT_FOUND), errmsg("cannot make new WAL entries during recovery")));
     }
 
-    if (!SSXLogInsertAllowed()) {
-        ereport(FATAL, (errmsg("SS standby cannot insert XLOG entries")));
+    if (SS_REPLICATION_STANDBY_CLUSTER) {
+        ereport(FATAL, (errmsg("SS dorado standby cluster cannot insert XLOG entries")));
     }
 
     START_CRIT_SECTION();
@@ -707,8 +717,6 @@ static XLogRecPtr XLogInsertRecordGroup(XLogRecData *rdata, XLogRecPtr fpw_lsn)
             extra_waits++;
         }
 
-        Assert(pg_atomic_read_u32(&proc->xlogGroupNext) == INVALID_PGPROCNO);
-
 #ifdef ENABLE_MULTIPLE_NODES
         /* Fix semaphore count for any absorbed wakeups */
         while (extra_waits-- > 0) {
@@ -722,6 +730,7 @@ static XLogRecPtr XLogInsertRecordGroup(XLogRecData *rdata, XLogRecPtr fpw_lsn)
          * in case of memory reordering in relaxed memory model like ARM.
          */
         pg_memory_barrier();
+        Assert(pg_atomic_read_u32(&proc->xlogGroupNext) == INVALID_PGPROCNO);
         return proc->xlogGroupReturntRecPtr;
     }
 
@@ -877,7 +886,7 @@ static void ReserveXLogInsertByteLocation(uint32 size, uint32 lastRecordSize, ui
      * because the usable byte position doesn't include any headers, reserving
      * X bytes from WAL is almost as simple as "CurrBytePos += X".
      */
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     union Union128 compare;
     union Union128 exchange;
     union Union128 current;
@@ -915,25 +924,29 @@ loop:
         UINT128_COPY(compare.value, current.value);
         goto loop;
     }
-#else
-    uint64 startbytepos;
-    uint64 endbytepos;
-    uint64 prevbytepos;
-
-    SpinLockAcquire(&Insert->insertpos_lck);
-
-    startbytepos = Insert->CurrBytePos;
-    endbytepos = startbytepos + size;
-    prevbytepos = Insert->PrevBytePos;
-    Insert->CurrBytePos = endbytepos;
-    Insert->PrevBytePos = endbytepos - lastRecordSize;
-
-    SpinLockRelease(&Insert->insertpos_lck);
-#endif /* __x86_64__ || __aarch64__ */
     *currlrc_ptr = compare.struct128.LRC;
     *StartBytePos = compare.struct128.currentBytePos;
     *EndBytePos = exchange.struct128.currentBytePos;
     *PrevBytePos = compare.struct128.currentBytePos - compare.struct128.byteSize;
+#else
+loop1:
+    SpinLockAcquire(&Insert->insertpos_lck);
+
+    if (unlikely(Insert->CurrLRC == WAL_COPY_SUSPEND)) {
+        SpinLockRelease(&Insert->insertpos_lck);
+        goto loop1;
+    }
+
+    *currlrc_ptr = Insert->CurrLRC;
+    *StartBytePos = Insert->CurrBytePos;
+    *EndBytePos = Insert->CurrBytePos + size;
+    *PrevBytePos = Insert->CurrBytePos - Insert->PrevByteSize;
+    Insert->CurrLRC = (Insert->CurrLRC + 1) & 0x7FFFFFFF;
+    Insert->PrevByteSize = lastRecordSize;
+    Insert->CurrBytePos = *EndBytePos;
+
+    SpinLockRelease(&Insert->insertpos_lck);
+#endif /* __x86_64__ || __aarch64__ */
 }
 
 /*
@@ -1083,8 +1096,8 @@ static XLogRecPtr XLogInsertRecordSingle(XLogRecData *rdata, XLogRecPtr fpw_lsn)
         ereport(ERROR, (errcode(ERRCODE_CASE_NOT_FOUND), errmsg("cannot make new WAL entries during recovery")));
     }
 
-    if (!SSXLogInsertAllowed()) {
-        ereport(FATAL, (errmsg("SS standby cannot insert XLOG entries")));
+    if (SS_REPLICATION_STANDBY_CLUSTER) {
+        ereport(FATAL, (errmsg("SS dorado standby cluster cannot insert XLOG entries")));
     }
 
     /* ----------
@@ -1394,7 +1407,7 @@ static void ReserveXLogInsertLocation(uint32 size, XLogRecPtr *StartPos, XLogRec
      * because the usable byte position doesn't include any headers, reserving
      * X bytes from WAL is almost as simple as "CurrBytePos += X".
      */
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     union Union128 compare;
     union Union128 exchange;
     union Union128 current;
@@ -1433,25 +1446,30 @@ loop1:
         goto loop1;
     }
 
-#else
-    uint64 startbytepos;
-    uint64 endbytepos;
-    uint64 prevbytepos;
-
-    SpinLockAcquire(&Insert->insertpos_lck);
-
-    startbytepos = Insert->CurrBytePos;
-    prevbytepos = Insert->PrevBytePos;
-    endbytepos = startbytepos + size;
-    Insert->CurrBytePos = endbytepos;
-    Insert->PrevBytePos = startbytepos;
-
-    SpinLockRelease(&Insert->insertpos_lck);
-#endif /* __x86_64__|| __aarch64__ */
     *currlrc_ptr = compare.struct128.LRC;
     *StartPos = XLogBytePosToRecPtr(compare.struct128.currentBytePos);
     *EndPos = XLogBytePosToEndRecPtr(exchange.struct128.currentBytePos);
     *PrevPtr = XLogBytePosToRecPtr(compare.struct128.currentBytePos - compare.struct128.byteSize);
+
+#else
+loop1:
+    SpinLockAcquire(&Insert->insertpos_lck);
+
+    if (unlikely(Insert->CurrLRC == WAL_COPY_SUSPEND)) {
+        SpinLockRelease(&Insert->insertpos_lck);
+        pg_usleep(1);
+        goto loop1;
+    }
+    *currlrc_ptr = Insert->CurrLRC;
+    *PrevPtr = XLogBytePosToRecPtr(Insert->CurrBytePos - Insert->PrevByteSize);
+    *StartPos = XLogBytePosToRecPtr(Insert->CurrBytePos);
+    Insert->CurrBytePos = Insert->CurrBytePos + size;
+    *EndPos = XLogBytePosToEndRecPtr(Insert->CurrBytePos);
+    Insert->PrevByteSize = size;
+    Insert->CurrLRC = (Insert->CurrLRC + 1) & 0x7FFFFFFF;
+
+    SpinLockRelease(&Insert->insertpos_lck);
+#endif /* __x86_64__|| __aarch64__ */
 }
 
 /*
@@ -1480,7 +1498,7 @@ static bool ReserveXLogSwitch(XLogRecPtr *StartPos, XLogRecPtr *EndPos, XLogRecP
      * are no other inserters competing for it. GetXLogInsertRecPtr() does
      * compete for it, but that's not called very frequently.
      */
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     uint128_u exchange;
     uint128_u current;
     uint128_u compare = atomic_compare_and_swap_u128((uint128_u *)&Insert->CurrBytePos);
@@ -1531,7 +1549,8 @@ loop:
     }
 
     endbytepos = startbytepos + size;
-    prevbytesize = startbytepos - Insert->PrevByteSize;
+    prevbytesize = Insert->PrevByteSize;
+    currlrc = Insert->CurrLRC;
 
     *StartPos = XLogBytePosToRecPtr(startbytepos);
     *EndPos = XLogBytePosToEndRecPtr(endbytepos);
@@ -1543,7 +1562,8 @@ loop:
         endbytepos = XLogRecPtrToBytePos(*EndPos);
     }
     Insert->CurrBytePos = endbytepos;
-    Insert->PrevByteSize = size;
+    Insert->PrevByteSize = (uint32)(endbytepos - startbytepos);
+    Insert->CurrLRC = currlrc;
 
     SpinLockRelease(&Insert->insertpos_lck);
 #endif /* __x86_64__ || __aarch64__ */
@@ -1561,11 +1581,12 @@ loop:
 static void StartSuspendWalInsert(int32 *const lastlrc_ptr)
 {
     volatile XLogCtlInsert *Insert = &t_thrd.shemem_ptr_cxt.XLogCtl->Insert;
-    uint64 startbytepos;
-    uint32 prevbytesize;
     int32 currlrc;
     int32 ientry;
     volatile WALInsertStatusEntry *entry;
+#if (defined(__x86_64__) || defined(__aarch64__)) && !defined(__USE_SPINLOCK)
+    uint64 startbytepos;
+    uint32 prevbytesize;
     uint128_u compare;
     uint128_u exchange;
     uint128_u current;
@@ -1614,6 +1635,24 @@ loop:
         UINT128_COPY(compare, current);
         goto loop;
     }
+#else
+loop:
+    SpinLockAcquire(&Insert->insertpos_lck);
+    currlrc = Insert->CurrLRC;
+    if (unlikely(currlrc == WAL_COPY_SUSPEND)) {
+        SpinLockRelease(&Insert->insertpos_lck);
+        goto loop;
+    }
+
+    /*
+     * Return the last LRC
+     */
+    *lastlrc_ptr = currlrc;
+
+    Insert->CurrLRC = WAL_COPY_SUSPEND;
+
+    SpinLockRelease(&Insert->insertpos_lck);
+#endif /* __x86_64__ || __aarch64__ */
 
     /*
      * Wait for the WAL copy thread obtaining the "*lastlrc_ptr - 1" to finish
@@ -2792,6 +2831,7 @@ static void XLogWrite(const XLogwrtRqst &WriteRqst, bool flexible)
                 /* signal that we need to wakeup walsenders later */
                 WalSndWakeupRequest();
                 t_thrd.xlog_cxt.LogwrtResult->Flush = t_thrd.xlog_cxt.LogwrtResult->Write; /* end of page */
+                UpdateSSDoradoCtlInfoAndSync();
                 AddShareStorageXLopCopyBackendWakeupRequest();
                 if (XLogArchivingActive()) {
                     XLogArchiveNotifySeg(t_thrd.xlog_cxt.openLogSegNo);
@@ -2864,6 +2904,7 @@ static void XLogWrite(const XLogwrtRqst &WriteRqst, bool flexible)
         /* signal that we need to wakeup walsenders later */
         WalSndWakeupRequest();
         t_thrd.xlog_cxt.LogwrtResult->Flush = t_thrd.xlog_cxt.LogwrtResult->Write;
+        UpdateSSDoradoCtlInfoAndSync();
         AddShareStorageXLopCopyBackendWakeupRequest();
     }
 
@@ -3105,7 +3146,7 @@ static void ResetSlotLSNEndRecovery(StringInfo slotname)
     ReplicationSlotsComputeRequiredLSN(NULL);
 }
 
-void inline XlogUpMinRecovPointSwitchChk(XLogRecPtr lsn)
+inline void XlogUpMinRecovPointSwitchChk(XLogRecPtr lsn)
 {
     if (g_instance.comm_cxt.predo_cxt.pre_enable_switch !=
         g_instance.attr.attr_storage.enable_update_max_page_flush_lsn) {
@@ -3151,37 +3192,11 @@ void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
     if (t_thrd.xlog_cxt.minRecoveryPoint == 0) {
         t_thrd.xlog_cxt.updateMinRecoveryPoint = false;
     } else if (force || XLByteLT(t_thrd.xlog_cxt.minRecoveryPoint, lsn)) {
-        /* use volatile pointer to prevent code rearrangement */
-        volatile XLogCtlData *xlogctl = t_thrd.shemem_ptr_cxt.XLogCtl;
-        XLogRecPtr newMinRecoveryPoint;
-
-        /*
-         * To avoid having to update the control file too often, we update it
-         * all the way to the last record being replayed, even though 'lsn'
-         * would suffice for correctness.  This also allows the 'force' case
-         * to not need a valid 'lsn' value.
-         *
-         * Another important reason for doing it this way is that the passed
-         * 'lsn' value could be bogus, i.e., past the end of available WAL, if
-         * the caller got it from a corrupted heap page.  Accepting such a
-         * value as the min recovery point would prevent us from coming up at
-         * all.  Instead, we just log a warning and continue with recovery.
-         * (See also the comments about corrupt LSNs in XLogFlush.)
-         */
-        SpinLockAcquire(&xlogctl->info_lck);
-        newMinRecoveryPoint = xlogctl->lastReplayedEndRecPtr;
-        SpinLockRelease(&xlogctl->info_lck);
-
-        if (!force && XLByteLT(newMinRecoveryPoint, lsn) && !enable_heap_bcm_data_replication()) {
-            ereport(DEBUG1, (errmsg("xlog min recovery request %X/%X is past current point %X/%X", (uint32)(lsn >> 32),
-                                    (uint32)lsn, (uint32)(newMinRecoveryPoint >> 32), (uint32)newMinRecoveryPoint)));
-        }
-
         /* update control file */
-        if (XLByteLT(t_thrd.shemem_ptr_cxt.ControlFile->minRecoveryPoint, newMinRecoveryPoint)) {
-            t_thrd.shemem_ptr_cxt.ControlFile->minRecoveryPoint = newMinRecoveryPoint;
+        if (XLByteLT(t_thrd.shemem_ptr_cxt.ControlFile->minRecoveryPoint, lsn)) {
+            t_thrd.shemem_ptr_cxt.ControlFile->minRecoveryPoint = lsn;
             UpdateControlFile();
-            t_thrd.xlog_cxt.minRecoveryPoint = newMinRecoveryPoint;
+            t_thrd.xlog_cxt.minRecoveryPoint = lsn;
             SetMinRecoverPointForStats(t_thrd.xlog_cxt.minRecoveryPoint);
             ereport(DEBUG1,
                     (errmsg("updated min recovery point to %X/%X", (uint32)(t_thrd.xlog_cxt.minRecoveryPoint >> 32),
@@ -3213,7 +3228,7 @@ void XLogWaitFlush(XLogRecPtr recptr)
         return;
     }
 
-    if (!SSXLogInsertAllowed()) {
+    if (SS_REPLICATION_STANDBY_CLUSTER) {
         return;
     }
 
@@ -3423,7 +3438,7 @@ bool XLogBackgroundFlush(void)
         return false;
     }
 
-    if (!SSXLogInsertAllowed()) {
+    if (SS_REPLICATION_STANDBY_CLUSTER) {
         return false;
     }
 
@@ -3743,8 +3758,8 @@ static int XLogFileInitInternal(XLogSegNo logsegno, bool *use_existent, bool use
         }
     }
 
-    if (!SSXLogInsertAllowed()) {
-        ereport(FATAL, (errmsg("SS standby cannot init xlog files due to DSS")));
+    if (SS_REPLICATION_STANDBY_CLUSTER) {
+        ereport(FATAL, (errmsg("SS dorado standby cluster cannot init xlog files due to DSS")));
     }
 
     /*
@@ -4197,8 +4212,14 @@ static int XLogFileOpenInternal(XLogSegNo segno, const char *xlog_dir)
                          (uint32)((segno) / XLogSegmentsPerXLogId), (uint32)((segno) % XLogSegmentsPerXLogId));
     securec_check_ss(errorno, "", "");
 
-    fd = BasicOpenFile(path, O_RDWR | PG_BINARY | (unsigned int)get_sync_bit(u_sess->attr.attr_storage.sync_method),
-                       S_IRUSR | S_IWUSR);
+    if (SS_REPLICATION_DORADO_CLUSTER) {
+        fd = SSErgodicOpenXlogFile(segno, O_RDWR | PG_BINARY | (unsigned int)get_sync_bit(u_sess->attr.attr_storage.sync_method),
+                        S_IRUSR | S_IWUSR);
+    } else {
+        fd = BasicOpenFile(path, O_RDWR | PG_BINARY | (unsigned int)get_sync_bit(u_sess->attr.attr_storage.sync_method),
+                        S_IRUSR | S_IWUSR);
+    }
+
     if (fd < 0) {
         ereport(PANIC, (errcode_for_file_access(), errmsg("could not open xlog file \"%s\" (log segment %s): %m", path,
                                                           XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, segno))));
@@ -4287,6 +4308,7 @@ static int XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli, int source, 
     }
 
     fd = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
+retry:
     if (fd >= 0) {
         /* Success! */
         t_thrd.xlog_cxt.curFileTLI = tli;
@@ -4306,6 +4328,39 @@ static int XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli, int source, 
 
         return fd;
     }
+
+    /* 
+     * When SS_REPLICATION_DORADO_CLUSTER enabled, current xlog dictionary may be not the correct dictionary,
+     * because all xlog dictionaries are in the same LUN, we need loop over other dictionaries.
+     * Do we need source == XLOG_FROM_STREAM?
+    */
+    if (SS_REPLICATION_DORADO_CLUSTER && source == XLOG_FROM_STREAM) {
+        std::vector<int> nodeList = SSGetAllStableNodeId(); // stable node list,
+        Assert(!nodeList.empty());
+        char xlogPath[MAXPGPATH];
+        char *dssdir = g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name;
+        for (auto elem : nodeList) {
+            if (elem == g_instance.dms_cxt.SSReformerControl.recoveryInstId) {
+                continue;
+            }
+
+            /* try to read from other xlog dictionary */
+            errorno = snprintf_s(xlogPath, MAXPGPATH, MAXPGPATH - 1, "%s/pg_xlog%d", dssdir, elem);
+            securec_check_ss(errorno, "", "");
+
+            errorno = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%08X%08X%08X", xlogPath, tli,
+                                 (uint32)((segno) / XLogSegmentsPerXLogId), (uint32)((segno) % XLogSegmentsPerXLogId));
+            securec_check_ss(errorno, "", "");
+
+            fd = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
+            if (fd < 0) {
+                continue;
+            }
+            ereport(LOG, (errmsg("find xlog file in path : \"%s\"", path)));
+            goto retry;
+        }
+    }
+    
     if (!FILE_POSSIBLY_DELETED(errno) || !notfoundOk) { /* unexpected failure? */
         ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\" (log segment %s): %m", path,
                                                           XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, segno))));
@@ -4967,8 +5022,9 @@ static void UpdateLastRemovedPtr(const char *filename)
  */
 static void RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr endptr)
 {
-    if (!SSXLogInsertAllowed())
+    if (SS_REPLICATION_STANDBY_CLUSTER) {
         return;
+    }
 
     DIR *xldir = NULL;
     struct dirent *xlde = NULL;
@@ -5175,6 +5231,39 @@ static void CleanupBackupHistory(void)
 }
 
 /*
+* in ss dorado double cluster, we need read xlogpath ergodic，
+* we will read xlog in path where last read success
+*/
+XLogRecord *SSXLogReadRecordErgodic(XLogReaderState *state, XLogRecPtr RecPtr, 
+            char **errormsg, char* dssdata, int* idList) {
+    char xlogPath[MAXPGPATH];
+    XLogRecord *record = NULL;
+    errno_t errorno = 0;
+
+    for (int i = 0; i < DMS_MAX_INSTANCE; i++) {
+        if (idList[i] == -1) {
+            break;
+        }
+        errorno = snprintf_s(xlogPath, MAXPGPATH, MAXPGPATH - 1, "%s/%s%d", dssdata, "pg_xlog", idList[i]);
+        securec_check_ss(errorno, "", "");
+        record = XLogReadRecord(state, RecPtr, errormsg, true, xlogPath);
+        if (record != NULL) {
+            /* read success, exchange index */
+            int buf = idList[i];
+            idList[i] = idList[0];
+            idList[0] = buf;
+            break;
+        } else {
+            if (t_thrd.xlog_cxt.readFile >= 0) {
+                close(t_thrd.xlog_cxt.readFile);
+                t_thrd.xlog_cxt.readFile = -1;
+            }
+        }
+    }
+    return record;
+}
+
+/*
  * Attempt to read an XLOG record.
  *
  * If RecPtr is not NULL, try to read a record at that position.  Otherwise
@@ -5203,8 +5292,13 @@ static XLogRecord *ReadRecord(XLogReaderState *xlogreader, XLogRecPtr RecPtr, in
 
     for (;;) {
         char *errormsg = NULL;
+        if (SS_REPLICATION_DORADO_CLUSTER) {
+            record = SSXLogReadRecordErgodic(xlogreader, RecPtr, &errormsg, 
+                g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name, g_instance.dms_cxt.SSRecoveryInfo.instid_list);
+        } else {
+            record = XLogReadRecord(xlogreader, RecPtr, &errormsg);
+        }
 
-        record = XLogReadRecord(xlogreader, RecPtr, &errormsg);
         t_thrd.xlog_cxt.ReadRecPtr = xlogreader->ReadRecPtr;
         t_thrd.xlog_cxt.EndRecPtr = xlogreader->EndRecPtr;
         g_instance.comm_cxt.predo_cxt.redoPf.read_ptr = t_thrd.xlog_cxt.ReadRecPtr;
@@ -5255,9 +5349,15 @@ static XLogRecord *ReadRecord(XLogReaderState *xlogreader, XLogRecPtr RecPtr, in
             latestValidRecord = t_thrd.xlog_cxt.ReadRecPtr;
             latestRecordCrc = record->xl_crc;
             latestRecordLen = record->xl_tot_len;
+            if (SS_REPLICATION_DORADO_CLUSTER) {
+                t_thrd.xlog_cxt.ssXlogReadFailedTimes = 0;
+            }
             /* Great, got a record */
             return record;
         } else {
+            if (SS_REPLICATION_DORADO_CLUSTER) {
+                t_thrd.xlog_cxt.ssXlogReadFailedTimes++;
+            }
             /* No valid record available from this source */
             if (streamFailCount < XLOG_STREAM_READREC_MAXTRY) {
                 streamFailCount++;
@@ -5296,7 +5396,7 @@ static XLogRecord *ReadRecord(XLogReaderState *xlogreader, XLogRecPtr RecPtr, in
              * So err on the safe side and give up.
              */
             if (!t_thrd.xlog_cxt.InArchiveRecovery && t_thrd.xlog_cxt.ArchiveRecoveryRequested && !fetching_ckpt) {
-                ProcTxnWorkLoad(false);
+                ProcTxnWorkLoad(true);
                 volatile XLogCtlData *xlogctl = t_thrd.shemem_ptr_cxt.XLogCtl;
                 XLogRecPtr newMinRecoveryPoint;
                 ereport(DEBUG1, (errmsg_internal("reached end of WAL in pg_xlog, entering archive recovery")));
@@ -5341,6 +5441,13 @@ static XLogRecord *ReadRecord(XLogReaderState *xlogreader, XLogRecPtr RecPtr, in
             if (t_thrd.xlog_cxt.StandbyMode && !dummyStandbyMode && !t_thrd.xlog_cxt.recoveryTriggered) {
                 continue;
             } else {
+                if (u_sess->attr.attr_storage.HaModuleDebug) {
+                    ereport(LOG,
+                        (errmsg("startup replay xlog ready to exit, standbymode is %s, dummyStandbyMode is %s, recoveryTriggered is %s",
+                                t_thrd.xlog_cxt.StandbyMode ? "true" : "false",
+                                dummyStandbyMode ? "true" : "false",
+                                t_thrd.xlog_cxt.recoveryTriggered ? "true" : "false")));
+                }
                 return NULL;
             }
         }
@@ -5351,7 +5458,7 @@ void UpdateMinrecoveryInAchive()
 {
     volatile XLogCtlData *xlogctl = t_thrd.shemem_ptr_cxt.XLogCtl;
     XLogRecPtr newMinRecoveryPoint;
-
+    extreme_rto::PushToWorkerLsn(true);
     /* initialize minRecoveryPoint to this record */
     LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
     t_thrd.shemem_ptr_cxt.ControlFile->state = DB_IN_ARCHIVE_RECOVERY;
@@ -5369,7 +5476,7 @@ void UpdateMinrecoveryInAchive()
     UpdateControlFile();
     LWLockRelease(ControlFileLock);
     MultiRedoUpdateMinRecovery(t_thrd.xlog_cxt.minRecoveryPoint);
-
+    t_thrd.xlog_cxt.updateMinRecoveryPoint = true; // for extreme rto xlog page read worker, no need send lsn forwarder
     ereport(LOG,
             (errmsg("update minrecovery point to %X/%X in archive recovery",
                     (uint32)(t_thrd.xlog_cxt.minRecoveryPoint >> 32), (uint32)(t_thrd.xlog_cxt.minRecoveryPoint))));
@@ -6364,10 +6471,12 @@ void XLOGShmemInit(void)
     /* The memory of the memset sometimes exceeds 2 GB. so, memset_s cannot be used. */
     MemSet(t_thrd.shemem_ptr_cxt.XLogCtl->pages, 0, (Size)XLOG_BLCKSZ * g_instance.attr.attr_storage.XLOGbuffers);
 
+#ifdef ENABLE_BBOX
     if (BBOX_BLACKLIST_XLOG_BUFFER) {
         bbox_blacklist_add(XLOG_BUFFER, t_thrd.shemem_ptr_cxt.XLogCtl->pages,
                            (uint64)XLOG_BLCKSZ * g_instance.attr.attr_storage.XLOGbuffers);
     }
+#endif
 
     /*
      * Do basic initialization of XLogCtl shared data. (StartupXLOG will fill
@@ -6377,7 +6486,7 @@ void XLOGShmemInit(void)
     t_thrd.shemem_ptr_cxt.XLogCtl->SharedRecoveryInProgress = true;
     t_thrd.shemem_ptr_cxt.XLogCtl->IsRecoveryDone = false;
     t_thrd.shemem_ptr_cxt.XLogCtl->IsOnDemandBuildDone = false;
-    t_thrd.shemem_ptr_cxt.XLogCtl->IsOnDemandRecoveryDone = false;
+    t_thrd.shemem_ptr_cxt.XLogCtl->IsOnDemandRedoDone = false;
     t_thrd.shemem_ptr_cxt.XLogCtl->SharedHotStandbyActive = false;
     t_thrd.shemem_ptr_cxt.XLogCtl->WalWriterSleeping = false;
     t_thrd.shemem_ptr_cxt.XLogCtl->xlogFlushPtrForPerRead = InvalidXLogRecPtr;
@@ -6536,6 +6645,35 @@ static uint64 GetMACAddr(void)
     macAddr = ((uint64)mac.a << 40) | ((uint64)mac.b << 32) | ((uint64)mac.c << 24) | ((uint64)mac.d << 16) |
               ((uint64)mac.e << 8) | (uint64)mac.f;
     return macAddr;
+}
+
+void UpdateCtlInfoToFile(ShareStorageXLogCtl *ctlInfo)
+{
+    int fd = BasicOpenFile(SS_DORADO_CTRL_FILE, O_RDWR | PG_BINARY | O_DIRECT, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        ereport(FATAL, (errcode_for_file_access(), errmsg("could not open ss ctl into file \"%s\": %m", SS_DORADO_CTRL_FILE)));
+    }
+
+    Assert(fd > 0);
+
+    errno = EOK;
+    if (pwrite(fd, ctlInfo, SS_DORADO_CTL_INFO_SIZE, 0) != SS_DORADO_CTL_INFO_SIZE) {
+        if (errno == 0) {
+            errno = ENOSPC;
+        }  
+        ereport(PANIC, (errcode_for_file_access(), errmsg("could not write to ss ctl info file: %m")));
+    }
+
+    if (pg_fsync(fd) != 0) {
+        int save_errno = errno;
+        close(fd);
+        errno = save_errno;
+        ereport(PANIC, (errcode_for_file_access(), errmsg("could not fsync ss ctl info file: %m")));
+    }
+
+    if (close(fd)) {
+        ereport(ERROR, (errcode_for_file_access(), errmsg("could not close file \"%s\": %m", SS_DORADO_CTRL_FILE)));
+    }
 }
 
 /*
@@ -6739,6 +6877,18 @@ void BootStrapXLOG(void)
                       errmsg("update dorado ctl info: len:%u, version:%u, start:%lu, end:%lu", ctlInfo->length,
                              ctlInfo->version, ctlInfo->insertHead, ctlInfo->insertTail)));
     }
+
+    if (SS_REPLICATION_DORADO_CLUSTER) {
+        ShareStorageXLogCtl *ctlInfo = g_instance.xlog_cxt.ssReplicationXLogCtl;
+        InitSSDoradoCtlInfo(ctlInfo, sysidentifier);
+        ctlInfo->insertHead = MAXALIGN((recptr - (char *)page));
+        ctlInfo->crc = CalShareStorageCtlInfoCrc(ctlInfo);
+        WriteSSDoradoCtlInfoFile();
+        ereport(LOG, (errcode_for_file_access(),
+                      errmsg("update ss dorado ctl info: len:%u, version:%u, start:%lu", ctlInfo->length,
+                             ctlInfo->version, ctlInfo->insertHead)));
+    }
+
 #ifndef ENABLE_MULTIPLE_NODES
     if (g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
         ret = memset_s(t_thrd.shemem_ptr_cxt.dcfData, sizeof(DCFData), 0, sizeof(DCFData));
@@ -7174,6 +7324,7 @@ static void RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 void CheckBeforeTruncateXLog(XLogRecPtr endRecPtr)
 {
     const uint32 shiftSize = 32;
+    ProcTxnWorkLoad(true);
 
     if (XLogRecPtrIsInvalid(t_thrd.xlog_cxt.minRecoveryPoint) ||
         XLByteLT(endRecPtr, t_thrd.xlog_cxt.minRecoveryPoint) ||
@@ -7290,6 +7441,7 @@ static void DropAllRecoverySlotForPitr()
     List *all_archive_slots = NIL;
     all_archive_slots = GetAllRecoverySlotsName();
     if (all_archive_slots == NIL || all_archive_slots->length == 0) {
+        list_free_deep(all_archive_slots);
         return;
     }
 
@@ -8501,7 +8653,7 @@ static void XLogMakeUpRemainSegsContent(char *contentBuffer)
 
 void XLogCheckRemainSegs()
 {
-    if (SS_ONDEMAND_BUILD_DONE && !SS_ONDEMAND_RECOVERY_DONE) {
+    if (SS_ONDEMAND_BUILD_DONE && !SS_ONDEMAND_REDO_DONE) {
         return;
     }
 
@@ -8705,6 +8857,90 @@ static inline void UpdateTermFromXLog(uint32 xlTerm)
     }
 }
 
+void init_extreme_rto_standby_read_first_snapshot(const XLogRecPtr checkpoint_loc)
+{
+    if (!IsExtremeRedo()) {
+        return;
+    }
+ 
+    if (!g_instance.attr.attr_storage.EnableHotStandby) {
+        return;
+    }
+ 
+    g_instance.comm_cxt.predo_cxt.exrto_snapshot->gen_snap_time = 0;
+    g_instance.comm_cxt.predo_cxt.exrto_snapshot->read_lsn = checkpoint_loc;
+    g_instance.comm_cxt.predo_cxt.exrto_snapshot->snapshot_csn = t_thrd.xact_cxt.ShmemVariableCache->nextCommitSeqNo;
+    g_instance.comm_cxt.predo_cxt.exrto_snapshot->xmin = t_thrd.xact_cxt.ShmemVariableCache->latestCompletedXid;
+    g_instance.comm_cxt.predo_cxt.exrto_snapshot->xmax = t_thrd.xact_cxt.ShmemVariableCache->latestCompletedXid;
+    if (TransactionIdIsValid(t_thrd.xact_cxt.ShmemVariableCache->standbyXmin) &&
+        t_thrd.xact_cxt.ShmemVariableCache->standbyXmin <= t_thrd.xact_cxt.ShmemVariableCache->latestCompletedXid) {
+        g_instance.comm_cxt.predo_cxt.exrto_snapshot->xmin = t_thrd.xact_cxt.ShmemVariableCache->standbyXmin;
+    }
+}
+
+static bool hex_string_to_int(char* hex_string, uint32* result)
+{
+    uint32 num = 0;
+    char* temp = hex_string;
+    uint32 c = 0;
+    uint32 index = 0;
+ 
+    if (NULL == hex_string) {
+        return false;
+    }
+ 
+    while (*temp++ != '\0') {
+        num++;
+    }
+ 
+    while (num--) {
+        if (hex_string[num] >= 'A' && hex_string[num] <= 'F') {
+            c = (uint32)((hex_string[num] - 'A') + 10);
+        } else if (hex_string[num] >= '0' && hex_string[num] <= '9') {
+            c = (uint32)(hex_string[num] - '0');
+        } else {
+            return false;
+        }
+ 
+        *result += c << (index * 4);
+        index++;
+    }
+ 
+    return true;
+}
+ 
+static inline void set_hot_standby_recycle_xid()
+{
+    DIR *dir = NULL;
+    struct dirent *ptr = NULL;
+    uint32 segnum = 0;
+    char *dir_name = "pg_clog";
+ 
+    if ((dir = opendir(dir_name)) == NULL) {
+        return;
+    }
+    // find the first clog file
+    while ((ptr = readdir(dir)) != NULL) {
+        if (ptr->d_type != DT_REG) {
+            continue;
+        }
+        if (!hex_string_to_int(ptr->d_name, &segnum)) {
+            closedir(dir);
+            return;
+        }
+        /* one segment file has 8k*8bit/2*32 xids */
+        uint32 segnum_xid = BLCKSZ * CLOG_XACTS_PER_BYTE * SLRU_PAGES_PER_SEGMENT;
+        /* the first xid number of current segment file */
+        TransactionId xid = (uint64)segnum * segnum_xid;
+        pg_atomic_write_u64(&g_instance.undo_cxt.hotStandbyRecycleXid, xid);
+        ereport(LOG, (errmsg("Startup: write hotStandbyRecycleXid %lu", xid)));
+
+        closedir(dir);
+        return;
+    }
+    closedir(dir);
+}
+
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
@@ -8752,6 +8988,7 @@ void StartupXLOG(void)
     t_thrd.xlog_cxt.startup_processing = true;
     t_thrd.xlog_cxt.RedoDone = false;
     t_thrd.xlog_cxt.currentRetryTimes = 0;
+    t_thrd.xlog_cxt.ssXlogReadFailedTimes = 0;
     t_thrd.xlog_cxt.forceFinishHappened = false;
     g_instance.comm_cxt.predo_cxt.redoPf.recovery_done_ptr = 0;
     g_instance.comm_cxt.predo_cxt.redoPf.redo_done_time = 0;
@@ -8808,13 +9045,15 @@ void StartupXLOG(void)
         SSReadControlFile(REFORM_CTRL_PAGE);
         if (SS_CLUSTER_ONDEMAND_NOT_NORAML && SS_PRIMARY_MODE) {
             if (SS_STANDBY_PROMOTING) {
-                ereport(FATAL, (errmsg("Do not allow switchover if on-demand recovery is not finish")));
+                ereport(FATAL, (errmsg("[On-demand] Do not allow switchover if ondemand recovery is not finish")));
             }
             Assert(g_instance.dms_cxt.SSReformerControl.recoveryInstId != INVALID_INSTANCEID);
             src_id = g_instance.dms_cxt.SSReformerControl.recoveryInstId;
-            ereport(LOG, (errmsg("[on-demand]: On-demand recovery do not finish in last reform, "
+            ereport(LOG, (errmsg("[On-demand]: Ondemand recovery do not finish in last reform, "
                                  "reading control file of original primary:%d", src_id)));
             SSOndemandRecoveryExitNormal = false;
+        } else if (SS_REPLICATION_DORADO_CLUSTER) {
+            src_id = SSGetPrimaryInstId();
         } else {
             if (SS_STANDBY_FAILOVER || SS_STANDBY_PROMOTING) {
                 src_id = SSGetPrimaryInstId();
@@ -9023,6 +9262,9 @@ void StartupXLOG(void)
 
     if (ENABLE_DMS && ENABLE_DSS) {
         SSGetRecoveryXlogPath();
+        if (SS_REPLICATION_DORADO_CLUSTER) {
+            SSDoradoGetInstidList();
+        }
         xlogreader = SSXLogReaderAllocate(&SSXLogPageRead, &readprivate, ALIGNOF_BUFFER);
         close_readFile_if_open();
         if (SS_STANDBY_FAILOVER || SS_STANDBY_PROMOTING) {
@@ -9031,6 +9273,13 @@ void StartupXLOG(void)
             SSCLOGShmemClear();
             SSMultiXactShmemClear();
         }
+        ereport(LOG, (errmsg("[SS] Recovery instance %d, my instance %d, checkpoint record loc %X/%X, redo loc %X/%X",
+            g_instance.dms_cxt.SSRecoveryInfo.recovery_inst_id,
+            g_instance.attr.attr_storage.dms_attr.instance_id,
+            (uint32)(t_thrd.shemem_ptr_cxt.ControlFile->checkPoint >> 32),
+            (uint32)t_thrd.shemem_ptr_cxt.ControlFile->checkPoint,
+            (uint32)(t_thrd.shemem_ptr_cxt.ControlFile->checkPointCopy.redo >> 32),
+            (uint32)t_thrd.shemem_ptr_cxt.ControlFile->checkPointCopy.redo)));
     } else {
         xlogreader = XLogReaderAllocate(&XLogPageRead, &readprivate);
     }
@@ -9302,7 +9551,7 @@ void StartupXLOG(void)
     t_thrd.shemem_ptr_cxt.XLogCtl->ckptXid = checkPoint.oldestXid;
     t_thrd.shemem_ptr_cxt.XLogCtl->IsRecoveryDone = false;
     t_thrd.shemem_ptr_cxt.XLogCtl->IsOnDemandBuildDone = false;
-    t_thrd.shemem_ptr_cxt.XLogCtl->IsOnDemandRecoveryDone = false;
+    t_thrd.shemem_ptr_cxt.XLogCtl->IsOnDemandRedoDone = false;
 
     latestCompletedXid = checkPoint.nextXid;
     TransactionIdRetreat(latestCompletedXid);
@@ -9378,6 +9627,7 @@ void StartupXLOG(void)
     } else {
         pg_atomic_write_u64(&g_instance.undo_cxt.globalRecycleXid, InvalidTransactionId);
     }
+    set_hot_standby_recycle_xid();
 
     /*
      * Initialize replication slots, before there's a chance to remove
@@ -9482,20 +9732,34 @@ void StartupXLOG(void)
         t_thrd.xlog_cxt.InRecovery = false;
     }
 
+    g_instance.dms_cxt.SSRecoveryInfo.in_ondemand_recovery = false;
+    SetDefaultExtremeRtoMode();
     if (SS_PRIMARY_MODE && ENABLE_ONDEMAND_RECOVERY && (SS_STANDBY_FAILOVER || SS_PRIMARY_NORMAL_REFORM) &&
         t_thrd.xlog_cxt.InRecovery == true) {
         if (SSOndemandRecoveryExitNormal) {
             g_instance.dms_cxt.SSRecoveryInfo.in_ondemand_recovery = true;
+            g_instance.dms_cxt.SSRecoveryInfo.cluster_ondemand_status= CLUSTER_IN_ONDEMAND_BUILD;
             /* for other nodes in cluster and ondeamnd recovery failed */
+            LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
             g_instance.dms_cxt.SSReformerControl.clusterStatus = CLUSTER_IN_ONDEMAND_BUILD;
             g_instance.dms_cxt.SSReformerControl.recoveryInstId = g_instance.dms_cxt.SSRecoveryInfo.recovery_inst_id;
-            SSSaveReformerCtrl();
+            SSUpdateReformerCtrl();
+            LWLockRelease(ControlFileLock);
+            SSRequestAllStandbyReloadReformCtrlPage();
             SetOndemandExtremeRtoMode();
             ereport(LOG, (errmsg("[On-demand] replayed in extreme rto ondemand recovery mode")));
         } else {
             ereport(LOG, (errmsg("[On-demand] do not allow replay in ondemand recovery if last ondemand recovery "
                 "crash, replayed in extreme rto recovery mode")));
         }
+    }
+
+    if (SS_PRIMARY_MODE || SS_REPLICATION_MAIN_STANBY_NODE) {
+        LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+        g_instance.dms_cxt.SSReformerControl.clusterRunMode =
+            (ClusterRunMode)g_instance.attr.attr_common.cluster_run_mode;
+        SSUpdateReformerCtrl();
+        LWLockRelease(ControlFileLock);
     }
 
     ReadRemainSegsFile();
@@ -9583,6 +9847,9 @@ void StartupXLOG(void)
                                             "have to use another backup for recovery.")));
                 }
                 t_thrd.shemem_ptr_cxt.ControlFile->backupEndPoint = t_thrd.shemem_ptr_cxt.ControlFile->minRecoveryPoint;
+                ereport(LOG, (errmsg("backup_from_standby: set backup end point to %X/%X",
+                                     (uint32)(t_thrd.shemem_ptr_cxt.ControlFile->backupEndPoint >> 32),
+                                     (uint32)t_thrd.shemem_ptr_cxt.ControlFile->backupEndPoint)));
             } else if (backupFromRoach) {
                 t_thrd.shemem_ptr_cxt.ControlFile->backupEndPoint = t_thrd.shemem_ptr_cxt.ControlFile->minRecoveryPoint;
                 ereport(LOG, (errmsg("perform roach backup restore and set backup end point to %X/%X",
@@ -9762,12 +10029,15 @@ void StartupXLOG(void)
          * redo LSN and future consistent point.
          */
         ereport(LOG, (errmsg("redo minRecoveryPoint at %X/%X; backupStartPoint at %X/%X; "
-                             "backupEndRequired %s",
+                             "backupEndPoint at %X/%X;backupEndRequired %s",
                              (uint32)(t_thrd.xlog_cxt.minRecoveryPoint >> 32), (uint32)t_thrd.xlog_cxt.minRecoveryPoint,
                              (uint32)(t_thrd.shemem_ptr_cxt.ControlFile->backupStartPoint >> 32),
                              (uint32)t_thrd.shemem_ptr_cxt.ControlFile->backupStartPoint,
+                             (uint32)(t_thrd.shemem_ptr_cxt.ControlFile->backupEndPoint >> 32),
+                             (uint32)t_thrd.shemem_ptr_cxt.ControlFile->backupEndPoint,
                              t_thrd.shemem_ptr_cxt.ControlFile->backupEndRequired ? "TRUE" : "FALSE")));
 
+        init_extreme_rto_standby_read_first_snapshot(checkPoint.redo);
         pg_atomic_write_u32(&t_thrd.walreceiverfuncs_cxt.WalRcv->rcvDoneFromShareStorage, false);
         // Allow read-only connections immediately if we're consistent already.
         CheckRecoveryConsistency();
@@ -9819,6 +10089,7 @@ void StartupXLOG(void)
             update_stop_barrier();
 #endif
             INSTR_TIME_SET_CURRENT(rec_startTime);
+            INSTR_TIME_SET_CURRENT(g_instance.dms_cxt.SSReformInfo.redo_start_time);
             t_thrd.xlog_cxt.RedoStartLSN = t_thrd.xlog_cxt.ReadRecPtr;
             g_instance.comm_cxt.predo_cxt.redoPf.redo_start_ptr = t_thrd.xlog_cxt.RedoStartLSN;
             knl_g_set_redo_finish_status(0);
@@ -10015,8 +10286,10 @@ void StartupXLOG(void)
                                  (uint32)t_thrd.xlog_cxt.EndRecPtr)));
 
             INSTR_TIME_SET_CURRENT(rec_endTime);
+            INSTR_TIME_SET_CURRENT(g_instance.dms_cxt.SSReformInfo.redo_end_time);
             INSTR_TIME_SUBTRACT(rec_endTime, rec_startTime);
             redoTotalBytes = t_thrd.xlog_cxt.EndRecPtr - redoStartPtr;
+            g_instance.dms_cxt.SSReformInfo.redo_total_bytes = redoTotalBytes;
             uint64 totalTime = INSTR_TIME_GET_MICROSEC(rec_endTime);
             uint64 speed = 0;  // MB/s
             if (totalTime > 0) {
@@ -10052,8 +10325,12 @@ void StartupXLOG(void)
             ereport(LOG, (errmsg("redo is not required")));
             if (SS_IN_ONDEMAND_RECOVERY) {
                 g_instance.dms_cxt.SSRecoveryInfo.in_ondemand_recovery = false;
+                g_instance.dms_cxt.SSRecoveryInfo.cluster_ondemand_status= CLUSTER_NORMAL;
+                LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
                 g_instance.dms_cxt.SSReformerControl.clusterStatus = CLUSTER_NORMAL;
-                SSSaveReformerCtrl();
+                SSUpdateReformerCtrl();
+                LWLockRelease(ControlFileLock);
+                SSRequestAllStandbyReloadReformCtrlPage();
             }
         }
     }
@@ -10139,10 +10416,15 @@ void StartupXLOG(void)
     /* only primary mode can call getwritepermissionsharedstorage wnen dorado hyperreplication
      * and dms enabled.
      */
-    if(!SS_PRIMARY_STANDBY_CLUSTER_STANDBY) {
+    if(IS_SHARED_STORAGE_MODE) {
         GetWritePermissionSharedStorage();
         CheckShareStorageCtlInfo(EndOfLog);   
     }
+
+    if (SS_REPLICATION_PRIMARY_NODE) {
+        CheckSSDoradoCtlInfo(EndOfLog);
+    }
+    
    
     /*
      * Complain if we did not roll forward far enough to render the backup
@@ -10283,6 +10565,14 @@ void StartupXLOG(void)
     } else {
         Insert->fullPageWrites = t_thrd.xlog_cxt.lastFullPageWrites;
     }
+
+    if (IS_EXRTO_READ) {
+        /* we are going to be master, we need to recycle residual_undo_file again */
+        (void)LWLockAcquire(ExrtoRecycleResidualUndoLock, LW_EXCLUSIVE);
+        g_instance.undo_cxt.is_exrto_residual_undo_file_recycled = false;
+        LWLockRelease(ExrtoRecycleResidualUndoLock);
+    }
+
     LocalSetXLogInsertAllowed();
     UpdateFullPageWrites();
     t_thrd.xlog_cxt.LocalXLogInsertAllowed = -1;
@@ -10334,7 +10624,7 @@ void StartupXLOG(void)
     t_thrd.xlog_cxt.InRecovery = false;
     g_instance.roach_cxt.isRoachRestore = false;
 
-    if (!SS_STANDBY_FAILOVER && !SS_STANDBY_PROMOTING && !SS_IN_ONDEMAND_RECOVERY) {
+    if (!SS_STANDBY_FAILOVER && !SS_STANDBY_PROMOTING && !SS_IN_ONDEMAND_RECOVERY && SSOndemandRecoveryExitNormal) {
         LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
         t_thrd.shemem_ptr_cxt.ControlFile->state = DB_IN_PRODUCTION;
         t_thrd.shemem_ptr_cxt.ControlFile->time = (pg_time_t)time(NULL);
@@ -10389,29 +10679,6 @@ void StartupXLOG(void)
     /* Shut down readFile facility, free space. */
     ShutdownReadFileFacility();
 
-    if (SS_STANDBY_FAILOVER && SS_PRIMARY_CLUSTER_STANDBY) {
-        ereport(LOG, (errmodule(MOD_DMS),
-                      errmsg("[SS failover] standby promoting: copy endofxlog pageptr from primary to standby")));
-        XLogRecPtr EndOfLogPagePtr = EndOfLog - (EndOfLog % XLOG_BLCKSZ);
-        SSXLOGCopyFromOldPrimary(xlogreader, EndOfLogPagePtr);
-
-        ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS failover] standby promoting: copy xlog from local to dorado")));
-        ShareStorageXLogCtl *sharestorageCtl = g_instance.xlog_cxt.shareStorageXLogCtl;
-        XLogRecPtr localFlush = InvalidXLogRecPtr;
-        localFlush = EndOfLog;
-        XLogRecPtr maxPosCanWrite = GetMaxPosCanOverWrite();
-        uint32 shiftSize = 32;
-        ereport(LOG,
-                (errmsg("start to copy xlog from local to shared storage, localFlush: %X/%X, maxPosCanWrite: %X/%X.",
-                        static_cast<uint32>(localFlush >> shiftSize), static_cast<uint32>(localFlush),
-                        static_cast<uint32>(maxPosCanWrite >> shiftSize), static_cast<uint32>(maxPosCanWrite))));
-
-        if (XLByteLT(sharestorageCtl->insertHead, maxPosCanWrite)) {
-            XLogRecPtr expectPos = XLByteLT(localFlush, maxPosCanWrite) ? localFlush : maxPosCanWrite;
-            SSDoXLogCopyFromLocal(expectPos);
-        }
-    }
-
     /* Shut down the xlog reader facility. */
     XLogReaderFree(xlogreader);
     xlogreader = NULL;
@@ -10462,14 +10729,14 @@ void StartupXLOG(void)
         }
     }
 
-    if (SS_STANDBY_FAILOVER || SS_STANDBY_PROMOTING) {
+    if (SS_STANDBY_FAILOVER || SS_STANDBY_PROMOTING || !SSOndemandRecoveryExitNormal) {
         if (SS_STANDBY_FAILOVER) {
             g_instance.dms_cxt.SSRecoveryInfo.failover_ckpt_status = ALLOW_CKPT;
             pg_memory_barrier();
         }
         if (!SS_IN_ONDEMAND_RECOVERY) {
             ereport(LOG, (errmodule(MOD_DMS),
-                errmsg("[SS switchover/SS failover] standby promoting: start full checkpoint.")));
+                errmsg("[SS switchover/SS failover/SS normal reform] start full checkpoint.")));
             RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_IMMEDIATE | CHECKPOINT_WAIT);
             LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
             t_thrd.shemem_ptr_cxt.ControlFile->state = DB_IN_PRODUCTION;
@@ -10478,7 +10745,7 @@ void StartupXLOG(void)
             LWLockRelease(ControlFileLock);
             SSRecheckBufferPool();
             ereport(LOG, (errmodule(MOD_DMS),
-                errmsg("[SS switchover/SS failover] standby promoting: finished full checkpoint"
+                errmsg("[SS switchover/SS failover/SS normal reform] finished full checkpoint"
                     "and update control file")));
         }
     }
@@ -10517,7 +10784,7 @@ void StartupXLOG(void)
 
     if (SS_IN_ONDEMAND_RECOVERY) {
         /* We wait at here */
-        ereport(LOG, (errmsg("[SS] On-demand redo, nextXid: " XID_FMT ", startupMaxXid: " XID_FMT
+        ereport(LOG, (errmsg("[On-demand] ondemand redo, nextXid: " XID_FMT ", startupMaxXid: " XID_FMT
                              ", recentLocalXmin: " XID_FMT ", recentGlobalXmin: %lu, PendingPreparedXacts: %d"
                              ", NextCommitSeqNo: %lu, cutoff_csn_min: %lu.",
                              NextXidAfterReovery, t_thrd.xact_cxt.ShmemVariableCache->startupMaxXid,
@@ -10538,7 +10805,7 @@ void StartupXLOG(void)
         LWLockRelease(ControlFileLock);
         SSRecheckBufferPool();
         ereport(LOG, (errmodule(MOD_DMS),
-            errmsg("[SS][on demand recovery] finished full checkpoint and update control file")));
+            errmsg("[On-demand] finished full checkpoint and update control file")));
 
         NotifyGscRecoveryFinished();
         if (ENABLE_INCRE_CKPT) {
@@ -10551,9 +10818,13 @@ void StartupXLOG(void)
     }
 
     if (SS_PRIMARY_MODE) {
+        g_instance.dms_cxt.SSRecoveryInfo.cluster_ondemand_status= CLUSTER_NORMAL;
         /* for other nodes in cluster */
+        LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
         g_instance.dms_cxt.SSReformerControl.clusterStatus = CLUSTER_NORMAL;
-        SSSaveReformerCtrl();
+        SSUpdateReformerCtrl();
+        LWLockRelease(ControlFileLock);
+        SSRequestAllStandbyReloadReformCtrlPage();
     }
 
     ereport(LOG, (errmsg("redo done, nextXid: " XID_FMT ", startupMaxXid: " XID_FMT ", recentLocalXmin: " XID_FMT
@@ -10574,8 +10845,12 @@ void StartupXLOG(void)
     }
 #endif
 
-    if (ENABLE_DMS && ENABLE_REFORM && !SS_PRIMARY_DEMOTED && !DORADO_STANDBY_CLUSTER) {
+    if (ENABLE_DMS && ENABLE_REFORM && !SS_PRIMARY_DEMOTED && !SS_REPLICATION_STANDBY_CLUSTER) {
         StartupWaitReform();
+    }
+
+    if (SS_REPLICATION_MAIN_STANBY_NODE) {
+        SendPostmasterSignal(PMSIGNAL_UPDATE_PROMOTING);
     }
 }
 
@@ -10760,7 +11035,7 @@ void ArchiveXlogForForceFinishRedo(XLogReaderState *xlogreader, TermFileData *te
 void backup_cut_xlog_file(XLogRecPtr lastReplayedEndRecPtr)
 {
     errno_t errorno = EOK;
-    ereport(DEBUG1, (errmsg("end of backup reached")));
+    ereport(LOG, (errmsg("end of backup reached")));
 
     LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
@@ -11294,7 +11569,7 @@ void ShutdownXLOG(int code, Datum arg)
 {
     if (SS_PRIMARY_DEMOTING) {
         ereport(LOG, (errmsg("[SS switchover] primary demote: doing shutdown checkpoint")));
-        if (DORADO_STANDBY_CLUSTER) {
+        if (SS_REPLICATION_STANDBY_CLUSTER) {
             CreateRestartPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
         } else {
             CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
@@ -11327,7 +11602,7 @@ void ShutdownXLOG(int code, Datum arg)
             }
 
             if (g_instance.wal_cxt.upgradeSwitchMode != ExtremelyFast) {
-                if (DORADO_STANDBY_CLUSTER) {
+                if (SS_REPLICATION_STANDBY_CLUSTER) {
                     CreateRestartPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
                 } else {
                     CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
@@ -11548,9 +11823,9 @@ void CreateCheckPoint(int flags)
                 (errcode(ERRCODE_INVALID_TRANSACTION_STATE), errmsg("can't create a checkpoint during recovery")));
     }
 
-    if (!SSXLogInsertAllowed()) {
+    if (SS_REPLICATION_STANDBY_CLUSTER) {
         ereport(ERROR,
-                (errcode(ERRCODE_INVALID_TRANSACTION_STATE), errmsg("can't create a checkpoint on SS standby node")));
+                (errcode(ERRCODE_INVALID_TRANSACTION_STATE), errmsg("can't create a checkpoint on SS dorado standby cluster")));
     }
 
     /* allow standby do checkpoint only after it has promoted AND has finished recovery. */
@@ -11567,6 +11842,9 @@ void CreateCheckPoint(int flags)
         return;
     } else if (g_instance.dms_cxt.SSRecoveryInfo.failover_ckpt_status == NOT_ALLOW_CKPT) {
         ereport(LOG, (errmodule(MOD_DMS), errmsg("[SS failover] do not do CreateCheckpoint during failover")));
+        return;
+    } else if (SS_IN_ONDEMAND_RECOVERY && !SS_ONDEMAND_REDO_DONE) {
+        /* do not allow ckpt in ondemand recovery if xlog do not redo done, for valid ckpt loc in control file */
         return;
     }
 
@@ -12629,7 +12907,8 @@ bool CreateRestartPoint(int flags)
             return false;
         }
     }
-
+    (void)LWLockAcquire(RedoTruncateLock, LW_SHARED);
+    LWLockRelease(RedoTruncateLock);
     /*
      * Update pg_control, using current time.  Check that it still shows
      * IN_ARCHIVE_RECOVERY state and an older checkpoint, else do nothing;
@@ -12805,7 +13084,7 @@ static XLogSegNo CalcRecycleSegNoForHadrMainStandby(XLogRecPtr curFlush, XLogSeg
 
         XLByteToSeg(minRequired, slotSegNo);
 
-        if (slotSegNo <= 0) {
+        if (slotSegNo == 0) {
             /* segno = 1 show all file should be keep */
             SegNoCanRecycled = 1;
             ereport(LOG, (errmsg("main standby keep all the xlog segments, because the minimal replication slot segno "
@@ -12937,7 +13216,7 @@ static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo, XLogRecPtr curIns
 
         XLByteToSeg(keep, slotSegNo);
 
-        if (slotSegNo <= 0) {
+        if (slotSegNo == 0) {
             /* segno = 1 show all file should be keep */
             segno = 1;
             ereport(LOG, (errmsg("keep all the xlog segments, because the minimal replication slot segno "
@@ -12955,7 +13234,7 @@ static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo, XLogRecPtr curIns
         XLogSegNo slotSegNo;
         XLByteToSeg(xlogcopystartptr, slotSegNo);
 
-        if (slotSegNo <= 0) {
+        if (slotSegNo == 0) {
             /* segno = 1 show all file should be keep */
             segno = 1;
             ereport(LOG, (errmsg("keep all the xlog segments, because there is a full-build task in the backend, "
@@ -12988,7 +13267,7 @@ static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo, XLogRecPtr curIns
      * while dms and dss enable, t_thrd.xlog_cxt.server_mode only is normal_mode, we do additional
      * check for dms and dss enabling.
      */
-    if (!ENABLE_DMS && t_thrd.xlog_cxt.server_mode == PRIMARY_MODE) {
+    if ((!ENABLE_DMS && t_thrd.xlog_cxt.server_mode == PRIMARY_MODE) || SS_REPLICATION_PRIMARY_NODE) {
         if (WalSndInProgress(SNDROLE_PRIMARY_BUILDSTANDBY) ||
             pg_atomic_read_u32(&g_instance.comm_cxt.current_gsrewind_count) > 0) {
             /* segno = 1 show all file should be keep */
@@ -13061,6 +13340,19 @@ static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo, XLogRecPtr curIns
             segno = mainStandbySegNo;
         }
     }
+
+    if (RecoveryInProgress() && IS_EXRTO_READ && !dummyStandbyMode &&
+        !g_instance.attr.attr_storage.enable_exrto_standby_read_opt) {
+        XLogRecPtr recycle_recptr = pg_atomic_read_u64(&g_instance.comm_cxt.predo_cxt.global_recycle_lsn);
+        XLogSegNo recyle_segno;
+        XLByteToSeg(recycle_recptr, recyle_segno);
+        if (recyle_segno == 0) {
+            segno = 1;
+        } else if (recyle_segno < segno) {
+            segno = recyle_segno;
+        }
+    }
+
     /* don't delete WAL segments newer than the calculated segment */
     if (segno < *logSegNo && segno > 0) {
         *logSegNo = segno;
@@ -13260,6 +13552,14 @@ bool IsCheckPoint(const XLogRecParseState *parseState)
     RmgrId rmid = parseState->blockparse.blockhead.xl_rmid;
 
     return rmid == RM_XLOG_ID && (info == XLOG_CHECKPOINT_SHUTDOWN || info == XLOG_CHECKPOINT_ONLINE);
+}
+
+bool is_backup_end(const XLogRecParseState *parse_state)
+{
+    uint8 info = parse_state->blockparse.blockhead.xl_info & (~XLR_INFO_MASK);
+    RmgrId rmid = parse_state->blockparse.blockhead.xl_rmid;
+ 
+    return rmid == RM_XLOG_ID && (info == XLOG_BACKUP_END);
 }
 
 bool HasTimelineUpdate(XLogReaderState *record)
@@ -13555,7 +13855,8 @@ void xlog_redo(XLogReaderState *record)
         rc = memcpy_s(&startpoint, sizeof(startpoint), XLogRecGetData(record), sizeof(startpoint));
         securec_check(rc, "", "");
 
-        if (XLByteEQ(t_thrd.shemem_ptr_cxt.ControlFile->backupStartPoint, startpoint)) {
+        if (XLByteEQ(t_thrd.shemem_ptr_cxt.ControlFile->backupStartPoint, startpoint) &&
+            t_thrd.shemem_ptr_cxt.ControlFile->backupEndRequired) {
             /*
              * We have reached the end of base backup, the point where
              * pg_stop_backup() was done. The data on disk is now consistent.
@@ -13563,7 +13864,7 @@ void xlog_redo(XLogReaderState *record)
              * sure we don't allow starting up at an earlier point even if
              * recovery is stopped and restarted soon after this.
              */
-            ereport(DEBUG1, (errmsg("end of backup reached")));
+            ereport(LOG, (errmsg("end of backup reached")));
 
             LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
@@ -14959,7 +15260,9 @@ XLogRecPtr do_roach_stop_backup(const char *backupidstr)
 {
     bool backup_started_in_recovery = false;
     XLogCtlInsert *Insert = &t_thrd.shemem_ptr_cxt.XLogCtl->Insert;
+#if defined(__aarch64__) || defined(__x86_64__) || defined(__i386__)
     uint64 current_bytepos;
+#endif
     XLogRecPtr stoppoint;
     char backup_label[MAXPGPATH];
     char backup_label_done[MAXPGPATH];
@@ -14992,7 +15295,7 @@ XLogRecPtr do_roach_stop_backup(const char *backupidstr)
         stoppoint = t_thrd.shemem_ptr_cxt.ControlFile->minRecoveryPoint;
         LWLockRelease(ControlFileLock);
     } else {
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
         current_bytepos = pg_atomic_barrier_read_u64((uint64 *)&Insert->CurrBytePos);
         stoppoint = XLogBytePosToEndRecPtr(current_bytepos);
 #else
@@ -15244,7 +15547,7 @@ XLogRecPtr enable_delay_ddl_recycle(void)
 
     LWLockAcquire(CBMParseXlogLock, LW_EXCLUSIVE);
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     uint64 current_bytepos = pg_atomic_barrier_read_u64((uint64 *)&Insert->CurrBytePos);
     curDelayRange.startLSN = XLogBytePosToEndRecPtr(current_bytepos);
 #else
@@ -15378,7 +15681,7 @@ void disable_delay_ddl_recycle(XLogRecPtr barrierLSN, bool isForce, XLogRecPtr *
      */
     LWLockAcquire(RelfilenodeReuseLock, LW_EXCLUSIVE);
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     uint64 current_bytepos = pg_atomic_barrier_read_u64((uint64 *)&Insert->CurrBytePos);
     delayRange.endLSN = XLogBytePosToEndRecPtr(current_bytepos);
 #else
@@ -15466,7 +15769,7 @@ XLogRecPtr enable_delay_ddl_recycle_with_slot(const char *slotname)
     /* hold this lock to push cbm parse exact to the ddl stop position */
     LWLockAcquire(CBMParseXlogLock, LW_EXCLUSIVE);
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     uint64 current_bytepos = pg_atomic_barrier_read_u64((uint64 *)&Insert->CurrBytePos);
     delay_start_lsn = XLogBytePosToEndRecPtr(current_bytepos);
 #else
@@ -15538,7 +15841,7 @@ void disable_delay_ddl_recycle_with_slot(const char *slotname, XLogRecPtr *start
      */
     LWLockAcquire(RelfilenodeReuseLock, LW_EXCLUSIVE);
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     uint64 current_bytepos = pg_atomic_barrier_read_u64((uint64 *)&Insert->CurrBytePos);
     delay_end_lsn = XLogBytePosToEndRecPtr(current_bytepos);
 #else
@@ -15898,8 +16201,8 @@ void SetXLogReplayRecPtr(XLogRecPtr readRecPtr, XLogRecPtr endRecPtr)
     SpinLockRelease(&xlogctl->info_lck);
     if (isUpdated) {
         RedoSpeedDiag(readRecPtr, endRecPtr);
+        update_dirty_page_queue_rec_lsn(readRecPtr);
     }
-    update_dirty_page_queue_rec_lsn(readRecPtr);
 #ifndef ENABLE_MULTIPLE_NODES
     if (g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
         int ret = dcf_set_election_priority(1, endRecPtr);
@@ -15977,7 +16280,7 @@ XLogRecPtr GetXLogInsertRecPtr(void)
     volatile XLogCtlInsert *Insert = &t_thrd.shemem_ptr_cxt.XLogCtl->Insert;
     uint64 current_bytepos;
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     current_bytepos = pg_atomic_barrier_read_u64((uint64 *)&Insert->CurrBytePos);
 #else
     SpinLockAcquire(&Insert->insertpos_lck);
@@ -15999,7 +16302,7 @@ XLogRecPtr GetXLogInsertEndRecPtr(void)
     volatile XLogCtlInsert *Insert = &t_thrd.shemem_ptr_cxt.XLogCtl->Insert;
     uint64 current_bytepos;
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     current_bytepos = pg_atomic_barrier_read_u64((uint64 *)&Insert->CurrBytePos);
 #else
     SpinLockAcquire(&Insert->insertpos_lck);
@@ -16217,6 +16520,9 @@ static bool read_tablespace_map(List **tablespaces)
 /* * Error context callback for errors occurring during rm_redo(). */
 void rm_redo_error_callback(void *arg)
 {
+    if (arg == NULL) {
+        return;
+    }
     XLogReaderState *record = (XLogReaderState *)arg;
     StringInfoData buf;
 
@@ -17236,7 +17542,9 @@ bool CheckForFailoverTrigger(void)
          */
         ResetSlotLSNEndRecovery(slotname);
 
-        SendPostmasterSignal(PMSIGNAL_UPDATE_PROMOTING);
+        if (!SS_REPLICATION_MAIN_STANBY_NODE) {
+            SendPostmasterSignal(PMSIGNAL_UPDATE_PROMOTING);
+        }  
         ret = true;
         goto exit;
     }
@@ -18102,7 +18410,7 @@ bool IsRoachRestore(void)
 }
 
 const uint UPDATE_REC_XLOG_NUM = 4;
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
 bool atomic_update_dirty_page_queue_rec_lsn(XLogRecPtr current_insert_lsn, bool need_immediately_update)
 {
     XLogRecPtr cur_rec_lsn = InvalidXLogRecPtr;
@@ -18159,7 +18467,7 @@ void update_dirty_page_queue_rec_lsn(XLogRecPtr current_insert_lsn, bool need_im
         }
     }
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     is_update = atomic_update_dirty_page_queue_rec_lsn(current_insert_lsn, need_immediately_update);
 #else
     SpinLockAcquire(&g_instance.ckpt_cxt_ctl->queue_lock);
@@ -18179,7 +18487,7 @@ void update_dirty_page_queue_rec_lsn(XLogRecPtr current_insert_lsn, bool need_im
 uint64 get_dirty_page_queue_rec_lsn()
 {
     uint64 dirty_page_queue_rec_lsn = 0;
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__aarch64__) && !defined(__USE_SPINLOCK)
     dirty_page_queue_rec_lsn = pg_atomic_barrier_read_u64(&g_instance.ckpt_cxt_ctl->dirty_page_queue_reclsn);
 #else
     SpinLockAcquire(&g_instance.ckpt_cxt_ctl->queue_lock);
@@ -18663,7 +18971,10 @@ int WriteXlogToShareStorage(XLogRecPtr startLsn, char *buf, int writeLen)
 
 pg_crc32c CalShareStorageCtlInfoCrc(const ShareStorageXLogCtl *ctlInfo)
 {
-    Assert(g_instance.xlog_cxt.shareStorageopCtl.isInit);
+    if (IS_SHARED_STORAGE_MODE) {
+        Assert(g_instance.xlog_cxt.shareStorageopCtl.isInit);
+    }
+    
     pg_crc32c crc;
     INIT_CRC32C(crc);
     COMP_CRC32C(crc, (char*)ctlInfo, offsetof(ShareStorageXLogCtl, crc));
@@ -18732,43 +19043,83 @@ void UpdatePostgresqlFile(const char *optName, const char *gucLine)
     release_file_lock(&filelock);
 }
 
-void ShareStorageInit()
+void SSWriteDoradoCtlInfoFile(int fd, char* buffer)
 {
-    if (g_instance.attr.attr_storage.xlog_file_path != NULL && g_instance.attr.attr_storage.xlog_file_size > 0) {
-        bool found = false;
-        void *tmpBuf = ShmemInitStruct("share storage Ctl", CalShareStorageCtlSize(), &found);
-        g_instance.xlog_cxt.shareStorageXLogCtl = (ShareStorageXLogCtl *)TYPEALIGN(MEMORY_ALIGNED_SIZE, tmpBuf);
-        g_instance.xlog_cxt.shareStorageXLogCtlOrigin = tmpBuf;
-        InitDoradoStorage(g_instance.attr.attr_storage.xlog_file_path,
-            (uint64)g_instance.attr.attr_storage.xlog_file_size);
-        if (!IsInitdb && g_instance.attr.attr_storage.xlog_lock_file_path != NULL) {
-            g_instance.xlog_cxt.shareStorageLockFd = BasicOpenFile(g_instance.attr.attr_storage.xlog_lock_file_path,
-                O_CREAT | O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
-            if (g_instance.xlog_cxt.shareStorageLockFd < 0) {
-                ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m",
-                    g_instance.attr.attr_storage.xlog_lock_file_path)));
-            }
-        }
+    Assert(ENABLE_DSS && SS_REPLICATION_DORADO_CLUSTER);
+    Assert(fd > 0);
+    errno = EOK;
+    if (pwrite(fd, buffer, SS_DORADO_CTL_INFO_SIZE, 0) != SS_DORADO_CTL_INFO_SIZE) {
+        if (errno == 0) {
+            errno = ENOSPC;
+        }  
+        ereport(PANIC, (errcode_for_file_access(), errmsg("could not write to ss ctl info file: %m")));
+    }
 
-        if (((uint64)g_instance.attr.attr_storage.xlog_file_size !=
-            g_instance.xlog_cxt.shareStorageopCtl.xlogFileSize) && (IS_SHARED_STORAGE_STANDBY_CLUSTER)) {
-            uint32 const bufSz = 256;
-            char buf[bufSz];
+    if (pg_fsync(fd) != 0) {
+        ereport(PANIC, (errcode_for_file_access(), errmsg("could not fsync ss ctl info file: %m")));
+    }
+}
 
-            errno_t errorno = snprintf_s(buf, sizeof(buf), sizeof(buf) - 1, "%lu",
-                g_instance.xlog_cxt.shareStorageopCtl.xlogFileSize);
-            securec_check_ss(errorno, "", "");
-            SetConfigOption("xlog_file_size", buf, PGC_POSTMASTER, PGC_S_ARGV);
-            char option[bufSz];
-            errorno = snprintf_s(option, sizeof(option), sizeof(option) - 1, "xlog_file_size=%lu\n",
-                g_instance.xlog_cxt.shareStorageopCtl.xlogFileSize);
-            securec_check_ss(errorno, "", "");
-            UpdatePostgresqlFile("xlog_file_size", option);
+void SSReadDoradoCtlInfoFile()
+{
+    Assert(ENABLE_DSS && SS_REPLICATION_DORADO_CLUSTER);
+    int fd = BasicOpenFile(SS_DORADO_CTRL_FILE, O_RDWR | PG_BINARY | O_DIRECT, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        ereport(FATAL, (errcode_for_file_access(), errmsg("could not open ss ctl into file \"%s\": %m", SS_DORADO_CTRL_FILE)));
+    }
+    int readSize = CalShareStorageCtlSize();
+    char buffer[readSize] __attribute__ ((__aligned__(ALIGNOF_BUFFER)));
+
+    if (pread(fd, buffer, SS_DORADO_CTL_INFO_SIZE, 0) != SS_DORADO_CTL_INFO_SIZE) {
+        ereport(PANIC, (errcode_for_file_access(), errmsg("could not read ss ctl into file: %m")));
+    }
+
+}
+
+void NormalClusterDoradoStorageInit()
+{
+    bool found = false;
+    void *tmpBuf = ShmemInitStruct("share storage Ctl", CalShareStorageCtlSize(), &found);
+    g_instance.xlog_cxt.shareStorageXLogCtl = (ShareStorageXLogCtl *)TYPEALIGN(MEMORY_ALIGNED_SIZE, tmpBuf);
+    g_instance.xlog_cxt.shareStorageXLogCtlOrigin = tmpBuf;
+    InitDoradoStorage(g_instance.attr.attr_storage.xlog_file_path,
+    (uint64)g_instance.attr.attr_storage.xlog_file_size);
+
+    if (!IsInitdb && g_instance.attr.attr_storage.xlog_lock_file_path != NULL) {
+        g_instance.xlog_cxt.shareStorageLockFd = BasicOpenFile(g_instance.attr.attr_storage.xlog_lock_file_path,
+            O_CREAT | O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
+        if (g_instance.xlog_cxt.shareStorageLockFd < 0) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m",
+                g_instance.attr.attr_storage.xlog_lock_file_path)));
         }
 
         if (ENABLE_DMS) {
             g_instance.dms_cxt.SSRecoveryInfo.dorado_sharestorage_inited = true;
         }
+    }
+
+    if (((uint64)g_instance.attr.attr_storage.xlog_file_size !=
+        g_instance.xlog_cxt.shareStorageopCtl.xlogFileSize) && (IS_SHARED_STORAGE_STANDBY_CLUSTER)) {
+        char buf[MAX_XLOG_FILE_SIZE_BUFFER];
+
+        errno_t errorno = snprintf_s(buf, sizeof(buf), sizeof(buf) - 1, "%lu",
+            g_instance.xlog_cxt.shareStorageopCtl.xlogFileSize);
+        securec_check_ss(errorno, "", "");
+        SetConfigOption("xlog_file_size", buf, PGC_POSTMASTER, PGC_S_ARGV);
+        char option[MAX_XLOG_FILE_SIZE_BUFFER];
+        errorno = snprintf_s(option, sizeof(option), sizeof(option) - 1, "xlog_file_size=%lu\n",
+            g_instance.xlog_cxt.shareStorageopCtl.xlogFileSize);
+        securec_check_ss(errorno, "", "");
+        UpdatePostgresqlFile("xlog_file_size", option);
+    }
+}
+
+void ShareStorageInit()
+{
+    if (SS_REPLICATION_DORADO_CLUSTER) {
+        SSClusterDoradoStorageInit();
+    } else if (IS_SHARED_STORAGE_MODE) {
+        NormalClusterDoradoStorageInit();
     }
 }
 
@@ -18950,20 +19301,6 @@ XLogRecPtr GetFlushMainStandby()
     return flushptr;
 }
 
-/* SS bans data write unless current node is:
- * 1. normal: running as primary;
- * 2. switchover: primary demoting, doing shutdown checkpoint;
- * 3. switchover: standby promoting, doing StartupXLOG;
- * 4. switchover: standby promoted, running as primary de facto,
- *    waiting for DMS reformer thread to update its role.
- * 5. failover: doing StartupXLOG
- */
-bool SSXLogInsertAllowed()
-{
-    /* allow xlog write as long as to different VGs */
-    return true;
-}
-
 bool SSModifySharedLunAllowed()
 {
     if (!ENABLE_DMS ||
@@ -19049,19 +19386,124 @@ static void SSOndemandXlogCopy(XLogSegNo copySegNo, uint32 startOffset, char *co
     t_thrd.ondemand_xlog_copy_cxt.openLogOff += copyBytes;
 }
 
-static int SSReadXLog(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
+static int SSReadXLog(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int expectReadLen,
                       XLogRecPtr targetRecPtr, char *readBuf, TimeLineID *readTLI, char* xlog_path)
 {
     /* Load reader private data */
     XLogPageReadPrivate *readprivate = (XLogPageReadPrivate *)xlogreader->private_data;
     int emode = IsExtremeRedo() ? LOG : readprivate->emode;
+    bool randAccess = IsExtremeRedo() ? false : readprivate->randAccess;
+    XLogRecPtr RecPtr = targetPagePtr;
+    uint32 targetPageOff;
+    uint32 actualBytes;
+
+#ifdef USE_ASSERT_CHECKING
+    XLogSegNo targetSegNo;
+
+    XLByteToSeg(targetPagePtr, targetSegNo);
+#endif
+    targetPageOff = targetPagePtr % XLogSegSize;
+
+    /*
+     * See if we need to switch to a new segment because the requested record
+     * is not in the currently open one.
+     */
+    if (t_thrd.xlog_cxt.readFile >= 0 && !XLByteInSeg(targetPagePtr, t_thrd.xlog_cxt.readSegNo)) {
+        close(t_thrd.xlog_cxt.readFile);
+        t_thrd.xlog_cxt.readFile = -1;
+        t_thrd.xlog_cxt.readSource = 0;
+    }
+
+    XLByteToSeg(targetPagePtr, t_thrd.xlog_cxt.readSegNo);
+    XLByteAdvance(RecPtr, expectReadLen);
+
+    /* In archive or crash recovery. */
+    if (t_thrd.xlog_cxt.readFile < 0) {
+        uint32 sources;
+
+        /* Reset curFileTLI if random fetch. */
+        if (randAccess) {
+            t_thrd.xlog_cxt.curFileTLI = 0;
+        }
+
+        sources = XLOG_FROM_PG_XLOG;
+        if (t_thrd.xlog_cxt.InArchiveRecovery) {
+            sources |= XLOG_FROM_ARCHIVE;
+        }
+
+        t_thrd.xlog_cxt.readFile = SSXLogFileOpenAnyTLI(t_thrd.xlog_cxt.readSegNo, emode, sources, xlog_path);
+
+        if (t_thrd.xlog_cxt.readFile < 0) {
+            return -1;
+        }
+    }
+
+    /*
+     * At this point, we have the right segment open and if we're streaming we
+     * know the requested record is in it.
+     */
+    Assert(t_thrd.xlog_cxt.readFile != -1);
+    
+    /* read size for XLOG_FROM_PG_XLOG */
+    t_thrd.xlog_cxt.readLen = XLOG_BLCKSZ;
+
+    /* Read the requested page */
+    t_thrd.xlog_cxt.readOff = targetPageOff;
+
+
+    if (xlogreader->preReadBuf == NULL) {
+        actualBytes = (uint32)pread(t_thrd.xlog_cxt.readFile, readBuf, t_thrd.xlog_cxt.readLen, t_thrd.xlog_cxt.readOff);
+    } else {
+        actualBytes = (uint32)SSReadXlogInternal(xlogreader, targetPagePtr, targetRecPtr, readBuf, t_thrd.xlog_cxt.readLen);
+    }
+
+    if (actualBytes != t_thrd.xlog_cxt.readLen) {
+        ereport(LOG, (errcode_for_file_access(), errmsg("read xlog(start:%X/%X, pos:%u len:%d) failed : %m",
+                                                        static_cast<uint32>(targetPagePtr >> BIT_NUM_INT32),
+                                                        static_cast<uint32>(targetPagePtr), targetPageOff,
+                                                        expectReadLen)));
+        ereport(emode_for_corrupt_record(emode, RecPtr),
+                (errcode_for_file_access(),
+                 errmsg("could not read from log file %s to offset %u: %m",
+                        XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, t_thrd.xlog_cxt.readSegNo),
+                        t_thrd.xlog_cxt.readOff)));
+        goto next_record_is_invalid;
+    }
+
+    Assert(targetSegNo == t_thrd.xlog_cxt.readSegNo);
+    Assert(targetPageOff == t_thrd.xlog_cxt.readOff);
+    Assert((uint32)expectReadLen <= t_thrd.xlog_cxt.readLen);
+
+    *readTLI = t_thrd.xlog_cxt.curFileTLI;
+
+    return (int)t_thrd.xlog_cxt.readLen;
+
+next_record_is_invalid:
+    t_thrd.xlog_cxt.failedSources |= t_thrd.xlog_cxt.readSource;
+
+    if (t_thrd.xlog_cxt.readFile >= 0) {
+        close(t_thrd.xlog_cxt.readFile);
+    }
+    t_thrd.xlog_cxt.readFile = -1;
+    t_thrd.xlog_cxt.readLen = 0;
+    t_thrd.xlog_cxt.readSource = 0;
+
+    return -1;
+}
+
+static int SSDoradoReadXLog(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
+                    XLogRecPtr targetRecPtr, char *readBuf, TimeLineID *readTLI, char* xlog_path)                      
+{
+    /* Load reader private data */
+    XLogPageReadPrivate *readprivate = (XLogPageReadPrivate*)xlogreader->private_data;
+    int emode = readprivate->emode;
     XLogRecPtr RecPtr = targetPagePtr;
     uint32 targetPageOff;
     bool processtrxn = false;
-    bool fetching_ckpt = readprivate->fetching_ckpt;
-    bool randAccess = IsExtremeRedo() ? false : readprivate->randAccess;
+    bool randAccess = readprivate->randAccess;
     XLogCtlData *xlogctl = t_thrd.shemem_ptr_cxt.XLogCtl;
     XLogSegNo replayedSegNo;
+    uint32 sources;
     uint32 actualBytes;
 
 #ifdef USE_ASSERT_CHECKING
@@ -19096,19 +19538,25 @@ static int SSReadXLog(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int
         t_thrd.xlog_cxt.readSource = 0;
     }
 
+    t_thrd.xlog_cxt.readOff = targetPageOff;
+    t_thrd.xlog_cxt.readLen = XLOG_BLCKSZ;
+    t_thrd.xlog_cxt.receivedUpto = g_instance.xlog_cxt.ssReplicationXLogCtl->insertHead;
     XLByteToSeg(targetPagePtr, t_thrd.xlog_cxt.readSegNo);
     XLByteAdvance(RecPtr, reqLen);
 
+    XLogRecPtr expectedRecPtr = RecPtr;
+    if (RecPtr % XLogSegSize == 0) {
+        XLByteAdvance(expectedRecPtr, SizeOfXLogLongPHD);
+    } else if (RecPtr % XLOG_BLCKSZ == 0) {
+        XLByteAdvance(expectedRecPtr, SizeOfXLogShortPHD);
+    }
+
 retry:
     /* See if we need to retrieve more data */
+    /* In ss dorado replication, we don't start walrecwrite thread, so t_thrd.xlog_cxt.receivedUpto = 0 */
     if (t_thrd.xlog_cxt.readFile < 0 || 
         (t_thrd.xlog_cxt.readSource == XLOG_FROM_STREAM && XLByteLT(t_thrd.xlog_cxt.receivedUpto, RecPtr))) {
-        if (t_thrd.xlog_cxt.StandbyMode && t_thrd.xlog_cxt.startup_processing && DORADO_STANDBY_CLUSTER) {
-            /*
-             * In standby mode, wait for the requested record to become
-             * available, either via restore_command succeeding to restore the
-             * segment, or via walreceiver having streamed the record.
-             */
+        if (t_thrd.xlog_cxt.StandbyMode && t_thrd.xlog_cxt.startup_processing) {
             for (;;) {
                 /*
                  * Need to check here also for the case where consistency level is
@@ -19123,31 +19571,7 @@ retry:
 
                 CheckRecoveryConsistency();
                 if (WalRcvInProgress()) {
-                    XLogRecPtr expectedRecPtr = RecPtr;
                     bool havedata = false;
-
-                    /*
-                     * If we find an invalid record in the WAL streamed from
-                     * master, something is seriously wrong. There's little
-                     * chance that the problem will just go away, but PANIC is
-                     * not good for availability either, especially in hot
-                     * standby mode. Disconnect, and retry from
-                     * archive/pg_xlog again. The WAL in the archive should be
-                     * identical to what was streamed, so it's unlikely that
-                     * it helps, but one can hope...
-                     */
-                    if (t_thrd.xlog_cxt.failedSources & XLOG_FROM_STREAM) {
-                        ProcTxnWorkLoad(true);
-                        ereport(LOG, (errmsg("read from stream failed, request xlog receivedupto at %X/%X. targetRecPtr:%X/%x",
-                                             (uint32)(t_thrd.xlog_cxt.receivedUpto >> 32),
-                                             (uint32)t_thrd.xlog_cxt.receivedUpto,
-                                             (uint32)(targetRecPtr >> 32),
-                                             (uint32)targetRecPtr
-                                             )));
-                        ShutdownWalRcv();
-                        continue;
-                    }
-
                     /*
                      * Walreceiver is active, so see if new data has arrived.
                      *
@@ -19160,18 +19584,15 @@ retry:
                      * XLogReceiptTime will not advance, so the grace time
                      * alloted to conflicting queries will decrease.
                      */
-                    if (RecPtr % XLogSegSize == 0) {
-                        XLByteAdvance(expectedRecPtr, SizeOfXLogLongPHD);
-                    } else if (RecPtr % XLOG_BLCKSZ == 0) {
-                        XLByteAdvance(expectedRecPtr, SizeOfXLogShortPHD);
-                    }
-
                     if (XLByteLT(expectedRecPtr, t_thrd.xlog_cxt.receivedUpto)) {
                         havedata = true;
                     } else {
+                        havedata = false;
                         XLogRecPtr latestChunkStart;
+                        ReadSSDoradoCtlInfoFile();
+                        t_thrd.xlog_cxt.receivedUpto = g_instance.xlog_cxt.ssReplicationXLogCtl->insertHead;
+                        latestChunkStart = g_instance.xlog_cxt.ssReplicationXLogCtl->insertHead;
 
-                        t_thrd.xlog_cxt.receivedUpto = GetWalRcvWriteRecPtr(&latestChunkStart);
                         if (XLByteLT(expectedRecPtr, t_thrd.xlog_cxt.receivedUpto)) {
                             havedata = true;
                             if (!XLByteLT(RecPtr, latestChunkStart)) {
@@ -19183,38 +19604,32 @@ retry:
                         }
                     }
                     if (havedata) {
-                        /*
-                         * Great, streamed far enough. Open the file if it's
-                         * not open already.  Use XLOG_FROM_STREAM so that
-                         * source info is set correctly and XLogReceiptTime
-                         * isn't changed.
-                         */
-                        if (t_thrd.xlog_cxt.readFile < 0) {
-                            t_thrd.xlog_cxt.readFile = XLogFileRead(t_thrd.xlog_cxt.readSegNo, PANIC,
-                                                                    t_thrd.xlog_cxt.recoveryTargetTLI, XLOG_FROM_STREAM,
-                                                                    false);
-                            Assert(t_thrd.xlog_cxt.readFile >= 0);
-                        } else {
-                            /* just make sure source info is correct... */
-                            t_thrd.xlog_cxt.readSource = XLOG_FROM_STREAM;
-                            t_thrd.xlog_cxt.XLogReceiptSource = XLOG_FROM_STREAM;
-                        }
-
+                        t_thrd.xlog_cxt.readSource = XLOG_FROM_STREAM;
+                        t_thrd.xlog_cxt.XLogReceiptSource = XLOG_FROM_STREAM;
                         break;
                     }
 
                     t_thrd.xlog_cxt.RedoDone = IsRedoDonePromoting();
                     pg_memory_barrier();
 
-                    if (IS_SHARED_STORAGE_MODE) {
-                        uint32 disableConnectionNode =
-                            pg_atomic_read_u32(&g_instance.comm_cxt.localinfo_cxt.need_disable_connection_node);
-                        if (disableConnectionNode && WalRcvIsRunning()) {
-                            ereport(LOG, (errmsg("request xlog receivedupto at %X/%X.",
-                                                 (uint32)(t_thrd.xlog_cxt.receivedUpto >> 32),
-                                                 (uint32)t_thrd.xlog_cxt.receivedUpto)));
-                            ShutdownWalRcv();
-                        }
+                    if (SS_REPLICATION_MAIN_STANBY_NODE && WalRcvIsDone() && CheckForFailoverTrigger()) {
+                        ProcTxnWorkLoad(true);
+                        ereport(LOG, (errmsg("RecPtr(%X/%X), receivedUpto(%X/%X).", (uint32)(RecPtr >> 32),
+                                             (uint32)RecPtr, (uint32)(t_thrd.xlog_cxt.receivedUpto >> 32),
+                                             (uint32)t_thrd.xlog_cxt.receivedUpto)));
+
+                        ShutdownWalRcv();
+                        ShutdownDataRcv();
+                        goto triggered;
+                    }
+
+                    uint32 disableConnectionNode =
+                        pg_atomic_read_u32(&g_instance.comm_cxt.localinfo_cxt.need_disable_connection_node);
+                    if (disableConnectionNode && WalRcvIsRunning()) {
+                        ereport(LOG, (errmsg("request xlog receivedupto at %X/%X.",
+                                                (uint32)(t_thrd.xlog_cxt.receivedUpto >> 32),
+                                                (uint32)t_thrd.xlog_cxt.receivedUpto)));
+                        ShutdownWalRcv();
                     }
                     if (!processtrxn) {
                         ProcTxnWorkLoad(true);
@@ -19228,163 +19643,103 @@ retry:
                     processtrxn = false;
                     ResetLatch(&t_thrd.shemem_ptr_cxt.XLogCtl->recoveryWakeupLatch);
                 } else {
-                    uint32 sources;
-                    /*
-                     * Until walreceiver manages to reconnect, poll the
-                     * archive.
-                     */
                     if (t_thrd.xlog_cxt.readFile >= 0) {
                         close(t_thrd.xlog_cxt.readFile);
                         t_thrd.xlog_cxt.readFile = -1;
                     }
+                    t_thrd.xlog_cxt.failedSources = 0;
                     /* Reset curFileTLI if random fetch. */
                     if (randAccess) {
                         t_thrd.xlog_cxt.curFileTLI = 0;
                     }
-
+                    if (SS_REPLICATION_MAIN_STANBY_NODE && CheckForFailoverTrigger()) {
+                        goto triggered;
+                    }
                     /*
                      * Try to restore the file from archive, or read an
                      * existing file from pg_xlog.
                      */
                     sources = XLOG_FROM_ARCHIVE | XLOG_FROM_PG_XLOG;
-                    ereport(DEBUG5, (errmsg("failedSources: %u", t_thrd.xlog_cxt.failedSources)));
-                    if (!(sources & ~t_thrd.xlog_cxt.failedSources)) {
-                        /*
-                         * We've exhausted all options for retrieving the
-                         * file. Retry.
-                         */
-                        t_thrd.xlog_cxt.failedSources = 0;
 
-                        /*
-                         * Before we sleep, re-scan for possible new timelines
-                         * if we were requested to recover to the latest
-                         * timeline.
-                         */
-                        if (t_thrd.xlog_cxt.recoveryTargetIsLatest) {
-                            if (rescanLatestTimeLine()) {
-                                continue;
-                            }
-                        }
+                    if (t_thrd.startup_cxt.shutdown_requested) {
+                        ereport(LOG, (errmsg("startup shutdown")));
+                        proc_exit(0);
+                    }
 
-                        if (t_thrd.startup_cxt.shutdown_requested) {
-                            ereport(LOG, (errmsg("startup shutdown")));
-                            proc_exit(0);
-                        }
-
-                        if (!xlogctl->IsRecoveryDone) {
-                            g_instance.comm_cxt.predo_cxt.redoPf.redo_done_time = GetCurrentTimestamp();
-                            g_instance.comm_cxt.predo_cxt.redoPf.recovery_done_ptr = t_thrd.xlog_cxt.ReadRecPtr;
-                            ereport(LOG, (errmodule(MOD_REDO), errcode(ERRCODE_LOG),
-                                          errmsg("XLogPageRead IsRecoveryDone is set true,"
-                                                 "ReadRecPtr:%X/%X, EndRecPtr:%X/%X",
-                                                 (uint32)(t_thrd.xlog_cxt.ReadRecPtr >> 32),
-                                                 (uint32)(t_thrd.xlog_cxt.ReadRecPtr),
-                                                 (uint32)(t_thrd.xlog_cxt.EndRecPtr >> 32),
-                                                 (uint32)(t_thrd.xlog_cxt.EndRecPtr))));
-                            parallel_recovery::redo_dump_all_stats();
-                        }
-
-                        /*
-                         * signal postmaster to update local redo end
-                         * point to gaussdb state file.
-                         */
-                        ProcTxnWorkLoad(true);
-                        if (!xlogctl->IsRecoveryDone) {
-                            SendPostmasterSignal(PMSIGNAL_LOCAL_RECOVERY_DONE);
-                            if (DORADO_STANDBY_CLUSTER && SS_PERFORMING_SWITCHOVER) {
-                                g_instance.dms_cxt.SSClusterState = NODESTATE_STANDBY_PROMOTED;
-                            }
-                        }
-
-                        SpinLockAcquire(&xlogctl->info_lck);
-                        xlogctl->IsRecoveryDone = true;
-                        SpinLockRelease(&xlogctl->info_lck);
-                        static uint64 printFrequency = 0;
-                        if (!(IS_SHARED_STORAGE_MODE) ||
-                            pg_atomic_read_u32(&t_thrd.walreceiverfuncs_cxt.WalRcv->rcvDoneFromShareStorage)) {
-                            knl_g_set_redo_finish_status(REDO_FINISH_STATUS_LOCAL | REDO_FINISH_STATUS_CM);
-                            if ((printFrequency & 0xFF) == 0) {
-                                ereport(LOG, (errmodule(MOD_REDO), errcode(ERRCODE_LOG),
-                                          errmsg("XLogPageRead set redo finish status,"
-                                                 "ReadRecPtr:%X/%X, EndRecPtr:%X/%X",
-                                                 (uint32)(t_thrd.xlog_cxt.ReadRecPtr >> 32),
-                                                 (uint32)(t_thrd.xlog_cxt.ReadRecPtr),
-                                                 (uint32)(t_thrd.xlog_cxt.EndRecPtr >> 32),
-                                                 (uint32)(t_thrd.xlog_cxt.EndRecPtr))));
-                            }
-                            printFrequency++;
-                            /*
-                             * If it hasn't been long since last attempt, sleep 1s to
-                             * avoid busy-waiting.
-                             */
-                            if (IS_SHARED_STORAGE_MODE) {
-                                uint32 connMode =
-                                    pg_atomic_read_u32(&g_instance.comm_cxt.localinfo_cxt.need_disable_connection_node);
-                                if (connMode) {
-                                    pg_atomic_write_u32(&g_instance.comm_cxt.localinfo_cxt.need_disable_connection_node,
-                                                        false);
-                                }
-                                pg_usleep(2000000L);
-                            } else {
-#ifdef ENABLE_LITE_MODE
-                                pg_usleep(1000000L);
-#else
-                                pg_usleep(50000L);
-#endif
-                            }
-                        }
-                        /*
-                         * If primary_conninfo is set, launch walreceiver to
-                         * try to stream the missing WAL, before retrying to
-                         * restore from archive/pg_xlog.
-                         *
-                         * If fetching_ckpt is TRUE, RecPtr points to the
-                         * initial checkpoint location. In that case, we use
-                         * RedoStartLSN as the streaming start position
-                         * instead of RecPtr, so that when we later jump
-                         * backwards to start redo at RedoStartLSN, we will
-                         * have the logs streamed already.
-                         */
-                        load_server_mode();
-
-                        if (IS_SHARED_STORAGE_STANBY_MODE && !IS_SHARED_STORAGE_MAIN_STANDBY_MODE) {
-                            ProcTxnWorkLoad(false);
-                            /* use volatile pointer to prevent code rearrangement */
-                            volatile WalRcvData *walrcv = t_thrd.walreceiverfuncs_cxt.WalRcv;
-#ifndef ENABLE_MULTIPLE_NODES
-                            rename_recovery_conf_for_roach();
-#endif
-
-                            ereport(LOG, (errmsg("request xlog stream from shared storage at %X/%X.",
-                                                 fetching_ckpt ? (uint32)(t_thrd.xlog_cxt.RedoStartLSN >> 32)
-                                                                : (uint32)(targetRecPtr >> 32),
-                                                 fetching_ckpt ? (uint32)t_thrd.xlog_cxt.RedoStartLSN
-                                                                : (uint32)targetRecPtr)));
-                            ShutdownWalRcv();
-                            t_thrd.xlog_cxt.receivedUpto = 0;
-                            SpinLockAcquire(&walrcv->mutex);
-                            walrcv->receivedUpto = 0;
-                            SpinLockRelease(&walrcv->mutex);
-
-                            RequestXLogStreaming(fetching_ckpt ? &t_thrd.xlog_cxt.RedoStartLSN : &targetRecPtr, 0,
-                                                 REPCONNTARGET_SHARED_STORAGE, 0);
+                    /*
+                    * Before we sleep, re-scan for possible new timelines
+                    * if we were requested to recover to the latest
+                    * timeline.
+                    */
+                    if (t_thrd.xlog_cxt.recoveryTargetIsLatest) {
+                        if (rescanLatestTimeLine()) {
                             continue;
                         }
                     }
-                    /* Don't try to read from a source that just failed */
-                    sources &= ~t_thrd.xlog_cxt.failedSources;
-                    t_thrd.xlog_cxt.readFile = SSXLogFileReadAnyTLI(t_thrd.xlog_cxt.readSegNo, emode, sources, xlog_path);
-                    if (t_thrd.xlog_cxt.readFile >= 0) {
-                        break;
+
+                    if (!xlogctl->IsRecoveryDone) {
+                        g_instance.comm_cxt.predo_cxt.redoPf.redo_done_time = GetCurrentTimestamp();
+                        g_instance.comm_cxt.predo_cxt.redoPf.recovery_done_ptr = t_thrd.xlog_cxt.ReadRecPtr;
+                        ereport(LOG, (errmodule(MOD_REDO), errcode(ERRCODE_LOG),
+                                    errmsg("XLogPageRead IsRecoveryDone is set true, "
+                                            "ReadRecPtr:%X/%X, EndRecPtr:%X/%X, "
+                                            "receivedUpto:%X/%X, CtlInfo_insertHead:%X/%X.",
+                                            (uint32)(t_thrd.xlog_cxt.ReadRecPtr >> 32),
+                                            (uint32)(t_thrd.xlog_cxt.ReadRecPtr),
+                                            (uint32)(t_thrd.xlog_cxt.EndRecPtr >> 32),
+                                            (uint32)(t_thrd.xlog_cxt.EndRecPtr),
+                                            (uint32)(t_thrd.xlog_cxt.receivedUpto >> 32),
+                                            (uint32)(t_thrd.xlog_cxt.receivedUpto),
+                                            (uint32)(g_instance.xlog_cxt.ssReplicationXLogCtl->insertHead >> 32),
+                                            (uint32)(g_instance.xlog_cxt.ssReplicationXLogCtl->insertHead))));
+                        parallel_recovery::redo_dump_all_stats();
                     }
 
-                    ereport(DEBUG5, (errmsg("do not find any more files.sources=%u failedSources=%u", sources,
-                                            t_thrd.xlog_cxt.failedSources)));
                     /*
-                     * Nope, not found in archive and/or pg_xlog.
-                     */
-                    t_thrd.xlog_cxt.failedSources |= sources;
+                    * signal postmaster to update local redo end
+                    * point to gaussdb state file.
+                    */
+                    ProcTxnWorkLoad(true);
+                    if (!xlogctl->IsRecoveryDone) {
+                        SendPostmasterSignal(PMSIGNAL_LOCAL_RECOVERY_DONE);
+                        if (SS_PERFORMING_SWITCHOVER) {
+                            g_instance.dms_cxt.SSClusterState = NODESTATE_STANDBY_PROMOTED;
+                        }
+                    }
 
+                    SpinLockAcquire(&xlogctl->info_lck);
+                    xlogctl->IsRecoveryDone = true;
+                    SpinLockRelease(&xlogctl->info_lck);
+                    /*
+                    * If primary_conninfo is set, launch walreceiver to
+                    * try to stream the missing WAL, before retrying to
+                    * restore from archive/pg_xlog.
+                    *
+                    * If fetching_ckpt is TRUE, RecPtr points to the
+                    * initial checkpoint location. In that case, we use
+                    * RedoStartLSN as the streaming start position
+                    * instead of RecPtr, so that when we later jump
+                    * backwards to start redo at RedoStartLSN, we will
+                    * have the logs streamed already.
+                    */
+                    load_server_mode();
+                    ProcTxnWorkLoad(false);
+                    if (!SS_IN_REFORM) {
+                        /* use volatile pointer to prevent code rearrangement */
+                        volatile WalRcvData *walrcv = t_thrd.walreceiverfuncs_cxt.WalRcv;
+                        rename_recovery_conf_for_roach();
+
+                        ereport(LOG, (errmsg("request xlog stream from dorado copy at %X/%X.",
+                                                                (uint32)(targetRecPtr >> 32),
+                                                                (uint32)targetRecPtr)));
+                        ShutdownWalRcv();
+                        SpinLockAcquire(&walrcv->mutex);
+                        walrcv->receivedUpto = 0;
+                        SpinLockRelease(&walrcv->mutex);
+
+                        RequestXLogStreaming(&targetRecPtr, 0, REPCONNTARGET_SHARED_STORAGE, 0);
+                    }
+                    break;
                 }
 
                 /*
@@ -19394,105 +19749,35 @@ retry:
                 RedoInterruptCallBack();
             }
         } else {
-            /* In archive or crash recovery. */
-            if (t_thrd.xlog_cxt.readFile < 0) {
-                uint32 sources;
+            if (randAccess) {
+                t_thrd.xlog_cxt.curFileTLI = 0;
+            }
 
-                /* Reset curFileTLI if random fetch. */
-                if (randAccess) {
-                    t_thrd.xlog_cxt.curFileTLI = 0;
-                }
-
-                sources = XLOG_FROM_PG_XLOG;
-                if (t_thrd.xlog_cxt.InArchiveRecovery) {
-                    sources |= XLOG_FROM_ARCHIVE;
-                }
-
-                t_thrd.xlog_cxt.readFile = SSXLogFileReadAnyTLI(t_thrd.xlog_cxt.readSegNo, 
-                    emode, sources, xlog_path);
-
-                if (t_thrd.xlog_cxt.readFile < 0) {
-                    return -1;
-                }
+            sources = XLOG_FROM_PG_XLOG;
+            if (t_thrd.xlog_cxt.InArchiveRecovery) {
+                sources |= XLOG_FROM_ARCHIVE;
             }
         }
     }
 
-    /*
-     * At this point, we have the right segment open and if we're streaming we
-     * know the requested record is in it.
-     */
-    Assert(t_thrd.xlog_cxt.readFile != -1);
-    
-    if (t_thrd.xlog_cxt.readSource == XLOG_FROM_STREAM) {
-        if ((targetPagePtr / XLOG_BLCKSZ) != (t_thrd.xlog_cxt.receivedUpto / XLOG_BLCKSZ)) {
-            t_thrd.xlog_cxt.readLen = XLOG_BLCKSZ;
-        } else {
-            t_thrd.xlog_cxt.readLen = t_thrd.xlog_cxt.receivedUpto % XLogSegSize - targetPageOff;
+needread:
+    if (t_thrd.xlog_cxt.readFile < 0) {
+        t_thrd.xlog_cxt.readFile = SSXLogFileOpenAnyTLI(t_thrd.xlog_cxt.readSegNo, emode, sources, xlog_path);
+        if (t_thrd.xlog_cxt.readFile < 0) {
+            ereport(LOG, (errmsg("%s open failed, change xlog file.", xlog_path)));
+            goto next_record_is_invalid;
         }
-    } else {
-        t_thrd.xlog_cxt.readLen = XLOG_BLCKSZ;
     }
 
-    /* Read the requested page */
-    t_thrd.xlog_cxt.readOff = targetPageOff;
-
-    if (DORADO_STANDBY_CLUSTER_MAINSTANDBY_NODE) {
-try_again:
-        if (lseek(t_thrd.xlog_cxt.readFile, (off_t)t_thrd.xlog_cxt.readOff, SEEK_SET) < 0) {
-            ereport(emode_for_corrupt_record(emode, RecPtr),
-                    (errcode_for_file_access(),
-                        errmsg("could not seek in log file %s to offset %u: %m",
-                            XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, t_thrd.xlog_cxt.readSegNo),
-                            t_thrd.xlog_cxt.readOff)));
-            if (errno == EINTR) {
-                errno = 0;
-                pg_usleep(1000);
-                goto try_again;
-            }
-            goto next_record_is_invalid;
-        }
-        pgstat_report_waitevent(WAIT_EVENT_WAL_READ);
-        actualBytes = read(t_thrd.xlog_cxt.readFile, readBuf, XLOG_BLCKSZ);
-        pgstat_report_waitevent(WAIT_EVENT_END);
-        if (actualBytes != XLOG_BLCKSZ) {
-            ereport(emode_for_corrupt_record(emode, RecPtr),
-                    (errcode_for_file_access(),
-                        errmsg("could not read from log file %s to offset %u: %m",
-                            XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, t_thrd.xlog_cxt.readSegNo),
-                            t_thrd.xlog_cxt.readOff)));
-            if (errno == EINTR) {
-                errno = 0;
-                pg_usleep(1000);
-                goto try_again;
-            }
-            goto next_record_is_invalid;
-        }
-    } else {
-        if (xlogreader->preReadBuf != NULL) {
-            actualBytes = (uint32)SSReadXlogInternal(xlogreader, targetPagePtr, targetRecPtr, readBuf, XLOG_BLCKSZ);
-        } else {
-            actualBytes = (uint32)pread(t_thrd.xlog_cxt.readFile, readBuf, XLOG_BLCKSZ, t_thrd.xlog_cxt.readOff);
-        }
-
-        if (actualBytes != XLOG_BLCKSZ) {
-            ereport(LOG, (errcode_for_file_access(), errmsg("read xlog(start:%X/%X, pos:%u len:%d) failed : %m",
-                                                            static_cast<uint32>(targetPagePtr >> BIT_NUM_INT32),
-                                                            static_cast<uint32>(targetPagePtr), targetPageOff,
-                                                            reqLen)));
-            ereport(emode_for_corrupt_record(emode, RecPtr),
-                    (errcode_for_file_access(),
-                        errmsg("could not read from log file %s to offset %u: %m",
-                            XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, t_thrd.xlog_cxt.readSegNo),
-                            t_thrd.xlog_cxt.readOff)));
-            goto next_record_is_invalid;
-        }
+    actualBytes = (uint32)pread(t_thrd.xlog_cxt.readFile, readBuf, t_thrd.xlog_cxt.readLen, t_thrd.xlog_cxt.readOff);
+    if (actualBytes != t_thrd.xlog_cxt.readLen) {
+        ereport(LOG, (errmsg("%s read failed, change xlog file.", xlog_path)));
+        goto next_record_is_invalid;
     }
 
     Assert(targetSegNo == t_thrd.xlog_cxt.readSegNo);
     Assert(targetPageOff == t_thrd.xlog_cxt.readOff);
     Assert((uint32)reqLen <= t_thrd.xlog_cxt.readLen);
-
     *readTLI = t_thrd.xlog_cxt.curFileTLI;
 
     return t_thrd.xlog_cxt.readLen;
@@ -19508,12 +19793,32 @@ next_record_is_invalid:
     t_thrd.xlog_cxt.readSource = 0;
 
     return -1;
+
+triggered:
+    if (t_thrd.xlog_cxt.ssXlogReadFailedTimes < XLOG_STREAM_READREC_MAXTRY) {
+        goto needread;
+    }
+    if (t_thrd.xlog_cxt.readFile >= 0) {
+        close(t_thrd.xlog_cxt.readFile);
+    }
+    t_thrd.xlog_cxt.readFile = -1;
+    t_thrd.xlog_cxt.readLen = 0;
+    t_thrd.xlog_cxt.readSource = 0;
+    t_thrd.xlog_cxt.recoveryTriggered = true;
+    
+    return -1;
 }
 
 int SSXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
     XLogRecPtr targetRecPtr, char *readBuf, TimeLineID *readTLI, char* xlog_path)
-{
-    int read_len = SSReadXLog(xlogreader, targetPagePtr, reqLen, targetRecPtr,
-                              readBuf, readTLI, g_instance.dms_cxt.SSRecoveryInfo.recovery_xlog_dir);
+{       
+    int read_len;            
+    if (SS_REPLICATION_DORADO_CLUSTER) {
+        read_len = SSDoradoReadXLog(xlogreader, targetPagePtr, reqLen, targetRecPtr,
+                                readBuf, readTLI, xlog_path);
+    } else {
+        read_len = SSReadXLog(xlogreader, targetPagePtr, reqLen, targetRecPtr,
+                                readBuf, readTLI, g_instance.dms_cxt.SSRecoveryInfo.recovery_xlog_dir);
+    }
     return read_len;
 }

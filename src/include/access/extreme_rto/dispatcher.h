@@ -94,7 +94,7 @@ typedef struct RecordBufferAarray {
 typedef struct {
     uint64 curPosition;
     XLogRecPtr curLsn;
-#if (!defined __x86_64__) && (!defined __aarch64__)
+#if (!defined __x86_64__) && (!defined __aarch64__) || defined(__USE_SPINLOCK)
     /* protects lastReplayedReadRecPtr and lastReplayedEndRecPtr */
     slock_t ptrLck;
 #endif
@@ -182,6 +182,7 @@ extern THR_LOCAL RecordBufferState *g_recordbuffer;
 
 const static uint64 OUTPUT_WAIT_COUNT = 0x7FFFFFF;
 const static uint64 PRINT_ALL_WAIT_COUNT = 0x7FFFFFFFF;
+const static uint64 STOP_WORKERS_WAIT_COUNT = 0x13FFFFFFFF;
 extern RedoItem g_redoEndMark;
 extern RedoItem g_terminateMark;
 extern uint32 g_readManagerTriggerFlag;

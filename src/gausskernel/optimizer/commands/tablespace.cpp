@@ -55,6 +55,8 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/multi_redo_api.h"
+#include "access/extreme_rto/standby_read/standby_read_delay_ddl.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -95,7 +97,7 @@
 #include "storage/tcap.h"
 
 static void create_tablespace_directories(const char* location, const Oid tablespaceoid);
-static bool destroy_tablespace_directories(Oid tablespaceoid, bool redo);
+static bool destroy_tablespace_directories(Oid tablespaceoid, bool redo, bool is_exrto_read = false);
 static void createtbspc_abort_callback(bool isCommit, const void* arg);
 
 Datum CanonicalizeTablespaceOptions(Datum datum);
@@ -1485,7 +1487,7 @@ static void createtbspc_abort_callback(bool isCommit, const void* arg)
  *
  * Returns TRUE if successful, FALSE if some subdirectory is not empty
  */
-static bool destroy_tablespace_directories(Oid tablespaceoid, bool redo)
+static bool destroy_tablespace_directories(Oid tablespaceoid, bool redo, bool is_exrto_read)
 {
     char* linkloc = NULL;
     char* linkloc_with_version_dir = NULL;
@@ -1605,7 +1607,9 @@ static bool destroy_tablespace_directories(Oid tablespaceoid, bool redo)
         if (rmdir(subfile) < 0)
             ereport(redo ? LOG : ERROR,
                 (errcode_for_file_access(), errmsg("could not remove directory \"%s\": %m", subfile)));
-
+        if (is_exrto_read) {
+            rmtree(subfile, true);
+        }
         if (spc) {
             spc_unlock(spc);
         }
@@ -2618,9 +2622,12 @@ void xlog_drop_tblspc(Oid tsId)
      * etc etc. There's not much we can do about that, so just remove what
      * we can and press on.
      */
+
     if (!destroy_tablespace_directories(tsId, true)) {
         ResolveRecoveryConflictWithTablespace(tsId);
-
+        if (IS_EXRTO_READ) {
+            delete_by_table_space(tsId);
+        }
         /*
          * If we did recovery processing then hopefully the backends who
          * wrote temp files should have cleaned up and exited by now.  So
@@ -2629,7 +2636,7 @@ void xlog_drop_tblspc(Oid tsId)
          * that would crash the database and require manual intervention
          * before we could get past this WAL record on restart).
          */
-        if (!destroy_tablespace_directories(tsId, true))
+        if (!destroy_tablespace_directories(tsId, true, true))
             ereport(LOG,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                     errmsg("directories for tablespace %u could not be removed", tsId),

@@ -260,6 +260,7 @@ extern int signal_schema_name(const char *schema_name);
 extern int signal_table_name(const char *table_name);
 extern int signal_column_name(const char *column_name);
 extern int signal_cursor_name(const char *cursor_name);
+extern int signal_mysql_errno(const char *mysql_errno);
 extern int signal_is_signal(int is_signal);
 
 extern void save_error_message(void);
@@ -535,6 +536,7 @@ typedef struct ErrorData {
     char* table_name;      /* table_name for signal/resignal */
     char* column_name;     /* column_name for signal/resignal */
     char* cursor_name;     /* cursor_name for signal/resignal */
+    char* mysql_errno;     /* mysql_errno for signal/resignal */
     bool is_warnings_throw;
     int is_signal;
 } ErrorData;
@@ -594,7 +596,6 @@ extern ErrorDataArea *initErrorDataArea();
 extern void resetErrorDataArea(bool, bool);
 extern void pushErrorData(ErrorData *);
 extern void copyErrorDataArea(ErrorDataArea *from, ErrorDataArea *to);
-extern void copyDiffErrorDataArea(ErrorDataArea *from, ErrorDataArea *to, ErrorData *edata);
 extern uint64 SqlErrorDataErrorCount();
 extern uint64 SqlErrorDataWarnCount();
 extern int SqlErrorDataCount();

@@ -691,6 +691,9 @@ void ReplicationSlotRelease(void)
     LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
     t_thrd.pgxact->xmin = InvalidTransactionId;
     t_thrd.pgxact->vacuumFlags &= ~PROC_IN_LOGICAL_DECODING;
+    t_thrd.proc->exrto_read_lsn = 0;
+    t_thrd.proc->exrto_min = 0;
+    t_thrd.proc->exrto_gen_snap_time = 0;
     LWLockRelease(ProcArrayLock);
 }
 
@@ -2635,7 +2638,8 @@ static bool CheckExistReplslotPath(char *path)
         errno_t rc = strcat_s(path_for_check, MAXPGPATH, suffix);
         securec_check_ss(rc, "\0", "\0");
     }
-    if (dss_exist_dir(path_for_check)) {
+    struct stat st;
+    if (stat(path_for_check, &st) == 0 && S_ISDIR(st.st_mode)) {
         return true;
     }
 

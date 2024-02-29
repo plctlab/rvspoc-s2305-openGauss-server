@@ -1303,6 +1303,7 @@ Datum plpgsql_exec_function(PLpgSQL_function* func, FunctionCallInfo fcinfo, boo
     }
 #endif
 
+    NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
     saved_current_stp_with_exception = plpgsql_get_current_value_stp_with_exception();
     /*
      * Setup error traceback support for ereport()
@@ -1532,7 +1533,7 @@ Datum plpgsql_exec_function(PLpgSQL_function* func, FunctionCallInfo fcinfo, boo
     estate.err_text = gettext_noop("while casting return value to function's return type");
 
     fcinfo->isnull = estate.retisnull;
-
+    t_thrd.postgres_cxt.cur_command_tag = T_CreateStmt;
     if (estate.retisset) {
         ReturnSetInfo* rsi = estate.rsi;
 
@@ -1743,7 +1744,7 @@ Datum plpgsql_exec_function(PLpgSQL_function* func, FunctionCallInfo fcinfo, boo
     /* Clean up any leftover temporary memory */
     plpgsql_destroy_econtext(&estate);
     exec_eval_cleanup(&estate);
-
+    t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
     /*
      * Pop the error context stack
      */
@@ -3915,6 +3916,7 @@ static int exec_stmt(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt, bool resigna
 {
     PLpgSQL_stmt* save_estmt = NULL;
     int rc = -1;
+    NodeTag old_command_tag;
 
     save_estmt = estate->err_stmt;
     estate->err_stmt = stmt;
@@ -3949,12 +3951,14 @@ static int exec_stmt(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt, bool resigna
             } 
     }
 
+    old_command_tag = t_thrd.postgres_cxt.cur_command_tag;
     switch ((enum PLpgSQL_stmt_types)stmt->cmd_type) {
         case PLPGSQL_STMT_BLOCK:
             rc = exec_stmt_block(estate, (PLpgSQL_stmt_block*)stmt, NULL, resignal_in_handler);
             break;
 
         case PLPGSQL_STMT_ASSIGN:
+            t_thrd.postgres_cxt.cur_command_tag = T_CreateStmt;
             rc = exec_stmt_assign(estate, (PLpgSQL_stmt_assign*)stmt);
             break;
 
@@ -4011,14 +4015,17 @@ static int exec_stmt(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt, bool resigna
             break;
 
         case PLPGSQL_STMT_RETURN:
+            t_thrd.postgres_cxt.cur_command_tag = T_CreateStmt;
             rc = exec_stmt_return(estate, (PLpgSQL_stmt_return*)stmt);
             break;
 
         case PLPGSQL_STMT_RETURN_NEXT:
+            t_thrd.postgres_cxt.cur_command_tag = T_CreateStmt;
             rc = exec_stmt_return_next(estate, (PLpgSQL_stmt_return_next*)stmt);
             break;
 
         case PLPGSQL_STMT_RETURN_QUERY:
+            t_thrd.postgres_cxt.cur_command_tag = T_SelectStmt;
             rc = exec_stmt_return_query(estate, (PLpgSQL_stmt_return_query*)stmt);
             break;
 
@@ -4058,6 +4065,7 @@ static int exec_stmt(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt, bool resigna
         }
 
         case PLPGSQL_STMT_FETCH:
+            t_thrd.postgres_cxt.cur_command_tag = T_CreateStmt;
             rc = exec_stmt_fetch(estate, (PLpgSQL_stmt_fetch*)stmt);
             break;
 
@@ -4095,6 +4103,7 @@ static int exec_stmt(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt, bool resigna
                     errmsg("unrecognized statement type: %d for PLSQL function.", stmt->cmd_type)));
             break;
     }
+    t_thrd.postgres_cxt.cur_command_tag = old_command_tag;
 
     /* Let the plugin know that we have finished executing this statement */
     if (*u_sess->plsql_cxt.plugin_ptr && (*u_sess->plsql_cxt.plugin_ptr)->stmt_end) {
@@ -4117,8 +4126,7 @@ static int exec_stmt(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt, bool resigna
             } else {
                 if ((enum PLpgSQL_stmt_types)stmt->cmd_type == PLPGSQL_STMT_BLOCK) {
                     if (estate->handler_level == estate->block_level) {
-                        copyDiffErrorDataArea(u_sess->dolphin_errdata_ctx.errorDataArea, u_sess->dolphin_errdata_ctx.lastErrorDataArea, estate->cur_error);
-                        copyErrorDataArea(u_sess->dolphin_errdata_ctx.lastErrorDataArea, u_sess->dolphin_errdata_ctx.errorDataArea);
+                        copyErrorDataArea(u_sess->dolphin_errdata_ctx.errorDataArea, u_sess->dolphin_errdata_ctx.lastErrorDataArea);
                         u_sess->dolphin_errdata_ctx.handler_active = false;
                     } else if (!u_sess->dolphin_errdata_ctx.handler_active) {
                         copyErrorDataArea(u_sess->dolphin_errdata_ctx.errorDataArea, u_sess->dolphin_errdata_ctx.lastErrorDataArea);
@@ -4406,7 +4414,7 @@ static int exec_stmt_b_getdiag(PLpgSQL_execstate* estate, PLpgSQL_stmt_getdiag* 
             edata->sqlerrcode = ERRCODE_INVALID_CONDITION_NUMBER;
             edata->message = "Invalid condition number";
             edata->class_origin = edata->sqlstate = edata->subclass_origin = edata->cons_catalog = edata->cons_schema = NULL;
-            edata->cons_name = edata->catalog_name = edata->schema_name = edata->table_name = edata->column_name = edata->cursor_name = NULL;
+            edata->cons_name = edata->catalog_name = edata->schema_name = edata->table_name = edata->column_name = edata->cursor_name = edata->mysql_errno = NULL;
             copyErrorDataArea(u_sess->dolphin_errdata_ctx.lastErrorDataArea, u_sess->dolphin_errdata_ctx.errorDataArea);
             pushErrorData(edata);
             pfree_ext(edata);
@@ -6380,6 +6388,7 @@ static void exec_get_condition_information(PLpgSQL_execstate* estate, PLpgSQL_st
     PLpgSQL_condition_info_item *con_item)
 {
     ListCell *lc = NULL;
+    int code = 0;
 
     foreach (lc, stmt->cond_info_item) {
         PLpgSQL_signal_info_item *item = (PLpgSQL_signal_info_item *)lfirst(lc);
@@ -6408,12 +6417,13 @@ static void exec_get_condition_information(PLpgSQL_execstate* estate, PLpgSQL_st
                 con_item->message_text = pstrdup(extval);
                 break;
             case PLPGSQL_MYSQL_ERRNO:
-                con_item->sqlerrcode = pg_atoi(extval, sizeof(int32), false);
-                if (con_item->sqlerrcode <= 0 || con_item->sqlerrcode > MYSQL_ERRNO_MAX) {
+                code = pg_atoi(extval, sizeof(int32), false);
+                if (code <= 0 || code > MYSQL_ERRNO_MAX) {
                     ereport(ERROR,
                         (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                             errmsg("Variable '%s' can't be set to the value of '%s'", item->con_name, extval)));
                 }
+                con_item->sqlerrcode = pstrdup(extval);
                 break;
             case PLPGSQL_CONSTRAINT_CATALOG:
                 con_item->constraint_catalog = pstrdup(extval);
@@ -6451,10 +6461,10 @@ static void exec_get_condition_information(PLpgSQL_execstate* estate, PLpgSQL_st
     return;
 }
 
-static void StoreSignalError(int elevel, PLpgSQL_condition_info_item *con_item, bool is_warning_throw, int is_signal)
+static void StoreSignalError(int elevel, int code, PLpgSQL_condition_info_item *con_item, bool is_warning_throw, int is_signal)
 {
     ereport(elevel, 
-        (errcode(con_item->sqlerrcode ? con_item->sqlerrcode : 0),
+        (errcode(code),
             errmsg_internal("%s", con_item->message_text),
             (con_item->sqlstate != NULL) ? signal_returnd_sqlstate(con_item->sqlstate) : 0,
             (con_item->class_origin != NULL) ? signal_class_origin(con_item->class_origin) : 0,
@@ -6467,6 +6477,7 @@ static void StoreSignalError(int elevel, PLpgSQL_condition_info_item *con_item, 
             (con_item->table_name != NULL) ? signal_table_name(con_item->table_name) : 0,
             (con_item->column_name != NULL) ? signal_column_name(con_item->column_name) : 0,
             (con_item->cursor_name != NULL) ? signal_cursor_name(con_item->cursor_name) : 0,
+            (con_item->sqlerrcode != NULL) ? signal_mysql_errno(con_item->sqlerrcode) : 0,
             signal_is_warnings_throw(is_warning_throw),
             signal_is_signal(is_signal)));
     
@@ -6486,6 +6497,7 @@ static void exec_free_con_item(PLpgSQL_condition_info_item *con_item)
     FREE_POINTER(con_item->table_name);
     FREE_POINTER(con_item->column_name);
     FREE_POINTER(con_item->cursor_name);
+    FREE_POINTER(con_item->sqlerrcode);
     
     FREE_POINTER(con_item);
 }
@@ -6502,7 +6514,6 @@ static int exec_stmt_signal(PLpgSQL_execstate* estate, PLpgSQL_stmt_signal* stmt
     bool is_warning_throw = false;;
     
     PLpgSQL_condition_info_item *con_item = (PLpgSQL_condition_info_item *)palloc0(sizeof(PLpgSQL_condition_info_item));
-    con_item->sqlerrcode = stmt->sqlerrstate;
 
     /* sqlsate is not null */
     if (sqlstate == NULL) {
@@ -6515,20 +6526,20 @@ static int exec_stmt_signal(PLpgSQL_execstate* estate, PLpgSQL_stmt_signal* stmt
 
     if (sqlstate[0] == '0' && sqlstate[1] == '1') {
         con_item->message_text = pstrdup("Unhandled user-defined warning condition");
-        con_item->sqlerrcode = MAKE_SQLSTATE('0', '1', '0', '0', '0');
+        con_item->sqlerrcode = pstrdup("01000");
         elevel = WARNING;
         is_warning_throw = is_declare_handler;
     } else if (sqlstate[0] == '0' && sqlstate[1] == '2') {
         con_item->message_text = pstrdup("Unhandled user-defined not found condition");
-        con_item->sqlerrcode = MAKE_SQLSTATE('0', '2', '0', '0', '0');
+        con_item->sqlerrcode = pstrdup("02000");
     } else {
         con_item->message_text = pstrdup("Unhandled user-defined exception condition");
-        con_item->sqlerrcode = MAKE_SQLSTATE('0', '3', '0', '0', '0');
+        con_item->sqlerrcode = pstrdup("03000");
     }
 
     exec_get_condition_information(estate, stmt, con_item);
 
-    StoreSignalError(elevel, con_item, is_warning_throw, PLpgSQL_signal_resignal::PLPGSQL_SIGNAL);
+    StoreSignalError(elevel, stmt->sqlerrstate, con_item, is_warning_throw, PLpgSQL_signal_resignal::PLPGSQL_SIGNAL);
 
     exec_free_con_item(con_item);
     return PLPGSQL_RC_OK;
@@ -6550,7 +6561,7 @@ static int exec_stmt_resignal(PLpgSQL_execstate* estate, PLpgSQL_stmt_signal* st
     PLpgSQL_condition_info_item *con_item = (PLpgSQL_condition_info_item *)palloc0(sizeof(PLpgSQL_condition_info_item));
     
     con_item->message_text = pstrdup(cur_errdata->message);
-    con_item->sqlerrcode = cur_errdata->sqlerrcode;
+    con_item->sqlerrcode = pstrdup(cur_errdata->mysql_errno);
     if (sqlstate != NULL) {
         has_sqlstate = true;
         con_item->sqlstate = pstrdup(sqlstate);
@@ -6560,22 +6571,22 @@ static int exec_stmt_resignal(PLpgSQL_execstate* estate, PLpgSQL_stmt_signal* st
 
     if (sqlstate != NULL) {
         if (sqlstate[0] == '0' && sqlstate[1] == '1') {
-            con_item->sqlerrcode = MAKE_SQLSTATE('0', '1', '0', '0', '0');
+            con_item->sqlerrcode = pstrdup("01000");
             elevel = WARNING;
             is_warning_throw = is_declare_handler;
         } else if (sqlstate[0] == '0' && sqlstate[1] == '2') {
-            con_item->sqlerrcode = MAKE_SQLSTATE('0', '2', '0', '0', '0');
+            con_item->sqlerrcode = pstrdup("02000");
         } else {
-            con_item->sqlerrcode = MAKE_SQLSTATE('0', '3', '0', '0', '0');
+            con_item->sqlerrcode = pstrdup("03000");
         }
     }
 
     exec_get_condition_information(estate, stmt, con_item);
 
     if (has_sqlstate) {
-        StoreSignalError(elevel, con_item, is_warning_throw, PLpgSQL_signal_resignal::PLPGSQL_RESIGNAL_WITH_SQLSTATE);
+        StoreSignalError(elevel, cur_errdata->sqlerrcode, con_item, is_warning_throw, PLpgSQL_signal_resignal::PLPGSQL_RESIGNAL_WITH_SQLSTATE);
     } else {
-        StoreSignalError(elevel, con_item, is_warning_throw, PLpgSQL_signal_resignal::PLPGSQL_RESIGNAL_WITHOUT_SQLSTATE);
+        StoreSignalError(elevel, cur_errdata->sqlerrcode, con_item, is_warning_throw, PLpgSQL_signal_resignal::PLPGSQL_RESIGNAL_WITHOUT_SQLSTATE);
     }
 
     exec_free_con_item(con_item);
@@ -6796,7 +6807,7 @@ static int exec_stmt_execsql(PLpgSQL_execstate* estate, PLpgSQL_stmt_execsql* st
     Cursor_Data* saved_cursor_data = NULL;
     bool has_alloc = false;
     bool multi_res_return = false;
-
+    NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
     TransactionId oldTransactionId = SPI_get_top_transaction_id();
  
     /*
@@ -6826,6 +6837,8 @@ static int exec_stmt_execsql(PLpgSQL_execstate* estate, PLpgSQL_stmt_execsql* st
             }
         }
     }
+
+    t_thrd.postgres_cxt.cur_command_tag = stmt->mod_stmt ? T_CreateSetStmt : T_SelectStmt;
     if (ENABLE_CN_GPC && g_instance.plan_cache->CheckRecreateSPICachePlan(expr->plan)) {
             g_instance.plan_cache->RecreateSPICachePlan(expr->plan);
     }
@@ -6859,13 +6872,13 @@ static int exec_stmt_execsql(PLpgSQL_execstate* estate, PLpgSQL_stmt_execsql* st
      * to enforce strictness.
      */
     if (stmt->into) {
-        if (!stmt->mod_stmt & !stmt->bulk_collect) {
+        if (!stmt->mod_stmt && !stmt->bulk_collect) {
             if (!DB_IS_CMPT(PG_FORMAT | B_FORMAT) || SELECT_INTO_RETURN_NULL == 0) {
                 stmt->strict = true;
             }
         }
 #ifdef ENABLE_MULTIPLE_NODES
-        if (!stmt->mod_stmt & !stmt->bulk_collect) {
+        if (!stmt->mod_stmt && !stmt->bulk_collect) {
             stmt->strict = true;
         }
 #endif
@@ -7105,6 +7118,7 @@ static int exec_stmt_execsql(PLpgSQL_execstate* estate, PLpgSQL_stmt_execsql* st
 
     estate->cursor_return_data = saved_cursor_data;
     estate->cursor_return_numbers =  saved_cursor_numbers;
+    t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
     return PLPGSQL_RC_OK;
 }
 
@@ -12580,7 +12594,8 @@ static Datum exec_cast_value(PLpgSQL_execstate* estate, Datum value, Oid valtype
             /* get the implicit cast function from valtype to reqtype */
             result = find_coercion_pathway(reqtype, valtype, COERCION_ASSIGNMENT, &funcid);
             if (funcid != InvalidOid && !(result == COERCION_PATH_COERCEVIAIO || result == COERCION_PATH_ARRAYCOERCE)) {
-                value = OidFunctionCall1(funcid, value);
+                value = (reqtype == INTERVALOID) ?
+                            OidFunctionCall2(funcid, value, reqtypmod) : OidFunctionCall1(funcid, value);
                 value = pl_coerce_type_typmod(value, reqtype, reqtypmod);
             } else {
                 extval = convert_value_to_string(estate, value, valtype);

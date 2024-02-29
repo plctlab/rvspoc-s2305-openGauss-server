@@ -48,6 +48,8 @@ elif [ X"$kernel" == X"centos" ]; then
     dist_version="CentOS"
 elif [ X"$kernel" == X"openeuler" ]; then
     dist_version="openEuler"
+elif [ X"$kernel" == X"fedora" ]; then
+    dist_version="fedora"
 else
     dist_version="Platform"
 fi
@@ -57,10 +59,13 @@ gcc_version="10.3.1"
 
 ##add platform architecture information
 cpus_num=$(grep -w processor /proc/cpuinfo|wc -l)
-PLATFORM_ARCH=$(uname -p)
+PLATFORM_ARCH=$(uname -m)
 if [ "$PLATFORM_ARCH"X == "aarch64"X ] ; then
     ARCHITECTURE_EXTRA_FLAG=_euleros2.0_${ext_version}_$PLATFORM_ARCH
     release_file_list="aarch64_lite_list"
+elif [ "$PLATFORM_ARCH"X == "riscv64"X ] ; then
+    ARCHITECTURE_EXTRA_FLAG=_euleros2.0_sp5_${PLATFORM_ARCH}
+    release_file_list="riscv64_lite_list"
 else
     ARCHITECTURE_EXTRA_FLAG=_euleros2.0_sp5_${PLATFORM_ARCH}
     release_file_list="x86_64_lite_list"
@@ -462,6 +467,11 @@ function install_gaussdb()
     if [[ -e "/etc/openEuler-release" && "$(cat /etc/openEuler-release | awk '{print $3}')" == "22.03" ]]; then
         CMAKE_OPT="$CMAKE_OPT -DENABLE_OPENEULER_MAJOR=ON"
     fi
+
+    if [ "${PLATFORM_ARCH}"x == "riscv64"x ]; then
+       CMAKE_OPT="$CMAKE_OPT -DENABLE_BBOX=OFF"
+    fi
+
     echo "CMAKE_OPT----> $CMAKE_OPT"
     echo "Begin run cmake for gaussdb server" >> "$LOG_FILE" 2>&1
     echo "CMake options: ${CMAKE_OPT}" >> "$LOG_FILE" 2>&1

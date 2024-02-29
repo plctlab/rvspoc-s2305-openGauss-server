@@ -615,7 +615,7 @@ Query* transformStmt(ParseState* pstate, Node* parseTree, bool isFirstNode, bool
         result->rightRefState = nullptr;
     }
 
-    PreventCommandDuringSSOndemandRecovery(parseTree);
+    PreventCommandDuringSSOndemandRedo(parseTree);
     return result;
 }
 
@@ -1594,17 +1594,16 @@ static void CheckUnsupportInsertSelectClause(Query* query)
 }
 
 
-static void SetInsertAttrnoState(ParseState* pstate, List* attrnos) 
+static void SetInsertAttrnoState(ParseState* pstate, List* attrnos, int exprLen) 
 {
     RightRefState* rstate = pstate->rightRefState;
     Relation relation = (Relation)linitial(pstate->p_target_relation);
     rstate->colCnt = RelationGetNumberOfAttributes(relation);
-    int len = list_length(attrnos);
-    rstate->explicitAttrLen = len;
-    rstate->explicitAttrNos = (int*)palloc0(sizeof(int) * len);
+    rstate->explicitAttrLen = exprLen;
+    rstate->explicitAttrNos = (int*)palloc0(sizeof(int) * exprLen);
     
     ListCell* attr = list_head(attrnos);
-    for (int i = 0; i < len; ++i) {
+    for (int i = 0; i < exprLen; ++i) {
         rstate->explicitAttrNos[i] = lfirst_int(attr);
         attr = lnext(attr);
     }
@@ -1854,8 +1853,6 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
 
     /* Validate stmt->cols list, or build default list if no list given */
     icolumns = checkInsertTargets(pstate, stmt->cols, &attrnos);
-
-    SetInsertAttrnoState(pstate, attrnos);
     
     AssertEreport(list_length(icolumns) == list_length(attrnos), MOD_OPT, "list length inconsistent");
 
@@ -2177,6 +2174,10 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
 
         /* Prepare row for assignment to target table */
         exprList = transformInsertRow(pstate, exprList, stmt->cols, icolumns, attrnos);
+    }
+
+    if (rightRefState->isSupported) {
+        SetInsertAttrnoState(pstate, attrnos, list_length(exprList));
     }
 
     /*
@@ -2630,7 +2631,7 @@ static bool shouldTransformStartWithStmt(ParseState* pstate, SelectStmt* stmt, Q
      * Back up the current select statement to be restored after query re-writing
      * for cases of START WITH CONNNECT BY under CREATE TABLE AS.
      */
-    selectQuery->sql_statement = fetchSelectStmtFromCTAS((char*)pstate->p_sourcetext);
+    selectQuery->sql_statement = fetchSelectStmtFromCTAS((char*)pstrdup(pstate->p_sourcetext));
 
     return true;
 }
@@ -4490,7 +4491,22 @@ static Query* transformDeclareCursorStmt(ParseState* pstate, DeclareCursorStmt* 
             ERROR, (errcode(ERRCODE_INVALID_CURSOR_DEFINITION), errmsg("cannot specify both SCROLL and NO SCROLL")));
     }
 
-    result = transformStmt(pstate, stmt->query);
+    PG_TRY();
+    {
+        /* according to DeclareCursorName to form a dependency on the used ROW type */
+        if (!(stmt->options & CURSOR_OPT_HOLD)) {
+            u_sess->analyze_cxt.DeclareCursorName = stmt->portalname;
+        }
+        result = transformStmt(pstate, stmt->query);
+    }
+    PG_CATCH();
+    {
+        u_sess->analyze_cxt.DeclareCursorName = NULL;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    u_sess->analyze_cxt.DeclareCursorName = NULL;
 
     /* Grammar should not have allowed anything but SELECT */
     if (!IsA(result, Query) || result->commandType != CMD_SELECT || result->utilityStmt != NULL) {
@@ -4554,6 +4570,7 @@ static Query* transformExplainStmt(ParseState* pstate, ExplainStmt* stmt)
 {
     Query* result = NULL;
 
+    t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(stmt->query);
     /* transform contained query, allowing SELECT INTO */
     stmt->query = (Node*)transformTopLevelStmt(pstate, stmt->query);
 

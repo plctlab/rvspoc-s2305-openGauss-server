@@ -24,7 +24,9 @@
 #include "postgres.h"
 
 #include "access/gtm.h"
+#include "access/multi_redo_api.h"
 #include "access/printtup.h"
+#include "access/multi_redo_api.h"
 #include "distributelayer/streamMain.h"
 #include "distributelayer/streamProducer.h"
 #include "executor/exec/execStream.h"
@@ -141,6 +143,7 @@ int StreamMain()
         WLMReleaseIoInfoFromHash();
         /* Reset here so that we can get debug_query_string when Stream thread is in Sync point */
         t_thrd.postgres_cxt.debug_query_string = NULL;
+        t_thrd.postgres_cxt.cur_command_tag = T_Invalid;
 
         /* 
          * Note that parent thread will do commit or abort transaction.
@@ -440,6 +443,7 @@ static void execute_stream_plan(StreamProducer* producer)
     // For now plan shipping is used only for SELECTs, in future
     // we should remove this hard coding and get the tag automatically
     commandTag = "SELECT";
+    t_thrd.postgres_cxt.cur_command_tag = T_SelectStmt;
 
     set_ps_display(commandTag, false);
 
@@ -482,10 +486,19 @@ static void execute_stream_plan(StreamProducer* producer)
 
     PortalDefineQuery(portal, NULL, "DUMMY", commandTag, lappend(NULL, planstmt), NULL);
 
+    /* The value of snapshot.read_lsn may be assigned to thread A and used on thread B.
+        So we should reassigned read_lsn to t_thrd of thread B */
+    if (unlikely(IS_EXRTO_STANDBY_READ && producer->getSnapShot() != NULL)) {
+        t_thrd.proc->exrto_read_lsn = producer->getSnapShot()->read_lsn;
+        t_thrd.proc->exrto_min = t_thrd.proc->exrto_read_lsn;
+        reset_invalidation_cache();
+    }
+
     /*
      * Start the portal.  No parameters here.
      */
     PortalStart(portal, producer->getParams(), 0, producer->getSnapShot());
+
     format = 0;
     PortalSetResultFormat(portal, 1, &format);
 

@@ -68,6 +68,7 @@
 #include "storage/lock/lock.h"
 #include "utils/elog.h"
 #include "tcop/dest.h"
+#include "og_record_time.h"
 
 typedef void (*pg_on_exit_callback)(int code, Datum arg);
 
@@ -304,6 +305,8 @@ typedef struct knl_u_analyze_context {
     struct StringInfoData* autoanalyze_timeinfo;
 
     struct BufferAccessStrategyData* vac_strategy;
+
+    char* DeclareCursorName;
 } knl_u_analyze_context;
 
 #define PATH_SEED_FACTOR_LEN 3
@@ -1667,6 +1670,7 @@ typedef struct knl_u_plpgsql_context {
     bool pragma_autonomous; /* save autonomous flag */
     char* debug_query_string;
     bool is_insert_gs_source; /* is doing insert gs_source? */
+    List* CursorRecordTypeList;  /*Save the type recorded during the cursor definition*/
 } knl_u_plpgsql_context;
 
 //this is used to define functions in package
@@ -1752,6 +1756,8 @@ typedef struct knl_u_stat_context {
     bool isTopLevelPlSql;
     int64* localTimeInfoArray;
     uint64* localNetInfo;
+    // use to record all use time in multi thread.
+    void* og_record_stat;
 
     MemoryContext pgStatLocalContext;
     MemoryContext pgStatCollectThdStatusContext;
@@ -1844,6 +1850,9 @@ typedef struct knl_u_storage_context {
 
     /* md.cpp */
     MemoryContext MdCxt; /* context for all md.c allocations */
+
+    /* exrto_file.cpp */
+    MemoryContext exrto_standby_read_file_cxt;
 
     /* sync.cpp */
     MemoryContext pendingOpsCxt;

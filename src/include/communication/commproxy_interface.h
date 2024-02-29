@@ -164,7 +164,7 @@ extern ErrorLevel min_debug_level;
 #define MAX_CONTINUOUS_COUNT 10
 #define INIT_TX_ALLOC_BUFF_NUM 5
 
-#if (!defined WITH_OPENEULER_OS) && (!defined OPENEULER_MAJOR)
+#if (!defined WITH_OPENEULER_OS) && (!defined OPENEULER_MAJOR) && (!defined(__riscv))
 extern int gettimeofday(struct timeval* tp, struct timezone* tzp);
 #endif
 //extern THR_LOCAL knl_thrd_context t_thrd;
@@ -421,7 +421,9 @@ extern bool comm_compare_and_swap_32(volatile int32* dest, int32 oldval, int32 n
 #define gaussdb_numa_memory_unbind()
 
 #else
-#define gaussdb_memory_barrier()
+#define gaussdb_memory_barrier() __asm__ __volatile__("" ::: "memory")
+#define gaussdb_read_barrier() gaussdb_memory_barrier()
+#define gaussdb_write_barrier() gaussdb_memory_barrier()
 
 #define gaussdb_numa_memory_bind(i)
 #define gaussdb_numa_memory_unbind()

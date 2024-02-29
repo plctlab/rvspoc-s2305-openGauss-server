@@ -10064,6 +10064,7 @@ make_execsql_stmt(int firsttoken, int location)
                 PLpgSQL_nsitem* ns = plpgsql_ns_lookup(plpgsql_ns_top(), false, yylval.word.ident, NULL, NULL, NULL);
                 if (ns == NULL) {
                     yyerror("insert an nonexistent variable.");
+                    continue;
                 }
 
                 PLpgSQL_datum* datum = u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[ns->itemno];
@@ -11281,8 +11282,16 @@ read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row, bool *strict, int firstto
                              errmsg("record or row variable cannot be part of multiple-item INTO list"),
                              parser_errposition(yylloc)));
                 }
-                if (tok == T_DATUM || tok == T_VARRAY_VAR
-                    || tok == T_TABLE_VAR || tok == T_PACKAGE_VARIABLE) {
+                if (tok == '.') {
+                    const char* message = "Improper use of '.*'. The '.*' operator cannot be used with a row type variable.";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                             errmsg("Improper use of '.*'. The '.*' operator cannot be used with a row type variable."),
+                             parser_errposition(yylloc)));
+                }
+                if (!DB_IS_CMPT(PG_FORMAT) && (tok == T_DATUM || tok == T_VARRAY_VAR
+                    || tok == T_TABLE_VAR || tok == T_PACKAGE_VARIABLE)) {
                     const char* message = "syntax error, expected \",\"";
                     InsertErrorMessage(message, plpgsql_yylloc);
                     ereport(errstate,
@@ -11305,8 +11314,8 @@ read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row, bool *strict, int firstto
                              errmsg("record or row variable cannot be part of multiple-item INTO list"),
                              parser_errposition(yylloc)));
                 }
-                if (tok == T_DATUM || tok == T_VARRAY_VAR
-                    || tok == T_TABLE_VAR || tok == T_PACKAGE_VARIABLE) {
+                if (!DB_IS_CMPT(PG_FORMAT) && (tok == T_DATUM || tok == T_VARRAY_VAR
+                    || tok == T_TABLE_VAR || tok == T_PACKAGE_VARIABLE)) {
                     const char* message = "syntax error, expected \",\"";
                     InsertErrorMessage(message, plpgsql_yylloc);
                     ereport(errstate,
@@ -11733,8 +11742,8 @@ read_into_array_table_scalar_list(char *initial_name,
         }
     }
 
-    if (tok == T_DATUM || tok == T_VARRAY_VAR
-                    || tok == T_TABLE_VAR || tok == T_PACKAGE_VARIABLE) {
+    if (!DB_IS_CMPT(PG_FORMAT) && (tok == T_DATUM || tok == T_VARRAY_VAR
+                    || tok == T_TABLE_VAR || tok == T_PACKAGE_VARIABLE)) {
         const char* message = "syntax error, expected \",\"";
         InsertErrorMessage(message, plpgsql_yylloc);
         ereport(errstate,

@@ -25,6 +25,19 @@
 #include "securec_check.h"
 #include "tool_common.h"
 
+SSInstanceConfig ss_instance_config = {
+    .dss = {
+        .enable_dss = false,
+        .instance_id = 0,
+        .primaryInstId = -1,
+        .interNodeNum = 0,
+        .vgname = NULL,
+        .vglog = NULL,
+        .vgdata = NULL,
+        .socketpath = NULL,
+    },
+};
+
 datadir_t g_datadir;  /* need init when used in first time */
 
 static void initFileDataPathStruct(datadir_t *dataDir);
@@ -135,6 +148,9 @@ static void initDSSDataPathStruct(datadir_t *dataDir)
     securec_check_ss_c(rc, "", "");
 
     rc = snprintf_s(dataDir->controlBakPath, MAXPGPATH, MAXPGPATH - 1, "%s/pg_control.backup", dataDir->dss_data);
+    securec_check_ss_c(rc, "", "");
+
+    rc = snprintf_s(dataDir->controlInfoPath, MAXPGPATH, MAXPGPATH - 1, "%s/pg_replication/pg_ss_ctl_info", dataDir->dss_data);
     securec_check_ss_c(rc, "", "");
 
     // DSS file directory (instance owner)

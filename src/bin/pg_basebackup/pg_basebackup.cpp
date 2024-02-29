@@ -635,8 +635,6 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                     duplicatedfd = -1;
                     disconnect_and_exit(1);
                 }
-                close(duplicatedfd);
-                duplicatedfd = -1;
             } else
 #endif
                 tarfile = stdout;
@@ -692,6 +690,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
             /* Compression is in use */
             pg_log(stderr, _("%s: could not create compressed file \"%s\": %s\n"), progname, filename,
                 get_gz_error(ztarfile));
+            if(duplicatedfd != -1) {
+                close(duplicatedfd);
+                duplicatedfd = -1;
+            }
             disconnect_and_exit(1);
         }
     } else
@@ -734,6 +736,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                         progname,
                         filename,
                         get_gz_error(ztarfile));
+                    if (duplicatedfd != -1) {
+                        close(duplicatedfd);
+                        duplicatedfd = -1;
+                    }
                     disconnect_and_exit(1);
                 }
             } else
@@ -764,6 +770,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                     progname,
                     filename,
                     get_gz_error(ztarfile));
+                if (duplicatedfd != -1) {
+                    close(duplicatedfd);
+                    duplicatedfd = -1;
+                }
                 disconnect_and_exit(1);
             }
         } else
@@ -779,6 +789,12 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
             progress_report(rownum, filename);
     } /* while (1) */
 
+#ifdef HAVE_LIBZ
+    if (duplicatedfd != -1) {
+        close(duplicatedfd);
+        duplicatedfd = -1;
+    }
+#endif
     if (copybuf != NULL) {
         PQfreemem(copybuf);
         copybuf = NULL;
@@ -950,7 +966,7 @@ static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
             /*
              * All files are padded up to 512 bytes
              */
-            if (current_len_left < 0 || current_len_left > INT_MAX - 511) {
+            if (current_len_left > INT_MAX - 511) {
                 pg_log(stderr, _("%s: the file '%s' is too big or file size is invalid\n"), progname, copybuf);
                 disconnect_and_exit(1);
             }
@@ -1944,13 +1960,11 @@ static int GsBaseBackup(int argc, char** argv)
     int i;
     for (i = 0; i < argc; i++) {
         char *optstr = argv[i];
-        int is_only_shortbar;
-        if (strlen(optstr) == 1) {
-            is_only_shortbar = optstr[0] == '-' ? 1 : 0;
-        } else {
-            is_only_shortbar = 0;
-        }
-        if (is_only_shortbar) {
+        if (strlen(optstr) == 1 && optstr[0] == '-') {
+            /* ignore the case of redirecting output like "gs_probackup ... -D -> xxx.tar.gz" */
+            if (i > 0 && strcmp(argv[i - 1], "-D") == 0) {
+                continue;
+            }
             fprintf(stderr, _("%s: The option '-' is not a valid option.\n"), progname);
             exit(1);
         }
@@ -1970,9 +1984,11 @@ static int GsBaseBackup(int argc, char** argv)
             }
 
             char *next_optstr = argv[i + 1];
+            if (strcmp(optstr, "-D") == 0 && strcmp(next_optstr, "-") == 0) {
+                continue;
+            }
             char *next_oli = strchr(optstring, next_optstr[1]);
-            int is_arg_optionform = next_optstr[0] == '-' && next_oli != NULL;
-            if (is_arg_optionform) {
+            if (next_optstr[0] == '-' && next_oli != NULL) {
                 fprintf(stderr, _("%s: The option '-%c' need a parameter.\n"), progname, optstr[1]);
                 exit(1);
             }
@@ -1985,11 +2001,16 @@ static int GsBaseBackup(int argc, char** argv)
                 GS_FREE(basedir);
                 check_env_value_c(optarg);
                 char realDir[PATH_MAX] = {0};
-                if (realpath(optarg, realDir) == nullptr) {
+                bool argIsMinus = (strcmp(optarg, "-") == 0);
+                if (!argIsMinus && realpath(optarg, realDir) == nullptr) {
                     pg_log(stderr, _("%s: realpath dir \"%s\" failed: %m\n"), progname, optarg);
                     exit(1);
                 }
-                basedir = xstrdup(realDir);
+                if (argIsMinus) {
+                    basedir = xstrdup(optarg);
+                } else {
+                    basedir = xstrdup(realDir);
+                }
                 break;
             }
             case 'F':

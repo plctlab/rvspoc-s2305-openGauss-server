@@ -238,7 +238,7 @@ static relopt_int intRelOpts[] = {
         0, 1, 32
     },
     {{ "compress_level", "Level of page compression.", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE}, 0, -31, 31},
-    {{ "compresstype", "compress type (none, pglz or zstd or pgzstd).", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE}, 0, 0, 3},
+    {{ "compresstype", "compress type (none, pglz or zstd. pgzstd isn't available now).", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE}, 0, 0, 2},
     {{ "compress_chunk_size", "Size of chunk to store compressed page.", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE},
      BLCKSZ / 2,
      BLCKSZ / 16,
@@ -1232,7 +1232,7 @@ static void parse_one_reloption(relopt_value *option, const char *text_str, int 
         case RELOPT_TYPE_INT64: {
             relopt_int64 *optint = (relopt_int64 *)option->gen;
 
-            parsed = parse_int64(value, &option->values.int64_val, NULL);
+            parsed = parse_int64(value, &option->values.int64_val, 0, NULL);
             if (validate && !parsed)
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),

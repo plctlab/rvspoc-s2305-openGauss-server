@@ -42,6 +42,7 @@
 #include "access/multixact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_matview.h"
 #include "catalog/gs_obsscaninfo.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -2627,7 +2628,7 @@ Oid heap_create_with_catalog(const char *relname, Oid relnamespace, Oid reltable
         /* store tables in segment storage as all possible while initdb */
         if (relpersistence == RELPERSISTENCE_PERMANENT &&
             (relkind != RELKIND_SEQUENCE && relkind != RELKIND_LARGE_SEQUENCE &&
-            (!ENABLE_DMS || relkind != RELKIND_TOASTVALUE))) {
+             relkind != RELKIND_TOASTVALUE)) {
             storage_type = SEGMENT_PAGE;
             reloptions = AddSegmentOption(reloptions);
         }
@@ -3695,8 +3696,7 @@ void heap_drop_with_catalog(Oid relid)
      * something with the doomed relation.
      */
     if (ISMLOG(RelationGetForm(rel)->relname.data)) {
-        char *base_relid_str = RelationGetForm(rel)->relname.data + MLOGLEN;
-        Oid base_relid = atoi(base_relid_str);
+        Oid base_relid = get_matview_mlog_baserelid(relid);
         if (OidIsValid(base_relid)) {
             CacheInvalidateRelcacheByRelid(base_relid);
         }

@@ -4,7 +4,7 @@
 
 declare LOG_FILE="${SCRIPT_DIR}/makemppdb_pkg.log"
 declare product_name='openGauss'
-declare PLATFORM_ARCH=$(uname -p)
+declare PLATFORM_ARCH=$(uname -m)
 declare package_path=${ROOT_DIR}/output
 declare install_package_format="tar"
 declare PLATFORM=32

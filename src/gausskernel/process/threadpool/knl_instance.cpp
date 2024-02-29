@@ -42,6 +42,7 @@
 #include "regex/regex.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
+#include "utils/snapshot.h"
 #include "workload/workload.h"
 #include "instruments/instr_waitevent.h"
 #include "access/multi_redo_api.h"
@@ -174,13 +175,16 @@ static void knl_g_dms_init(knl_g_dms_context *dms_cxt)
 {
     Assert(dms_cxt != NULL);
     dms_cxt->dmsProcSid = 0;
-    dms_cxt->xminAck = 0;
     dms_cxt->SSReformerControl.list_stable = 0;
     dms_cxt->SSReformerControl.primaryInstId = -1;
     dms_cxt->SSReformInfo.in_reform = false;
     dms_cxt->SSReformInfo.dms_role = DMS_ROLE_UNKNOW;
+    dms_cxt->SSReformInfo.old_bitmap = 0;
+    dms_cxt->SSReformInfo.new_bitmap = 0;
+    dms_cxt->SSReformInfo.redo_total_bytes = 0;
     dms_cxt->SSClusterState = NODESTATE_NORMAL;
     dms_cxt->SSRecoveryInfo.recovery_inst_id = INVALID_INSTANCEID;
+    dms_cxt->SSRecoveryInfo.cluster_ondemand_status= CLUSTER_NORMAL;
     dms_cxt->SSRecoveryInfo.recovery_pause_flag = true;
     dms_cxt->SSRecoveryInfo.failover_ckpt_status = NOT_ACTIVE;
     dms_cxt->SSRecoveryInfo.new_primary_reset_walbuf_flag = false;
@@ -203,6 +207,27 @@ static void knl_g_dms_init(knl_g_dms_context *dms_cxt)
     dms_cxt->resetSyscache = false;
     dms_cxt->finishedRecoverOldPrimaryDWFile = false;
     dms_cxt->dw_init = false;
+    {
+        ss_xmin_info_t *xmin_info = &g_instance.dms_cxt.SSXminInfo;
+        for (int i = 0; i < DMS_MAX_INSTANCES; i++) {
+            ss_node_xmin_item_t *item = &xmin_info->node_table[i];
+            item->active = false;
+            SpinLockInit(&item->item_lock);
+            item->notify_oldest_xmin = MaxTransactionId;
+        }
+        xmin_info->snap_cache = NULL;
+        xmin_info->snap_oldest_xmin = MaxTransactionId;
+        SpinLockInit(&xmin_info->global_oldest_xmin_lock);
+        xmin_info->global_oldest_xmin = MaxTransactionId;
+        xmin_info->prev_global_oldest_xmin = MaxTransactionId;
+        xmin_info->global_oldest_xmin_active = false;
+        SpinLockInit(&xmin_info->bitmap_active_nodes_lock);
+        xmin_info->bitmap_active_nodes = 0;
+    }
+    dms_cxt->latest_snapshot_xmin = 0;
+    dms_cxt->latest_snapshot_xmax = 0;
+    dms_cxt->latest_snapshot_csn = 0;
+    SpinLockInit(&dms_cxt->set_snapshot_mutex);
 }
 
 static void knl_g_tests_init(knl_g_tests_context* tests_cxt)
@@ -304,8 +329,19 @@ static void knl_g_parallel_redo_init(knl_g_parallel_redo_context* predo_cxt)
 
     rc = memset_s(&predo_cxt->redoCpuBindcontrl, sizeof(RedoCpuBindControl), 0, sizeof(RedoCpuBindControl));
     securec_check(rc, "", "");
-
+    predo_cxt->global_recycle_lsn = InvalidXLogRecPtr;
+    predo_cxt->exrto_recyle_xmin = 0;
+    predo_cxt->exrto_snapshot = (ExrtoSnapshot)MemoryContextAllocZero(
+        INSTANCE_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), sizeof(ExrtoSnapshotData));
     predo_cxt->redoItemHash = NULL;
+
+    predo_cxt->standby_read_delay_ddl_stat.delete_stat = 0;
+    predo_cxt->standby_read_delay_ddl_stat.next_index_can_insert = 0;
+    predo_cxt->standby_read_delay_ddl_stat.next_index_need_unlink = 0;
+    predo_cxt->max_clog_pageno = 0;
+    predo_cxt->buffer_pin_wait_buf_ids = NULL;
+    predo_cxt->buffer_pin_wait_buf_len = 0;
+    predo_cxt->exrto_send_lsn_forworder_time = 0;
 }
 
 static void knl_g_parallel_decode_init(knl_g_parallel_decode_context* pdecode_cxt)
@@ -452,6 +488,7 @@ static void knl_g_xlog_init(knl_g_xlog_context *xlog_cxt)
     securec_check(rc, "\0", "\0");
     pthread_mutex_init(&xlog_cxt->remain_segs_lock, NULL);
     xlog_cxt->shareStorageLockFd = -1;
+    xlog_cxt->ssReplicationXLogCtl = NULL;
 }
 
 static void KnlGUndoInit(knl_g_undo_context *undoCxt)
@@ -480,6 +517,8 @@ static void KnlGUndoInit(knl_g_undo_context *undoCxt)
     undoCxt->undoChainTotalSize = 0;
     undoCxt->globalFrozenXid = InvalidTransactionId;
     undoCxt->globalRecycleXid = InvalidTransactionId;
+    undoCxt->hotStandbyRecycleXid = InvalidTransactionId;
+    undoCxt->is_exrto_residual_undo_file_recycled = false;
 }
 
 static void knl_g_flashback_init(knl_g_flashback_context *flashbackCxt)
@@ -832,6 +871,9 @@ static void knl_g_datadir_init(knl_g_datadir_context* datadir_init)
     errorno = strcpy_s(datadir_init->controlBakPath, MAXPGPATH, "global/pg_control.backup");
     securec_check_c(errorno, "\0", "\0");
 
+    errorno = strcpy_s(datadir_init->controlInfoPath, MAXPGPATH, "pg_replication/pg_ss_ctl_info");
+    securec_check_c(errorno, "\0", "\0");
+
     knl_g_dwsubdir_init(&datadir_init->dw_subdir_cxt);
 }
 
@@ -992,6 +1034,8 @@ void knl_instance_init()
     for (int i = 0; i < DB_CMPT_MAX; i++) {
         pthread_mutex_init(&g_instance.loadPluginLock[i], NULL);
     }
+    g_instance.needCheckConflictSubIds = NIL;
+    pthread_mutex_init(&g_instance.subIdsLock, NULL);
 #endif
 
     knl_g_datadir_init(&g_instance.datadir_cxt);
@@ -1044,4 +1088,3 @@ bool knl_g_get_redo_finish_status()
     uint32 isRedoFinish = pg_atomic_read_u32(&(g_instance.comm_cxt.predo_cxt.isRedoFinish));
     return (isRedoFinish & REDO_FINISH_STATUS_CM) == REDO_FINISH_STATUS_CM;
 }
-
